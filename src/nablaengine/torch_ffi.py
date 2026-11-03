@@ -703,7 +703,14 @@ def _custom_ops():
     from typing import List, Optional
     from torch import Tensor
 
-    @torch.library.custom_op("nablaengine::forward", mutates_args=())
+    def model_op(name):
+        def register(fn):
+            # Model identity must specialize even when Dynamo generalizes tensor shapes.
+            schema = torch.library.infer_schema(fn, mutates_args=()).replace("SymInt context_id", "int context_id")
+            return torch.library.custom_op(f"nablaengine::{name}", fn, mutates_args=(), schema=schema)
+        return register
+
+    @model_op("forward")
     def forward_op(qpos: Tensor, qvel: Tensor, warm: Tensor, ctrl: Tensor, friction: Tensor, com: Tensor,
                    qfrc_applied: Optional[Tensor], kp_scale: Optional[Tensor], iterations: int, substeps: int,
                    tape: bool, kinematics: bool, context_id: int) -> List[Tensor]:
@@ -720,7 +727,7 @@ def _custom_ops():
             out += [qpos.new_empty(s) for s in ((B, nq), (B, nb, 3), (B, nb, 4), (B, nb, 6), (B, nb, 3))]
         return out
 
-    @torch.library.custom_op("nablaengine::backward", mutates_args=())
+    @model_op("backward")
     def backward_op(tape: Tensor, friction: Tensor, com: Tensor, g_qpos: Tensor, g_qvel: Tensor,
                     ctrl: Optional[Tensor], kin_state: List[Tensor], kin_cot: List[Tensor], substeps: int,
                     clamp_kv: int, normal: int, clamp_soft: float, qfrc_applied: Optional[Tensor],
@@ -736,7 +743,7 @@ def _custom_ops():
         return [tape.new_empty((B, nq)), tape.new_empty((B, nv)), tape.new_empty((B, nu)),
                 tape.new_empty((B,), dtype=torch.int32), tape.new_empty((B, nv))]
 
-    @torch.library.custom_op("nablaengine::kinematics", mutates_args=())
+    @model_op("kinematics")
     def kinematics_op(qpos: Tensor, qvel: Tensor, com: Tensor, context_id: int) -> List[Tensor]:
         return _kinematics_impl(qpos, qvel, com, context_id)
 
@@ -746,7 +753,7 @@ def _custom_ops():
         B = qpos.shape[0]
         return [qpos.new_empty(s) for s in ((B, nq), (B, nb, 3), (B, nb, 4), (B, nb, 6), (B, nb, 3))]
 
-    @torch.library.custom_op("nablaengine::kinematics_backward", mutates_args=())
+    @model_op("kinematics_backward")
     def kinematics_backward_op(qpos: Tensor, qvel: Tensor, com: Tensor, g_qpos_n: Tensor, g_xpos: Tensor,
                                g_xquat: Tensor, g_cvel: Tensor, g_subtree_com: Tensor, context_id: int) -> List[Tensor]:
         return _kinematics_backward_impl(qpos, qvel, com, g_qpos_n, g_xpos, g_xquat, g_cvel, g_subtree_com, context_id)

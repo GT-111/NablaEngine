@@ -43,6 +43,15 @@ def inputs(context, device="cpu", requires_grad=False):
 
 
 class ContextChecks(unittest.TestCase):
+    def test_diagnostics_are_context_owned_and_default_switch_stays_lazy(self):
+        with patch.object(F, "_DEFAULT_CONTEXT", None), patch.object(F, "_DEFAULT_DIAGNOSTICS_ON", True), \
+                patch.object(F, "init", side_effect=AssertionError("must stay lazy")), contexts() as owners:
+            self.assertTrue(F.set_diagnostics(False))
+            self.assertFalse(F.set_diagnostics(True))
+            self.assertTrue(owners[0].set_diagnostics(False))
+            self.assertFalse(owners[0]._diagnostics_on)
+            self.assertTrue(owners[1]._diagnostics_on)
+
     def test_fake_shapes_and_tape_bytes_belong_to_context(self):
         from torch._subclasses.fake_tensor import FakeTensorMode
 
@@ -75,20 +84,25 @@ class ContextChecks(unittest.TestCase):
             gu = gv.sum(-1, keepdim=True).expand(-1, F._sizes(cid)[2]) * gain
             return [gq * gain, gv * gain, gu, tp.new_zeros((tp.shape[0],), dtype=torch.int32), gv * gain]
 
-        with contexts() as owners, patch.dict(F._IMPL, forward=forward, backward=backward):
-            batches, results = [], []
-            for owner in (owners[0], owners[1], owners[0]):
-                batch = inputs(owner, requires_grad=True)
-                batches.append((owner, batch))
-                results.append(owner.step(*batch))
-            for result in reversed(results):
-                (result[0].sum() + result[1].sum()).backward()
-            self.assertEqual(launches, [owners[0].context_id, owners[1].context_id, owners[0].context_id])
-            for owner, batch in batches:
-                gain = float(owner.context_id + 2)
-                self.assertTrue(torch.equal(batch[0].grad, torch.full_like(batch[0], gain)))
-                self.assertTrue(torch.equal(batch[6].grad, torch.full_like(batch[6], gain)))
-                self.assertTrue(torch.equal(batch[3].grad, torch.full_like(batch[3], gain * owner.info["nv"])))
+        F._custom_ops()  # real init also registers before any compilation
+        with contexts() as owners, patch.dict(F._IMPL, forward=forward, backward=backward), \
+                patch.object(F, "_forward_impl", forward), patch.object(F, "_backward_impl", backward):
+            for compiled in (False, True):
+                launches.clear()
+                batches, results = [], []
+                for owner in (owners[0], owners[1], owners[0]):
+                    batch = inputs(owner, requires_grad=True)
+                    batches.append((owner, batch))
+                    program = torch.compile(owner.step, backend="aot_eager", fullgraph=True) if compiled else owner.step
+                    results.append(program(*batch))
+                for result in reversed(results):
+                    (result[0].sum() + result[1].sum()).backward()
+                self.assertEqual(launches, [owners[0].context_id, owners[1].context_id, owners[0].context_id])
+                for owner, batch in batches:
+                    gain = float(owner.context_id + 2)
+                    self.assertTrue(torch.equal(batch[0].grad, torch.full_like(batch[0], gain)))
+                    self.assertTrue(torch.equal(batch[6].grad, torch.full_like(batch[6], gain)))
+                    self.assertTrue(torch.equal(batch[3].grad, torch.full_like(batch[3], gain * owner.info["nv"])))
 
 
 def cuda_check(artifacts):
