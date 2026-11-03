@@ -1025,7 +1025,7 @@ template<class T> CM_DEVICE void inflate(int nx, T* x1, T* x2, T* dist,
 }
 
 template<class T> CM_DEVICE int mjc_multicontact(Obj<T>* obj1, Obj<T>* obj2, T* x1, T* x2, T* dist,
-                     int nconmax, int nmeshdegmax, int npolygonmax, uint8_t* buffer) {
+                     int nconmax, int nmeshdegmax, int npolygonmax, uint8_t* buffer, T* normal_out=nullptr) {
   if (obj1->nsupp < 1 || obj2->nsupp < 1) {
     return 1;
   }
@@ -1172,6 +1172,7 @@ template<class T> CM_DEVICE int mjc_multicontact(Obj<T>* obj1, Obj<T>* obj2, T* 
   }
 
   if (nx > 0) {
+    if (normal_out) copy3<T>(normal_out, normal);
     inflate<T>(nx, x1, x2, dist, margin1, margin2, normal);
     return nx;
   }
@@ -2978,7 +2979,7 @@ template<class T> CM_DEVICE void frame(const T* normal,T* result) {
 }
 namespace cm {
 struct Replay {
-  Dual dist[8], x1[24], x2[24];
+  Dual dist[8], x1[24], x2[24], normal[3];
   int count;
 };
 CM_DEVICE void vertex(Obj<Dual>* o,int index,Dual* result) {
@@ -3014,11 +3015,12 @@ CM_DEVICE int replay(int g1,int g2,const float* gx,const float* gq,const CMFeatu
     output->x1[k]=lambda[0]*a.suppvert[k]+lambda[1]*a.suppvert[3+k]+lambda[2]*a.suppvert[6+k];
     output->x2[k]=lambda[0]*b.suppvert[k]+lambda[1]*b.suppvert[3+k]+lambda[2]*b.suppvert[6+k];
   }
+  cmgeom::copy3<Dual>(output->normal,projection);
   output->dist[0]=-cmgeom::norm3<Dual>(projection);
   output->count=1;
   if(CM_MULTI) {
     output->count=cmgeom::mjc_multicontact<Dual>(&a,&b,output->x1,output->x2,output->dist,
-      4,CM_DEGREE_MAX,CM_POLYGON_MAX,scratch->bytes);
+      4,CM_DEGREE_MAX,CM_POLYGON_MAX,scratch->bytes,output->normal);
   }
   return 0;
 }
@@ -3027,7 +3029,9 @@ CM_DEVICE void contact_geometry(const Replay& result,int slot,Dual* dist,Dual* p
   Dual normal[3];
   for(int k=0;k<3;k++) {
     pos[k]=(result.x1[3*slot+k]+result.x2[3*slot+k])*Dual(0.5f);
-    normal[k]=result.x1[3*slot+k]-result.x2[3*slot+k];
+    // The same selected face direction avoids subtracting nearly coincident
+    // world witnesses, which corrupts shallow-contact normals and their VJP.
+    normal[k]=result.normal[k];
   }
   cmgeom::frame<Dual>(normal,frame);
 }

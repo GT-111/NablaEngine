@@ -354,6 +354,32 @@ class ConvexMeshCheck(unittest.TestCase):
                 for contact, feature in zip(contacts, features):
                     np.testing.assert_array_equal(engine.replay(x, q, feature, pair=pair), contact)
 
+    def test_shallow_mesh_face_frame_preserves_translation_independence(self):
+        engine = self.engines[id(self.mesh)]
+        _, deep_x, deep_q = poses(self.mesh)
+        _, features = engine.forward(deep_x, deep_q)
+        qpos = self.mesh.qpos0.copy()
+        rotation = np.array([.99991, .008, .004, .009])
+        rotation /= np.linalg.norm(rotation)
+        matrix = np.empty(9)
+        mujoco.mju_quat2Mat(matrix, rotation)
+        origin = np.array([.01, -.04, -.15])
+        qpos[:3], qpos[3:7] = origin, rotation
+        qpos[7:10] = origin + matrix.reshape(3, 3) @ np.array([.19995, .013, .009])
+        qpos[10:14] = rotation
+        native, x, q = poses(self.mesh, qpos)
+        self.assertEqual(len(features), native.ncon)
+        # Replay the same face at 50 micrometres of penetration. Its normal is
+        # independent of translation, even when world witnesses almost coincide.
+        bar = np.array([0, 0, 0, 0, .2, -.4, .8, .3, .6, -.2, -.1, .5, .7], np.float32)
+        for feature in features:
+            contact = engine.replay(x, q, feature)
+            expected = min(native.contact, key=lambda c: np.linalg.norm(c.pos - contact[1:4]))
+            np.testing.assert_allclose(contact[4:], expected.frame, atol=2e-6, rtol=0)
+            gradient = engine.reverse(x, q, feature, bar)
+            np.testing.assert_allclose(gradient[[0, 1, 2, 6, 7, 8]], 0, atol=1e-6, rtol=0)
+            self.assertGreater(np.linalg.norm(gradient[[3, 4, 5, 9, 10, 11]]), .1)
+
     def test_native_box_box_keeps_all_eight_contacts_independent_of_multiccd(self):
         for model in (self.octagon, self.octagon_no_multi):
             contacts, _, _ = self.assert_oracle(model)
