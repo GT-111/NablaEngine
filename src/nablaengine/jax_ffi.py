@@ -154,6 +154,7 @@ per SM; launch_info()). Every handler checks the rank and dimensions of all its 
 """
 
 import ctypes
+import fcntl
 import functools
 import hashlib
 import json
@@ -1006,29 +1007,35 @@ def _build(units, defines, arch, include, consts, unit_arch=None, prefix="libdk_
     out = cache_dir() / f"{prefix}_{arch}_{key}.so"
     if out.exists():
         return out, False, key
-    t0 = time.time()
-    work = Path(tempfile.mkdtemp(prefix=f"build_{key}_", dir=cache_dir()))
-    try:
-        def compile_unit(name):
-            (work / name).write_text(units[name])
-            r = subprocess.run([nvcc, *unit_command(name, arch, defines, unit_arch, include), "-c", "-o",
-                                str(work / (name + ".o")), str(work / name)], stdout=subprocess.PIPE,
+    # Keep this inode in the cache: deleting a lock file can split waiters
+    # between two independent locks. Different artifacts use different locks.
+    with out.with_suffix(".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if out.exists():
+            return out, False, key
+        t0 = time.time()
+        work = Path(tempfile.mkdtemp(prefix=f"build_{key}_", dir=cache_dir()))
+        try:
+            def compile_unit(name):
+                (work / name).write_text(units[name])
+                r = subprocess.run([nvcc, *unit_command(name, arch, defines, unit_arch, include), "-c", "-o",
+                                    str(work / (name + ".o")), str(work / name)], stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT, universal_newlines=True)
+                if r.returncode:
+                    raise RuntimeError(f"nvcc failed on {name}:\n{r.stdout[-4000:]}")
+            with ThreadPoolExecutor(max_workers=max(1, min(len(units), os.cpu_count() or 1))) as ex:
+                list(ex.map(compile_unit, sorted(units)))
+            r = subprocess.run([nvcc, "-shared", f"-arch={arch}", "-o", str(work / "lib.so"),
+                                *(str(work / (n + ".o")) for n in sorted(units))], stdout=subprocess.PIPE,
                                stderr=subprocess.STDOUT, universal_newlines=True)
             if r.returncode:
-                raise RuntimeError(f"nvcc failed on {name}:\n{r.stdout[-4000:]}")
-        with ThreadPoolExecutor(max_workers=max(1, min(len(units), os.cpu_count() or 1))) as ex:
-            list(ex.map(compile_unit, sorted(units)))
-        r = subprocess.run([nvcc, "-shared", f"-arch={arch}", "-o", str(work / "lib.so"),
-                            *(str(work / (n + ".o")) for n in sorted(units))], stdout=subprocess.PIPE,
-                           stderr=subprocess.STDOUT, universal_newlines=True)
-        if r.returncode:
-            raise RuntimeError(f"nvcc link failed:\n{r.stdout[-4000:]}")
-        os.replace(work / "lib.so", out)  # atomic: concurrent builders leave one complete file
-    finally:
-        shutil.rmtree(work, ignore_errors=True)
-    STATS["builds"] += 1
-    STATS["build_seconds"] += time.time() - t0
-    return out, True, key
+                raise RuntimeError(f"nvcc link failed:\n{r.stdout[-4000:]}")
+            os.replace(work / "lib.so", out)
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+        STATS["builds"] += 1
+        STATS["build_seconds"] += time.time() - t0
+        return out, True, key
 
 
 def init(model_dir=None, model=None, foot_pairs=None, com_body_id=None):

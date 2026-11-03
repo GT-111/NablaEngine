@@ -47,6 +47,7 @@ import hashlib
 import json
 import math
 import os
+import tempfile
 import threading
 from pathlib import Path
 
@@ -270,7 +271,6 @@ def build(arch, model_dir=None, model=None, foot_pairs=None, set_current=True, c
     except AssertionError as e:
         kin_error = f"the model does not meet the kinematics outputs' assumptions ({e!r})"
     stem = path.with_suffix("")
-    np.save(stem.with_suffix(".npy"), consts)
     nr = len(g1_source.free_roots(m))
     com_ids = (int(m.body("torso_link").id),) if com_body_id is None else tuple(int(x) for x in np.atleast_1d(com_body_id))
     meta = dict(artifact_version=ARTIFACT_VERSION, library=path.name, consts=stem.with_suffix(".npy").name, key=key,
@@ -287,9 +287,19 @@ def build(arch, model_dir=None, model=None, foot_pairs=None, set_current=True, c
                 forward_defines=plan["forward_defines"], built=built,
                 default_model=model_dir is None and model is None)
     js = stem.with_suffix(".json")
-    js.write_text(json.dumps(meta, indent=1) + "\n")
-    if set_current:
-        (cache_dir() / f"torch_{arch}_current.json").write_text(json.dumps({"artifact": js.name}) + "\n")
+    # Other ranks can return from the shared library build together. Publish
+    # complete files so one rank never loads another's truncated rewrite.
+    with tempfile.TemporaryDirectory(prefix=f"artifact_{key}_", dir=js.parent) as directory:
+        work = Path(directory)
+        constants = stem.with_suffix(".npy")
+        np.save(work / constants.name, consts)
+        os.replace(work / constants.name, constants)
+        (work / js.name).write_text(json.dumps(meta, indent=1) + "\n")
+        os.replace(work / js.name, js)
+        if set_current:
+            current = cache_dir() / f"torch_{arch}_current.json"
+            (work / current.name).write_text(json.dumps({"artifact": js.name}) + "\n")
+            os.replace(work / current.name, current)
     return js
 
 

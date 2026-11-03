@@ -38,6 +38,10 @@ imports no JAX and no mujoco and calls no nvcc (an artifact built elsewhere: cop
 an update of the package `init()` rebuilds it where mujoco and nvcc are available and refuses it otherwise. Without
 any artifact, `init()` builds one first.
 
+Concurrent processes requesting the same library key share one compilation under a Linux file lock; different
+keys can compile in parallel. Constants, artifact metadata and the current-artifact pointer are published by
+atomic replacement, so another rank always reads complete files.
+
 On a V100 (sm_70) install a PyTorch build that still targets sm_70, e.g. the CUDA 12.6 wheels
 (`--index-url https://download.pytorch.org/whl/cu126`); the CUDA 12.8 and 12.9 wheels start at sm_75.
 
