@@ -64,6 +64,30 @@ class GenerationCheck(unittest.TestCase):
             np.testing.assert_allclose(after.qfrc_bias[dof+3:dof+6] - before.qfrc_bias[dof+3:dof+6],
                                        expected, atol=1e-14)
 
+    def test_reference_com_preserves_authored_geom_and_site_poses(self):
+        from coupled_physics_check import native_contact_model, set_reference_com
+
+        models = [native_contact_model(mujoco, "mesh"), mujoco.MjModel.from_xml_string('''<mujoco>
+          <worldbody><body><freejoint/>
+            <inertial pos="0 0 0" quat="0.7071067811865476 0 0 0.7071067811865476"
+                      mass="1" diaginertia=".03 .02 .01"/>
+            <geom type="box" size=".1 .12 .08" quat="0.7071067811865476 0 0 0.7071067811865476"/>
+            <site quat="0.7071067811865476 0 0 0.7071067811865476"/>
+          </body></worldbody></mujoco>''')]
+        for model in models:
+            roots = source.free_roots(model)
+            before = mujoco.MjData(model)
+            mujoco.mj_forward(model, before)
+            self.assertIn(int(mujoco.mjtSameFrame.mjSAMEFRAME_INERTIA), model.geom_sameframe)
+            if model.nsite:
+                self.assertIn(int(mujoco.mjtSameFrame.mjSAMEFRAME_INERTIA), model.site_sameframe)
+            offsets = np.tile((.001, -.002, .003), len(roots))
+            set_reference_com(model, model.body_ipos.copy(), model.body_sameframe.copy(), roots, offsets)
+            after = mujoco.MjData(model)
+            mujoco.mj_forward(model, after)
+            for field in ("geom_xpos", "geom_xmat", "site_xpos", "site_xmat"):
+                np.testing.assert_allclose(getattr(after, field), getattr(before, field), atol=1e-15)
+
     @unittest.skipUnless(shutil.which("c++"), "state layout check requires a C++ compiler")
     def test_state_layout_compiles_with_root_count_macro(self):
         model = hand_model(22, roots=2)

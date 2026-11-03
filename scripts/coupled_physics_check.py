@@ -54,11 +54,16 @@ def set_reference_com(model, base_ipos, base_sameframe, body_ids, offsets):
     """Apply physical COM offsets without the compiler's old inertial-frame shortcut."""
     import mujoco
 
+    none = int(mujoco.mjtSameFrame.mjSAMEFRAME_NONE)
+    inertia = int(mujoco.mjtSameFrame.mjSAMEFRAME_INERTIA)
     model.body_ipos[:] = base_ipos
     model.body_sameframe[:] = base_sameframe
     for r, body in enumerate(body_ids):
         model.body_ipos[body] += offsets[3*r:3*r+3]
-        model.body_sameframe[body] = int(mujoco.mjtSameFrame.mjSAMEFRAME_NONE)
+        model.body_sameframe[body] = none
+        # These compiled aliases would move authored collision/site poses with COM.
+        model.geom_sameframe[(model.geom_bodyid == body) & (model.geom_sameframe == inertia)] = none
+        model.site_sameframe[(model.site_bodyid == body) & (model.site_sameframe == inertia)] = none
 
 
 def check_case(name, model, foot_pairs, com_ids, options, modules):
@@ -79,7 +84,9 @@ def check_case(name, model, foot_pairs, com_ids, options, modules):
     ctrl = qpos[model.jnt_qposadr[model.actuator_trnid[:, 0]]].copy()
     applied = rng.normal(size=model.nv) * 0.02
     friction, com, kp_scale = options.friction, rng.normal(size=len(com_ids) * 3) * options.com_magnitude, options.kp_scale
-    base = dict(ipos=model.body_ipos.copy(), sameframe=model.body_sameframe.copy(), pair_friction=model.pair_friction.copy(),
+    base = dict(ipos=model.body_ipos.copy(), sameframe=model.body_sameframe.copy(),
+                geom_sameframe=model.geom_sameframe.copy(), site_sameframe=model.site_sameframe.copy(),
+                pair_friction=model.pair_friction.copy(),
                 geom_friction=model.geom_friction.copy(), gain=model.actuator_gainprm.copy(),
                 bias=model.actuator_biasprm.copy())
     geoms = step.collision_geoms(model)
@@ -148,7 +155,7 @@ def check_case(name, model, foot_pairs, com_ids, options, modules):
         factor_h = tape_module.tri_unpack(decoded["L_H"][0, k], model.nv)
         hessian = factor_h @ factor_h.T
         native_mass, native_hessian = np.asarray(native["mass"]), np.asarray(native["hessian"])
-        comparisons.append(dict(engine_mass=mass.tolist(),
+        comparisons.append(dict(engine_L_Q=factor_q.tolist(), engine_L_H=factor_h.tolist(), engine_mass=mass.tolist(),
                                 mass_relative_error=float(np.linalg.norm(mass-native_mass)/np.linalg.norm(native_mass)),
                                 engine_hessian=hessian.tolist(),
                                 hessian_relative_error=float(np.linalg.norm(hessian-native_hessian)/np.linalg.norm(native_hessian)),
@@ -240,6 +247,7 @@ def check_case(name, model, foot_pairs, com_ids, options, modules):
                               and all(row["passed"] for rows in errors.values() for row in rows)
                               and (cross_root is None or abs(cross_root) > 1e-9)))
     for key, target in (("ipos", "body_ipos"), ("sameframe", "body_sameframe"),
+                        ("geom_sameframe", "geom_sameframe"), ("site_sameframe", "site_sameframe"),
                         ("pair_friction", "pair_friction"), ("geom_friction", "geom_friction"),
                         ("gain", "actuator_gainprm"), ("bias", "actuator_biasprm")):
         getattr(model, target)[:] = base[key]
