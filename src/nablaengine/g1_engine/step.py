@@ -1991,25 +1991,24 @@ __device__ void substep_post(S& s, int iterations, int lane, int* niter_out, flo
       zprev = z;
       alpha = nx;
     }
-    // move along p: qacc, M qacc and J qacc - aref are linear in alpha; with the new cost (as total_cost) and the rows'
-    // forces for newton_grad
+    // Rebuild the products from the updated float32 acceleration. Incremental
+    // products can keep moving after qacc rounds, inventing cost improvement.
+    for (int i = lane; i < NV; i += 32) s.qacc[i] += alpha * s.p[i];
+    __syncwarp();
+    refresh(s, lane);
     float g = 0.f;
-    for (int i = lane; i < NV; i += 32) {
-      float qa = s.qacc[i] + alpha * s.p[i], ma = s.Ma[i] + alpha * s.Mp[i];
-      s.qacc[i] = qa; s.Ma[i] = ma;
-      g += 0.5f * (ma - s.qsm[i]) * (qa - s.qacc0[i]);
-    }
+    for (int i = lane; i < NV; i += 32)
+      g += 0.5f * (s.Ma[i] - s.qsm[i]) * (s.qacc[i] - s.qacc0[i]);
     bool chg = false;  // a row of this lane changes its zone (tape: the Hessian factored above is then out of date)
 #pragma unroll
     for (int t = 0; t < RT; t++) {
       int r = lane + 32 * t;
       if (32 * t >= nefc) break;
       if (r < nefc) {
-        float xn = rx[t] + alpha * rj[t], ds, dd;
+        float xn = s.efc_jar[r], ds, dd;
         int z0 = row_piece(r, rx[t], rD[t], rF[t], &ds, &dd), z1 = row_piece(r, xn, rD[t], rF[t], &ds, &dd);
         chg |= z0 != z1;
         g += row_cost(z1, xn, rD[t], rF[t]);
-        s.efc_jar[r] = xn;
         s.efc_jv[r] = -ds;  // the line search's J p is not needed any more
       }
     }
