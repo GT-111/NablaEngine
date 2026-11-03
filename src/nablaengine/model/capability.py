@@ -2,10 +2,10 @@
 
 The engine's code is generated from the model (nablaengine.g1_engine), but its kernels are written for one class of
 robot models (the mjlab G1's): a floating base with one hinge per body, position servos, explicit contact pairs
-between planes, spheres, capsules and boxes, the implicitfast integrator and the Newton solver, no passive forces,
-tendons or equality constraints. Without these checks many departures from that class would be silent: code generation
+between planes, spheres, capsules and boxes, linear damping and frictionloss, soft linear joint equalities,
+the implicitfast integrator and the Newton solver, no tendons. Without these checks departures would be silent: code generation
 would accept the model and the engine would simulate other physics (contype / conaffinity contacts left out, condim 4
-treated as frictionless, joint damping ignored, an Euler model integrated as implicitfast, ...). check() turns every
+treated as frictionless, nonlinear damping ignored, an Euler model integrated as implicitfast, ...). check() turns every
 assumption into a finding with a code:
 
   error  the engine would compute other physics than MuJoCo, or fail: the model is unsupported (UnsupportedModel)
@@ -57,7 +57,7 @@ D, E = mujoco.mjtDisableBit, mujoco.mjtEnableBit
 # (contype contacts are rejected; explicit pairs are not filtered), ctrl clamping (the engine never clamps); the CCD
 # flags only without box pairs (box-box follows MuJoCo Warp's native CCD, step.py BOX_BOX_CCD; no other pair uses CCD)
 DISABLE_OK = (D.mjDSBL_SENSOR, D.mjDSBL_EULERDAMP, D.mjDSBL_AUTORESET, D.mjDSBL_MIDPHASE, D.mjDSBL_ISLAND,
-              D.mjDSBL_FILTERPARENT, D.mjDSBL_CLAMPCTRL)
+              D.mjDSBL_FILTERPARENT, D.mjDSBL_CLAMPCTRL, D.mjDSBL_CONTACT)
 DISABLE_OK_NO_BOX = (D.mjDSBL_NATIVECCD, D.mjDSBL_MULTICCD)
 # disable flags of physics a supported model does not have, so they change nothing: springs and dampers (every
 # stiffness and damping field must be at its default 0: H22 and the default-kind fields; no tendons or flexes: H25),
@@ -163,6 +163,8 @@ def filter_pairs(m):
     same weld body, the parent filter unless disabled, not excluded, not already an explicit pair; measured on mujoco
     3.17: an explicit pair replaces only its own geom pair, exclude signatures are body1 << 16 | body2): the contacts
     the engine, which generates only explicit pairs, would leave out."""
+    if m.opt.disableflags & int(D.mjDSBL_CONTACT):
+        return []
     ex = {int(s) for s in m.exclude_signature} if m.nexclude else set()
     explicit = {frozenset((int(a), int(b))) for a, b in zip(m.pair_geom1, m.pair_geom2)}
     filt_parent = not (m.opt.disableflags & int(D.mjDSBL_FILTERPARENT))
@@ -225,7 +227,7 @@ def check(m, foot_pairs=None, com_body=COM_BODY, scope="engine"):
         ("forward", "kinematics"))
     add("H2", nb <= 31, "error", "at most 31 bodies in the adjoint (lanes 0 and 31 carry root rotation dofs)", nb,
         ("adjoint",))
-    add("H3", nv >= 32, "error", "nv >= 32 (the Cholesky / triangular solves give lane l dof row l)", nv)
+    add("H3", nv >= 6, "error", "nv >= 6 (a free root)", nv)
     add("H4", nv <= 64, "error", "nv <= 64 (two rows per lane)", nv)
     add("H5", 33 <= nv <= 35, "warn", "33 <= nv <= 35: the tuned CHOL_BCAST / NEWTON_REUSE / blocked triangular solve "
         "(else the register Cholesky fallback: untested on a corpus, slower)", nv, ("forward", "adjoint"))
@@ -249,7 +251,7 @@ def check(m, foot_pairs=None, com_body=COM_BODY, scope="engine"):
         {_name(m, mujoco.mjtObj.mjOBJ_JOINT, j): float(m.qpos0[m.jnt_qposadr[j]]) for j in q0[:8]},
         ("forward", "kinematics"))
     nch = max((len(c) for c in children[1:]), default=0)
-    add("H9", nch <= 3, "error", "at most 3 children per body (c_child)", nch)
+    add("H9", nch <= 5, "error", "at most 5 children per body (MAX_CHILD)", nch)
 
     def nanc(b):
         k, n = parent[b], 0
@@ -260,20 +262,22 @@ def check(m, foot_pairs=None, com_body=COM_BODY, scope="engine"):
     add("H10", na_max <= 12, "error", "at most 12 hinge ancestors per body (c_anc)", na_max)
 
     # ---- actuators
-    bad11 = []
+    bad11, driven = [], []
     for a in range(int(m.nactuator)):
         j = int(m.actuator_trnid[a, 0])
         ok = (m.actuator_trntype[a] == T.mjTRN_JOINT and 0 <= j < m.njnt and m.jnt_type[j] == J.mjJNT_HINGE
-              and m.jnt_dofadr[j] == 6 + a and m.actuator_biastype[a] == mujoco.mjtBias.mjBIAS_AFFINE
+              and m.actuator_biastype[a] == mujoco.mjtBias.mjBIAS_AFFINE
               and m.actuator_gear[a, 0] == 1.0 and not np.any(m.actuator_gear[a, 1:])
-              and m.actuator_gainprm[a, 0] == -m.actuator_biasprm[a, 1] and not m.actuator_forcelimited[a]
+              and m.actuator_gainprm[a, 0] == -m.actuator_biasprm[a, 1]
               and m.actuator_ctrladr[a] == a and m.actuator_ctrlnum[a] == 1 and m.actuator_outadr[a] == a
               and m.actuator_outnum[a] == 1)
         if not ok:
             bad11.append(_name(m, mujoco.mjtObj.mjOBJ_ACTUATOR, a))
-    add("H11a", nu == m.nactuator == m.nout == nv - 6 and not bad11, "error",
-        "one position servo per hinge in joint order (actuator a on dof 6 + a, one control and force each), joint "
-        "transmission, affine bias, gear 1, gainprm[0] = -biasprm[1], not force-limited",
+        else:
+            driven.append(j)
+    add("H11a", nu == m.nactuator == m.nout and len(set(driven)) == len(driven) and not bad11, "error",
+        "at most one position servo per hinge (passive hinges allowed, independent control order), joint "
+        "transmission, affine bias, gear 1, gainprm[0] = -biasprm[1]",
         dict(nu=nu, nactuator=int(m.nactuator), hinges=nv - 6, bad=bad11[:8]))
     gt = [_name(m, mujoco.mjtObj.mjOBJ_ACTUATOR, a) for a in range(int(m.nactuator))
           if m.actuator_gaintype[a] != mujoco.mjtGain.mjGAIN_FIXED or m.actuator_dyntype[a] != mujoco.mjtDyn.mjDYN_NONE
@@ -286,10 +290,13 @@ def check(m, foot_pairs=None, com_body=COM_BODY, scope="engine"):
         "it; the interface's documented semantics)", dict(ctrllimited=clamped))
     asym = [_name(m, mujoco.mjtObj.mjOBJ_JOINT, j) for j in range(m.njnt)
             if m.jnt_actfrclimited[j] and m.jnt_actfrcrange[j, 0] != -m.jnt_actfrcrange[j, 1]]
-    add("H12", not asym, "error", "symmetric actuator force ranges (jnt_actfrcrange)", asym[:8])
+    asym += [_name(m, mujoco.mjtObj.mjOBJ_ACTUATOR, a) for a in range(m.nactuator)
+             if m.actuator_forcelimited[a] and m.actuator_forcerange[a, 0] != -m.actuator_forcerange[a, 1]]
+    add("H12", not asym, "error", "symmetric actuator and joint actuator force ranges", asym[:8])
     if com_body is not None:
-        tid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, com_body)
-        add("H13", tid >= 1, "error", f"the COM-offset body {com_body!r} exists", tid)
+        tid = (mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, com_body)
+               if isinstance(com_body, str) else int(com_body))
+        add("H13", 1 <= tid < nb, "error", f"the COM-offset body {com_body!r} exists", tid)
 
     # ---- contacts
     cg = collision_geoms(m)
@@ -328,7 +335,8 @@ def check(m, foot_pairs=None, com_body=COM_BODY, scope="engine"):
     # <= 0 a direct damping (e.g. (0.02, 0) is the time constant's stiffness without damping); the engine's kbimp has
     # the standard form of both only
     neg = dict(pairs=int((m.pair_solref <= 0).any(axis=1).sum()), joints=int((m.jnt_solref[1:] <= 0).any(axis=1).sum()),
-               dofs=int((m.dof_solref <= 0).any(axis=1).sum()))
+               dofs=int((m.dof_solref <= 0).any(axis=1).sum()),
+               equalities=int((m.eq_solref <= 0).any(axis=1).sum()))
     add("H19", not any(neg.values()), "error", "solref in the standard form, both entries > 0 (time constant, damping "
         "ratio; a direct, non-positive stiffness or damping entry is unsupported)", neg)
     lim_free = [j for j in range(m.njnt) if m.jnt_limited[j] and m.jnt_type[j] != J.mjJNT_HINGE]
@@ -337,8 +345,8 @@ def check(m, foot_pairs=None, com_body=COM_BODY, scope="engine"):
     add("H20", bool(uni and not m.jnt_margin.any() and dof_uni and not lim_free), "error",
         "one solref / solimp for every joint limit and every dof, jnt_margin 0, only hinge limits",
         dict(limited_non_hinge=lim_free[:4]))
-    add("H21", not (m.dof_frictionloss > 0).any(), "error", "no frictionloss in the adjoint (the forward has it)",
-        int((m.dof_frictionloss > 0).sum()), ("adjoint",))
+    add("H21", True, "info", "dof frictionloss rows (forward and adjoint)", int((m.dof_frictionloss > 0).sum()),
+        ("adjoint",))
 
     # ---- passive forces, integrator, solver, options
     medium = dict(density=float(m.opt.density), viscosity=float(m.opt.viscosity), wind=[float(x) for x in m.opt.wind])
@@ -349,7 +357,9 @@ def check(m, foot_pairs=None, com_body=COM_BODY, scope="engine"):
     add("H24a", m.opt.solver == mujoco.mjtSolver.mjSOL_NEWTON, "error", "Newton solver",
         mujoco.mjtSolver(int(m.opt.solver)).name)
     has_box = any(m.geom_type[g] == G.mjGEOM_BOX for g in cg)
-    noop = DISABLE_NOOP + ((D.mjDSBL_FRICTIONLOSS,) if not (m.dof_frictionloss > 0).any() else ()) + (
+    noop = tuple(x for x in DISABLE_NOOP if x != D.mjDSBL_DAMPER or not m.dof_damping.any())
+    noop = tuple(x for x in noop if x != D.mjDSBL_EQUALITY or not m.neq)
+    noop += ((D.mjDSBL_FRICTIONLOSS,) if not (m.dof_frictionloss > 0).any() else ()) + (
         (D.mjDSBL_LIMIT,) if not np.asarray(m.jnt_limited).any() else ())
     dis = int(m.opt.disableflags) & ~_mask(DISABLE_OK + noop + (() if has_box else DISABLE_OK_NO_BOX))
     en = int(m.opt.enableflags) & ~_mask(ENABLE_OK)
@@ -357,10 +367,20 @@ def check(m, foot_pairs=None, com_body=COM_BODY, scope="engine"):
         "no disable / enable flags that change the physics, noslip off, no disabled actuator groups",
         dict(disable=_bits(dis, D), enable=_bits(en, E), noslip_iterations=int(m.opt.noslip_iterations),
              disableactuator=int(m.opt.disableactuator)))
-    add("H25", m.ntendon == 0 and m.neq == 0 and m.nmocap == 0 and m.nflex == 0 and m.nplugin == 0, "error",
-        "no tendons, equality constraints, mocap bodies, flexes or plugins",
+    add("H25", m.ntendon == 0 and m.nmocap == 0 and m.nflex == 0 and m.nplugin == 0, "error",
+        "no tendons, mocap bodies, flexes or plugins",
         dict(ntendon=int(m.ntendon), neq=int(m.neq), nmocap=int(m.nmocap), nflex=int(m.nflex),
              nplugin=int(m.nplugin)), ("forward", "kinematics"))
+    badeq = []
+    for e in range(m.neq):
+        j1, j2 = int(m.eq_obj1id[e]), int(m.eq_obj2id[e])
+        if not (m.eq_type[e] == mujoco.mjtEq.mjEQ_JOINT and m.eq_active0[e]
+                and 0 <= j1 < m.njnt and 0 <= j2 < m.njnt and j1 != j2
+                and m.jnt_type[j1] == J.mjJNT_HINGE and m.jnt_type[j2] == J.mjJNT_HINGE
+                and not np.any(m.eq_data[e, 2:5])):
+            badeq.append(e)
+    add("H25b", m.neq <= 6 and not badeq, "error", "at most six active soft linear joint equalities between hinges",
+        dict(neq=int(m.neq), bad=badeq), ("forward",))
 
     # ---- capacities (the generators' own values; they need supported geom types and one hinge per body)
     gen = types <= FORWARD_TYPES and not bad7 and nb > 1

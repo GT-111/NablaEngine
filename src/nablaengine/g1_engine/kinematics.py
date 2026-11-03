@@ -116,11 +116,11 @@ __device__ __forceinline__ void kin_copy(float* dst, const float* src, int n, in
   for (int i = lane; i < n; i += 32) dst[i] = src[i];
 }
 
-// body b's children (at most 3: source.constants) into registers before a sweep: their count
+// body b's children (source.constants) into registers before a sweep: their count
 __device__ __forceinline__ int kin_children(int b, int* ch) {
   const int n = b >= 1 && b < NB ? c_nchild[b] : 0;
 #pragma unroll
-  for (int i = 0; i < 3; i++) ch[i] = i < n ? c_child[3 * b + i] : 0;
+  for (int i = 0; i < MAX_CHILD; i++) ch[i] = i < n ? c_child[MAX_CHILD * b + i] : 0;
   return n;
 }
 
@@ -163,7 +163,7 @@ __device__ __forceinline__ void kin_state(S& s, int lane) {
     __syncwarp();
   }
   float S3[3] = {0.f, 0.f, 0.f}, Mb = 0.f;
-  int ch[3];
+  int ch[MAX_CHILD];
   const int nch = kin_children(b, ch);
   if (b >= 1 && b < NB) {
     float ip[3], c[3];
@@ -177,7 +177,7 @@ __device__ __forceinline__ void kin_state(S& s, int lane) {
   for (int L = MAXD - 1; L >= 1; L--) {
     if (d == L && nch > 0) {
 #pragma unroll
-      for (int i = 0; i < 3; i++)
+      for (int i = 0; i < MAX_CHILD; i++)
         if (i < nch) {
           for (int k = 0; k < 3; k++) S3[k] += s.C[ch[i]][k];
           Mb += s.Mt[ch[i]];
@@ -297,7 +297,7 @@ __global__ void __launch_bounds__(32 * KIN_WPB) k_kin_vjp(int nw, const float* q
   // leaf to root: the twists' recursion reversed with the pose sweep (adjoint.py adj_tree_up's pattern: a parent pulls
   // its children's finished cotangents, deterministic). Off the levels' chain, before: the children, the hinge axis z_b
   // = R_b axis_b (W_b = W_p + z qd), its rate and addresses
-  int ch[3];
+  int ch[MAX_CHILD];
   const int nch = kin_children(b, ch), iv = b >= 2 && b < NB ? c_dadr[b] : 0, iq = b >= 2 && b < NB ? c_qadr[b] : 0;
   float z[3] = {0.f, 0.f, 0.f};
   if (b >= 2 && b < NB) qrot(s.Q[b], c_axis + 3 * b, z);
@@ -307,7 +307,7 @@ __global__ void __launch_bounds__(32 * KIN_WPB) k_kin_vjp(int nw, const float* q
       float bW[3], bV[3], F[3], N[3], t[3], u[3];
       for (int k = 0; k < 3; k++) { bW[k] = s.bW[b][k]; bV[k] = s.bV[b][k]; F[k] = s.F[b][k]; N[k] = s.N[b][k]; }
 #pragma unroll
-      for (int i = 0; i < 3; i++) {
+      for (int i = 0; i < MAX_CHILD; i++) {
         if (i >= nch) break;
         const int c = ch[i];
         float r[3];

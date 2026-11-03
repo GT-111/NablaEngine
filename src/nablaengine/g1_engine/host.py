@@ -18,7 +18,8 @@ __device__ unsigned long long g_prof[NPROF];
 // tape: null, or nw * nsub records of REC_WORDS (tape.py), record w * nsub + k for world w and substep k
 __global__ void k_substep(int nw, const float* qpos, const float* qvel, const float* warm, const float* ctrl,
                           const float* fric, const float* com, int iterations, int nsub, float* oqpos, float* oqvel,
-                          float* owarm, int* info, float* ocon, float* tape) {
+                          float* owarm, int* info, float* ocon, float* tape, const float* qfrc = nullptr,
+                          const float* kp_scale = nullptr) {
   extern __shared__ __align__(16) unsigned char dk_smem[];  // dynamic: struct Sim can exceed the 48 KB static limit
   Sim& s = *reinterpret_cast<Sim*>(dk_smem);
   // lane = threadIdx.x & 31, not threadIdx.x (also in k_pre, k_post, k_adjoint): the block is one warp, but the
@@ -41,8 +42,9 @@ __global__ void k_substep(int nw, const float* qpos, const float* qvel, const fl
   __syncwarp();
   int nit = 0;
   for (int k = 0; k < nsub; k++)
-    substep(s, ctrl + (size_t)w * (NV - 6), iterations, lane, &nit,
-            tape ? tape + ((size_t)w * nsub + k) * REC_WORDS : nullptr);
+    substep(s, ctrl + (size_t)w * NU, iterations, lane, &nit,
+            tape ? tape + ((size_t)w * nsub + k) * REC_WORDS : nullptr,
+            qfrc ? qfrc + (size_t)w * NV : nullptr, kp_scale ? kp_scale[w] : 1.f);
   for (int i = lane; i < NQ; i += 32) oqpos[(size_t)w * NQ + i] = s.qpos[i];
   for (int i = lane; i < NV; i += 32) { oqvel[(size_t)w * NV + i] = s.qvel[i]; owarm[(size_t)w * NV + i] = s.qacc[i]; }
 #ifdef DK_PROFILE
@@ -132,7 +134,8 @@ __global__ void k_substep(int nw, const float* qpos, const float* qvel, const fl
 // the pre half of substep k for world w
 __device__ __forceinline__ void pre_world(SimP& s, Hand& g, int w, int lane, const float* qpos, const float* qvel,
                                           const float* ctrl, const float* fric, const float* com, int k, int nsub,
-                                          float* ocon, float* tape) {
+                                          float* ocon, float* tape, const float* qfrc = nullptr,
+                                          const float* kp_scale = nullptr) {
   for (int i = lane; i < NQ; i += 32) s.qpos[i] = qpos[(size_t)w * NQ + i];
   for (int i = lane; i < NV; i += 32) s.qvel[i] = qvel[(size_t)w * NV + i];
   if (lane < 3) s.com[lane] = com[w * 3 + lane];
@@ -147,7 +150,8 @@ __device__ __forceinline__ void pre_world(SimP& s, Hand& g, int w, int lane, con
   if (lane < NPROF) s.prof[lane] = 0;
 #endif
   __syncwarp();
-  substep_pre(s, ctrl + (size_t)w * (NV - 6), lane, tape ? tape + ((size_t)w * nsub + k) * REC_WORDS : nullptr);
+  substep_pre(s, ctrl + (size_t)w * NU, lane, tape ? tape + ((size_t)w * nsub + k) * REC_WORDS : nullptr,
+              qfrc ? qfrc + (size_t)w * NV : nullptr, kp_scale ? kp_scale[w] : 1.f);
   int ncon = min(s.ncon, MAXCON);
   for (int i = lane; i < NV; i += 32) { g.qsm[i] = s.qsm[i]; g.qacc0[i] = s.qacc0[i]; }
   for (int c = lane; c < ncon; c += 32) {
@@ -265,11 +269,12 @@ __device__ __forceinline__ int dk_order_world(const int* cnt, const int* order, 
 #endif
 __global__ void SPLIT_PRE_BOUNDS k_pre(int nw, const float* qpos, const float* qvel, const float* ctrl,
                                        const float* fric, const float* com, int k, int nsub, Hand* work, float* ocon,
-                                       float* tape) {
+                                       float* tape, const float* qfrc = nullptr, const float* kp_scale = nullptr) {
   extern __shared__ __align__(16) unsigned char dk_smem[];
   const int lane = threadIdx.x & 31, w = blockIdx.x;  // (& 31: see k_substep)
   if (w >= nw) return;
-  pre_world(*reinterpret_cast<SimP*>(dk_smem), work[w], w, lane, qpos, qvel, ctrl, fric, com, k, nsub, ocon, tape);
+  pre_world(*reinterpret_cast<SimP*>(dk_smem), work[w], w, lane, qpos, qvel, ctrl, fric, com, k, nsub, ocon, tape,
+            qfrc, kp_scale);
 #if DK_SPLIT_ORDER
   if (lane == 0) {
     int* cnt = reinterpret_cast<int*>(work + nw);
@@ -311,7 +316,8 @@ static inline cudaError_t dk_forward_split(cudaStream_t st, int nw, const float*
                                            const float* warm, const float* ctrl, const float* fric, const float* com,
                                            int iterations, int nsub, float* oqpos, float* oqvel, float* owarm,
                                            int* info, float* ocon, float* tape, void* work,
-                                           size_t smem_pre = sizeof(SimP), size_t smem_post = sizeof(SimN)) {
+                                           size_t smem_pre = sizeof(SimP), size_t smem_post = sizeof(SimN),
+                                           const float* qfrc = nullptr, const float* kp_scale = nullptr) {
   Hand* hand = reinterpret_cast<Hand*>(work);
 #if DK_SPLIT_ORDER
   if (nsub > SPLIT_MAXSUB) return cudaErrorInvalidValue;
@@ -321,7 +327,7 @@ static inline cudaError_t dk_forward_split(cudaStream_t st, int nw, const float*
   for (int k = 0; k < nsub; k++) {
     if (dk_split_only != 2)
       k_pre<<<nw, 32, smem_pre, st>>>(nw, k ? oqpos : qpos, k ? oqvel : qvel, ctrl, fric, com, k, nsub, hand, ocon,
-                                      tape);
+                                      tape, qfrc, kp_scale);
     if (dk_split_only != 1)
       k_post<<<nw, 32, smem_post, st>>>(nw, k ? oqpos : qpos, k ? oqvel : qvel, k ? owarm : warm, iterations, k, nsub,
                                         hand, oqpos, oqvel, owarm, info, tape);

@@ -45,9 +45,10 @@ On a V100 (sm_70) install a PyTorch build that still targets sm_70, e.g. the CUD
 
 | entry | as in jax_ffi | notes |
 |---|---|---|
-| `init(device=None, artifact=None, model_dir=None, model=None, foot_pairs=None)` | `init` | loads the artifact (building it if needed) and uploads the model constants to `device` (default: the current CUDA device); the first call on a device synchronizes it; one architecture per process |
+| `init(device=None, artifact=None, model_dir=None, model=None, foot_pairs=None, com_body_id=None)` | `init` | prepares the default context and returns its model facts; the first call on a device synchronizes it |
+| `create_context(device=None, artifact=None, model_dir=None, model=None, foot_pairs=None, com_body_id=None)` | | returns an independent `ModelContext` with its own immutable model library, dimensions, constants, readiness and diagnostics |
 | `build(arch, ...)`, `python -m nablaengine.torch_ffi build` | | the artifact for an architecture (mujoco and nvcc needed) |
-| `step(qpos, qvel, warm, ctrl, friction, com, *, iterations=10, substeps=4, clamp_kv=0, normal=3, clamp_soft=None, grad_decay=1.0, kinematics=False)` | `step` | a `torch.autograd.Function`; the tape is written only when an input requires grad; `warm'` is not differentiable |
+| `step(qpos, qvel, warm, ctrl, friction, com, qfrc_applied=None, kp_scale=None, *, iterations=10, substeps=4, clamp_kv=0, normal=3, clamp_soft=None, grad_decay=1.0, kinematics=False, context=None)` | `step` | differentiable in Q, V, control and applied generalized force; the tape is written only when an input requires grad; `warm'` is not differentiable |
 | `kinematics(qpos, qvel, com)` | `kinematics` | differentiable in `qpos` and `qvel` |
 | `scale_grad(tree, gamma)` | `scale_grad` | on a pytree of tensors (`torch.utils._pytree`); non-floating leaves pass through |
 | `forward(...)`, `backward(...)` | `forward`, `backward` | without autograd; the same outputs, `info` included |
@@ -58,6 +59,37 @@ On a V100 (sm_70) install a PyTorch build that still targets sm_70, e.g. the CUD
 Every tensor is float32, contiguous and on one CUDA device, with the worlds as the leading dimension; another dtype,
 device, layout or shape raises `TypeError` (nothing is cast or copied). Every call runs on PyTorch's current CUDA
 stream of the inputs' device, with that device made current for the call.
+
+`qfrc_applied` is `(B, nv)` in the model's generalized force coordinates; omitted means zero. It is held for the
+native substeps in that call. `kp_scale` is `(B,)` and multiplies the actual position servo Kp, leaving Kd unchanged;
+omitted means one. It is a stopped physical randomization parameter, with no gradient. `backward(...,
+qfrc_applied=..., kp_scale=...)` takes the same operands as its forward and appends `g_qfrc_applied` to its usual four
+outputs when an applied force is supplied.
+
+## Independent models in one process
+
+Module calls without `context=` keep their original default G1 API. `init()` prepares that context once; it never
+switches the default model after loading. Build or load additional models explicitly:
+
+```python
+left = torch_ffi.create_context(model=left_model, foot_pairs=[], com_body_id=left_root_body)
+right = torch_ffi.create_context(model=right_model, foot_pairs=[], com_body_id=right_root_body)
+q1, v1, warm1 = left.step(qpos_left, qvel_left, warm_left, finger_ctrl_left, friction_left, com_left,
+                        qfrc_applied_left, kp_scale_left, substeps=1)
+# Equivalently: torch_ffi.step(..., context=left).
+```
+
+Each context has `step`, `forward`, `backward`, `kinematics`, `init`, `tape_bytes`, `diagnostics`, `read_diagnostics`
+and `set_diagnostics` methods. Native dimensions and artifact facts are in `context.info`. The optional numeric
+`com_body_id` selects the actual compiled body whose local inertial position receives the per-world `com` offset; the
+default retains the G1 torso binding. Contexts are retained for the process lifetime because delayed autograd and
+captured CUDA graphs reference their libraries and constants. There is no model reload or global constant switch.
+
+Custom ops register once and carry a static integer context identity. Their fake shapes use that context's Q/V,
+actuator, body and tape dimensions. Forward saves the same identity for delayed backward, including after another
+model has run. Prepare each context on every target device with `context.init(device)` before capture.
+`scripts/torch_context_check.py` checks routing and fake shapes on CPU; `--cuda ARTIFACT_A ARTIFACT_B` additionally
+checks real delayed VJPs and compiled/graph execution on CUDA. CPU routing checks are not CUDA qualification.
 
 ## Rollouts and memory
 

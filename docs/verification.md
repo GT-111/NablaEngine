@@ -12,6 +12,21 @@ scripts/verify.sh [OUTDIR]           # about 15 minutes on a V100: every check o
 
 `OUTDIR` defaults to `runs/verify`; each check leaves `<name>.log` and `<name>.json` there.
 
+The generated model extensions have a separate CPU check:
+
+```bash
+PYTHONPATH=src python scripts/model_generation_check.py
+```
+
+It checks genuine zero-contact generation, `nv` 13 / 18 / 22 / 28, three / four / five child branches, the compiled
+COM body, independent actuator ordering with passive hinges, damping constants, and six soft linear joint equalities
+with dof frictionloss. Equality positions, velocities, Jacobians and constraint weights are compared with MuJoCo C
+3.17. These checks do not execute CUDA kernels or qualify a hand's forward accuracy, finite-difference VJP accuracy,
+runtime or contact behavior. Run forward and VJP checks on the actual compiled model and target GPU for those claims;
+use `clamp_kv=1, normal=0, grad_decay=1` for finite differences and report training mode separately.
+The synthetic models in this check have no collision geometry. They do not represent the normal DexForge five-hand
+native scenes, whose enabled convex-mesh contacts and multiple free roots remain unsupported by this candidate.
+
 ## Data
 
 | data | file | what it is |

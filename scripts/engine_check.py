@@ -19,7 +19,7 @@ import numpy as np
 
 from nablaengine import fixtures, provenance, workdir
 from nablaengine.cuda import compile_cuda
-from nablaengine.g1_engine.source import CONST_LAYOUT, DEVICE, constants, header
+from nablaengine.g1_engine.source import DEVICE, const_layout, constants, header
 
 
 KERNEL = r"""
@@ -56,7 +56,7 @@ __global__ void k_smooth(int nw, const float* __restrict__ qpos, const float* __
   for (int L = MAXD - 1; L >= 1; L--) {
     if (d == L)
       for (int i = 0; i < c_nchild[b]; i++) {
-        int c = c_child[3 * b + i];
+        int c = c_child[MAX_CHILD * b + i];
         accumulate(sX[g][b], sX[g][c], sF[g][c], sN[g][c], sF[g][b], sN[g][b]);
         for (int k = 0; k < 10; k++) sJ[g][b][k] += sJ[g][c][k];
       }
@@ -99,12 +99,12 @@ __global__ void k_smooth(int nw, const float* __restrict__ qpos, const float* __
     float bias = sb[g][i];
     qfrc[w * NV + i] = bias;
     float act = 0.f;
-    if (i >= 6) {
-      int j = i - 6;
-      act = c_kp[i] * (ctrl[w * (NV - 6) + j] - sq[g][i + 1]) - c_kv[i] * sq[g][NQ + i];
+    if (c_actid[i] >= 0) {
+      int j = c_actid[i];
+      act = c_kp[i] * (ctrl[w * (NU) + j] - sq[g][i + 1]) - c_kv[i] * sq[g][NQ + i];
       act = fminf(fmaxf(act, -c_frclim[i]), c_frclim[i]);
     }
-    sb[g][i] = act - bias;
+    sb[g][i] = act - c_damping[i] * sq[g][NQ + i] - bias;
   }
   __syncwarp();
   chol_warp(sM[g], lane);
@@ -135,7 +135,7 @@ int main(int argc, char** argv) {  // dir nworld reps
 LOAD_CONSTS
   snprintf(path, sizeof path, "%s/qpos.bin", dir); std::vector<float> hq = readf(path, (size_t)nw * NQ);
   snprintf(path, sizeof path, "%s/qvel.bin", dir); std::vector<float> hv = readf(path, (size_t)nw * NV);
-  snprintf(path, sizeof path, "%s/ctrl.bin", dir); std::vector<float> hc = readf(path, (size_t)nw * (NV - 6));
+  snprintf(path, sizeof path, "%s/ctrl.bin", dir); std::vector<float> hc = readf(path, (size_t)nw * (NU));
   snprintf(path, sizeof path, "%s/com.bin", dir); std::vector<float> ho = readf(path, (size_t)nw * 3);
   float *dq, *dv, *dc, *dcom, *df, *dM, *da;
   cudaMalloc(&dq, hq.size() * 4); cudaMalloc(&dv, hv.size() * 4); cudaMalloc(&dc, hc.size() * 4);
@@ -168,7 +168,7 @@ LOAD_CONSTS
 def load_consts_code(m):
     n = {"nb": m.nbody, "nv": m.nv, "one": 1}
     lines, tmp = [], 0
-    for sym, kind, cnt, width in CONST_LAYOUT:
+    for sym, kind, cnt, width in const_layout(m):
         size = n[cnt] * width
         if kind == "i":
             lines.append(f"  {{ static int t{tmp}[{size}]; for (int i = 0; i < {size}; i++) t{tmp}[i] = (int)p[i]; "

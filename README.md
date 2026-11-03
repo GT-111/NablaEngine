@@ -31,9 +31,18 @@ the engine's simulation gradients.
 
 ## Scope
 
-NablaEngine is specialized for the Unitree G1 (the mjlab model), the first robot it supports: contacts between
-spheres, capsules and the floor, joint limits, PD position actuators, MuJoCo's Newton solver and implicitfast
-integration, in float32. Other models are rejected with an error that names the unsupported features.
+The generated engine supports a free root followed by one hinge at each body's origin, with at most 31 bodies,
+five children per body and 12 hinge ancestors. Position actuators may drive a subset of the hinges in any order;
+passive hinges retain their coordinates. The solver includes linear joint damping, dof frictionloss, hinge limits,
+up to six active soft linear joint equalities, symmetric actuator and joint force limits, and explicit sphere,
+capsule and floor contacts. Models with no contact pairs generate directly. Physics uses MuJoCo's Newton solver
+and implicitfast integration in float32. Unsupported features are rejected with their capability-check codes.
+Multiple free roots, implicit `contype` / `conaffinity` contacts and convex-mesh collisions remain unsupported.
+
+The published numerical and performance results qualify the mjlab Unitree G1. The smaller-model extensions
+have CPU source-generation and MuJoCo row checks; those checks alone do not qualify CUDA forward or gradient accuracy.
+The PyTorch interface can select the compiled COM-offset body by id and supply applied generalized forces and a
+per-world Kp scale (Kd stays fixed); see `docs/api_torch.md`.
 
 Requirements: Linux x86_64, an NVIDIA GPU of compute capability 7.0 or newer (tested: V100, RTX 3090, H100, RTX PRO
 6000), Python 3.12, and a CUDA 12.x toolkit (nvcc) for the one-time build of the CUDA library (about 15 s, cached).

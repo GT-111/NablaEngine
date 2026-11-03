@@ -179,7 +179,17 @@ ignored.
 
 ## Unsupported models
 
-The engine supports one model, the mjlab G1. `init`, `check_model`, `EnginePhysics` and the scripts' model loading
+The engine's model class is a free root and one hinge per later body, with at most 31 bodies, five children per body
+and 12 hinge ancestors. Position actuators may drive any unique subset of hinges, with independent `nu`; passive
+hinges remain in `qpos` and `qvel`. Linear joint damping, dof frictionloss and up to six active soft linear hinge
+equalities are represented. Contact pairs may be absent. Sphere, capsule and world-plane contact pairs have an
+analytic adjoint; boxes remain forward-only. The published numerical qualification is for the mjlab G1; CPU
+generation checks for smaller models are described in `docs/verification.md`.
+Multiple free roots, implicit `contype` / `conaffinity` contacts and convex-mesh collisions remain unsupported.
+Disabling contacts changes the simulated condition; a successful check of such a model does not qualify its original
+contact-enabled scene.
+
+`init`, `check_model`, `EnginePhysics` and the scripts' model loading
 run the capability checker (`nablaengine.model.capability`) first. A model outside its scope raises
 `nablaengine.model.capability.UnsupportedModel` (a subclass of `ValueError` and `AssertionError`) before anything is
 built, with the failing checks' codes and values; it never simulates other physics silently. `check_model(mjm,

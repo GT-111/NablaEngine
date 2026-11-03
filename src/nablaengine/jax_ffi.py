@@ -227,7 +227,8 @@ extern "C" int @PFX@_upload(const float* p, cudaStream_t st) {
 // them (their k_adjoint gets nullptr as before and has no delta argument)
 extern "C" int @PFX@_adjoint(cudaStream_t st, int nw, int nsub, const float* tape, const float* fric, const float* com,
                            const float* gq_out, const float* gv_out, float* gq_in, float* gv_in, float* gctrl,
-                           int* info, const float* ctrl, float clamp_soft) {
+                           int* info, const float* ctrl, float clamp_soft, const float* qfrc,
+                           const float* kp_scale, float* gqfrc) {
   int dev = -1;
   cudaError_t e = cudaGetDevice(&dev);
   if (e != cudaSuccess) return (int)e;
@@ -236,7 +237,8 @@ extern "C" int @PFX@_adjoint(cudaStream_t st, int nw, int nsub, const float* tap
   if (DK_ADJ_CLAMP_KV == 2 && !ctrl) return (int)cudaErrorInvalidValue;
   (void)clamp_soft;
   k_adjoint<<<nw, 32, g_adj_smem[dev], st>>>(nw, nsub, tape, fric, com, gq_out, gv_out, gq_in, gv_in, gctrl, info,
-                                             nullptr, DK_ADJ_CLAMP_KV == 2 ? ctrl : nullptr ADJ_SOFT_ARG(clamp_soft));
+                                             nullptr, DK_ADJ_CLAMP_KV == 2 ? ctrl : nullptr ADJ_SOFT_ARG(clamp_soft),
+                                             qfrc, kp_scale, gqfrc);
   return (int)cudaGetLastError();
 }
 // the launch on device dev (after its upload): o[0] the dynamic shared memory, o[1] the resident worlds per SM
@@ -265,14 +267,15 @@ FWD_SHIM = r"""
 extern "C" long long @PFX@_work_bytes(int nw) { return DK_SPLIT ? (long long)dk_work_bytes(nw) : 0; }
 extern "C" int @PFX@_forward(cudaStream_t st, int nw, const float* qpos, const float* qvel, const float* warm,
                            const float* ctrl, const float* fric, const float* com, int iterations, int nsub, float* oq,
-                           float* ov, float* ow, int* info, float* ocon, float* tape, void* work) {
+                           float* ov, float* ow, int* info, float* ocon, float* tape, void* work,
+                           const float* qfrc, const float* kp_scale) {
 #if DK_SPLIT
   return (int)dk_forward_split(st, nw, qpos, qvel, warm, ctrl, fric, com, iterations, nsub, oq, ov, ow, info, ocon,
-                               tape, work);
+                               tape, work, sizeof(SimP), sizeof(SimN), qfrc, kp_scale);
 #else
   (void)work;
   k_substep<<<nw, 32, sizeof(Sim), st>>>(nw, qpos, qvel, warm, ctrl, fric, com, iterations, nsub, oq, ov, ow, info, ocon,
-                                         tape);
+                                         tape, qfrc, kp_scale);
   return (int)cudaGetLastError();
 #endif
 }
@@ -307,9 +310,10 @@ namespace ffi = xla::ffi;
 @DEFINES@
 typedef int (*UploadFn)(const float*, cudaStream_t);
 typedef int (*AdjointFn)(cudaStream_t, int, int, const float*, const float*, const float*, const float*, const float*,
-                         float*, float*, float*, int*, const float*, float);
+                         float*, float*, float*, int*, const float*, float, const float*, const float*, float*);
 typedef int (*ForwardFn)(cudaStream_t, int, const float*, const float*, const float*, const float*, const float*,
-                         const float*, int, int, float*, float*, float*, int*, float*, float*, void*);
+                         const float*, int, int, float*, float*, float*, int*, float*, float*, void*, const float*,
+                         const float*);
 typedef int (*LaunchFn)(int, long long*);
 typedef int (*KinFn)(cudaStream_t, int, const float*, const float*, const float*, float*, float*, float*, float*,
                      float*);
@@ -542,7 +546,7 @@ static ffi::Error forward_impl(cudaStream_t st, ffi::ScratchAllocator& scratch, 
   }
   int rc = kForward(st, (int)B, qpos.typed_data(), qvel.typed_data(), warm.typed_data(), ctrl.typed_data(),
                     fric.typed_data(), com.typed_data(), iterations, substeps, qo->typed_data(), vo->typed_data(),
-                    wo->typed_data(), info->typed_data(), con->typed_data(), tp, work);
+                    wo->typed_data(), info->typed_data(), con->typed_data(), tp, work, nullptr, nullptr);
   if (rc) return cuda_error((cudaError_t)rc, "k_substep launch");
   if (kin) {  // the output state's kinematics (the outputs are complete after the last k_post, in stream order)
     rc = kKin(st, (int)B, qo->typed_data(), vo->typed_data(), com.typed_data(), kin[0]->typed_data(),
@@ -649,7 +653,7 @@ static ffi::Error bwd_impl(cudaStream_t st, ffi::Buffer<ffi::F32> tape, ffi::Buf
   }
   int rc = adj(st, (int)B, substeps, tape.typed_data(), fric.typed_data(), com.typed_data(), cq, cv, gq->typed_data(),
                gv->typed_data(), gu->typed_data(), info->typed_data(), ctrl ? ctrl->typed_data() : nullptr,
-               clamp_soft);
+               clamp_soft, nullptr, nullptr, nullptr);
   if (rc) return cuda_error((cudaError_t)rc, "k_adjoint launch");
   k_diag_bwd<<<diag_grid(B), 256, 0, st>>>((int)B, gq->typed_data(), gv->typed_data(), gu->typed_data(), cq, cv,
                                             info->typed_data());
@@ -816,17 +820,17 @@ def _model(model_dir=None, model=None, foot_pairs=None):
     return m, mt["foot_pairs"]
 
 
-def library_sources(m, foot_pairs, forward_unit=False, target=None):
+def library_sources(m, foot_pairs, forward_unit=False, target=None, com_body_id=None):
     """({file name: CUDA source} of the library's translation units, the packed constants, the per-unit -D options).
     forward_unit: the forward and kinematics kernels in a unit of their own, FWD_UNIT.cu (the text of FWD_VARIANT's unit,
     built with other architecture flags: cuda.arch_flags('forward')), every adjoint variant's unit without them. target:
     the build target (default cuda.arch()), whose forward-unit -D options (cuda.unit_defines: the register caps on
     sm_90) the unit with the forward kernels gets."""
-    consts, lays, sizes = adjoint.engine_constants(m, foot_pairs)
+    consts, lays, sizes = adjoint.engine_constants(m, foot_pairs, com_body_id=com_body_id)
     load = host.loader(lays, sizes)
     load = re.sub(r"cudaMemcpyToSymbol\(([^;]*)\);", r"cudaMemcpyToSymbolAsync(\1, 0, cudaMemcpyHostToDevice, st);", load)
     assert "cudaMemcpyToSymbol(" not in load
-    engine = adjoint.cuda_source(m)
+    engine = adjoint.cuda_source(m, com_body_id=com_body_id)
     assert engine.count("#include <cuda_runtime.h>\n") == 1 and engine.count("#include") == 1, \
         "the engine source may only include cuda_runtime.h (it is wrapped in a namespace)"
     engine = engine.replace("#include <cuda_runtime.h>\n", "")
@@ -865,12 +869,13 @@ def library_sources(m, foot_pairs, forward_unit=False, target=None):
         t = _tag(v)
         decls.append(f'extern "C" int {t}_upload(const float*, cudaStream_t);')
         decls.append(f'extern "C" int {t}_adjoint(cudaStream_t, int, int, const float*, const float*, const float*, '
-                     f'const float*, const float*, float*, float*, float*, int*, const float*, float);')
+                     f'const float*, const float*, float*, float*, float*, int*, const float*, float, '
+                     f'const float*, const float*, float*);')
         decls.append(f'extern "C" void {t}_sizes(long long*);')
         decls.append(f'extern "C" int {t}_launch(int, long long*);')
     decls.append(f'extern "C" int {fp}_forward(cudaStream_t, int, const float*, const float*, '
                  f'const float*, const float*, const float*, const float*, int, int, float*, float*, float*, int*, '
-                 f'float*, float*, void*);')
+                 f'float*, float*, void*, const float*, const float*);')
     decls.append(f'extern "C" long long {fp}_work_bytes(int);')
     decls.append(f'extern "C" int {fp}_kinematics(cudaStream_t, int, const float*, const float*, '
                  f'const float*, float*, float*, float*, float*, float*);')
@@ -900,7 +905,7 @@ def library_sources(m, foot_pairs, forward_unit=False, target=None):
     return units, consts, defines
 
 
-def build_plan(m, foot_pairs, arch):
+def build_plan(m, foot_pairs, arch, com_body_id=None):
     """How init() builds the library for build target arch: dict(units, consts, defines (library_sources), unit_arch
     ({unit: architecture flags} where they are not -arch=<arch>: every unit on sm_120 by default, the forward unit only
     with $DK_SM120_FRONTEND=split; cuda.arch_flags), arch_flags (forward, adjoint), split (the forward / kinematics
@@ -910,7 +915,7 @@ def build_plan(m, foot_pairs, arch):
     fwd_flags = cuda.arch_flags("forward", arch)  # the forward / kinematics unit's (NVVM 7 on sm_120)
     adj_flags = cuda.arch_flags(None, arch)  # the adjoint units' and the FFI unit's (NVVM 7 on sm_120 with n7)
     split = fwd_flags != adj_flags
-    units, consts, defines = library_sources(m, foot_pairs, forward_unit=split, target=arch)
+    units, consts, defines = library_sources(m, foot_pairs, forward_unit=split, target=arch, com_body_id=com_body_id)
     fu = FWD_UNIT if split else _tag(FWD_VARIANT)
     fwd_defines = [d for d in defines[f"{fu}.cu"]
                    if not d.startswith(("-DDK_ADJ_CLAMP_KV=", "-DDK_ADJ_NORMAL="))]  # (the register caps)

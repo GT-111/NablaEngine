@@ -13,7 +13,7 @@ contact or row; no warp intrinsics, no shared state. They need source.DEVICE (qr
 step.STEP_DEVICE (kbimp, imp_raw, efc_D, contact_invw, sphere_sphere, make_frame and the primitives' geometry that
 collide_pair uses: plane_point, plane_capsule_frame, capsule_end, segment_point, capcap_*) before them in the compilation
 unit, and header(m) (which asserts the
-model: no boxes, no frictionloss rows). Unit-test labels: U4-U9 (docs/verification.md).
+model: no box contacts). Unit-test labels: U4-U9 (docs/verification.md).
 
 Conventions:
 - P = grad Psi with MuJoCo Warp's res_* sign (the adjoint kernel subtracts it: qbar = qbar_dir - P). Every "bar"
@@ -59,14 +59,12 @@ from nablaengine.g1_engine import step
 
 
 def check_model(m):
-    """The contact adjoint is for the mjlab model only: collision geoms are planes, spheres and capsules
-    (no boxes), and no dof has a frictionloss row."""
+    """The contact adjoint's collision geoms are planes, spheres and capsules (no boxes)."""
     types = {int(m.geom_type[g]) for g in step.collision_geoms(m)}
     assert int(mujoco.mjtGeom.mjGEOM_BOX) not in types, "the adjoint has no box collisions (mjlab model only)"
     assert {step.GEOM_TYPE[t] for t in types} <= {0, 1, 2}, "collision geoms other than plane / sphere / capsule"
     planes = [g for g in step.collision_geoms(m) if int(m.geom_type[g]) == int(mujoco.mjtGeom.mjGEOM_PLANE)]
     assert all(int(m.geom_bodyid[g]) == 0 for g in planes), "a plane not on the world body (it gets no cotangent)"
-    assert not (m.dof_frictionloss > 0).any(), "the adjoint has no frictionloss rows (mjlab model only)"
 
 
 def header(m):
@@ -86,7 +84,7 @@ def header(m):
 #ifndef DK_ADJ_PARALLEL_EPS
 #define DK_ADJ_PARALLEL_EPS 1.2e-3f  // sin^2(theta) = |a1 x a2|^2 / (|a1|^2 |a2|^2) of DK_ADJ_PARALLEL 1 (strict <):
 #endif                               // ~sin^2(2 degrees) (theta < 1.99 degrees)
-static_assert(!HAS_BOX && NFLOSS == 0, "the contact adjoint is for the mjlab model: no boxes, no frictionloss rows");
+static_assert(!HAS_BOX, "the contact adjoint has no box collisions");
 // adj_contact_geom's branch bits (its return value; -1: a type combination without a VJP)
 #define ADJ_BR_FREE1 1      // capsule-capsule: segment parameter x1 free (inside, not clamped)
 #define ADJ_BR_FREE2 2      // capsule-capsule x2 / sphere-capsule t free
