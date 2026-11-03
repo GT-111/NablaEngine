@@ -366,6 +366,7 @@ struct Sim {
     };
   };
   float M[NTRI], L[NTRI];  // mass matrix and Cholesky scratch, packed lower triangles TRI(i, j)
+  double H[NTRI];  // accumulate contact curvature before rounding once for the float factorization
   float qpos[NQ], qvel[NV], zero[NV], qsm[NV], qacc0[NV], qacc[NV], Ma[NV], grad[NV], p[NV], Mp[NV], tmp[NV];
   alignas(16) float cbuf[72];  // CHOL_SOLVE's scratch (chol_solve_bcast)
   float com[COM_WIDTH], fric;
@@ -1324,14 +1325,15 @@ __device__ __forceinline__ unsigned long long support_mask(unsigned long long x)
   return m;
 #endif
 }
-// the Newton Hessian into s.L (see below); world and group: tiled contact masks and groups by body
+// the Newton Hessian into s.L, accumulated in s.H before its float rounding;
+// world and group: tiled contact masks and groups by body
 // (substep_post)
 template <class S>
 __device__ __forceinline__ void hessian(S& s, int ncon, const unsigned* world, const unsigned* group, int lane) {
   // H = M + J' D J on the quadratic rows (lower triangle into L), curvatures D from the rows' zones at jar. The pyramid
   // rows of a contact, u_k = n +- mu t1, n +- mu t2, add C_nn n n' + C_n1 (n t1' + t1 n') + C_11 t1 t1' + (same for t2)
   // = J' C J with C = [C_nn C_n1 C_n2; C_n1 C_11 0; C_n2 0 C_22] (only C_nn for condim 1) and J the frame rows
-  float mv[(NTRI + 31) / 32];  // L = M: all loads first (entry e by lane e mod 32)
+  float mv[(NTRI + 31) / 32];  // H = M: all loads first (entry e by lane e mod 32)
 #pragma unroll
   for (int k = 0; k < (NTRI + 31) / 32; k++) if (lane + 32 * k < NTRI) mv[k] = s.M[lane + 32 * k];
   int ha[HSETS_STORAGE][3], hb[HSETS_STORAGE], hthr[HSETS_STORAGE][3];  // this lane's support pairs (ha, hb) of one column hb per set, the
@@ -1365,21 +1367,21 @@ __device__ __forceinline__ void hessian(S& s, int ncon, const unsigned* world, c
   }
   SUBPROF(27);
 #pragma unroll
-  for (int k = 0; k < (NTRI + 31) / 32; k++) if (lane + 32 * k < NTRI) s.L[lane + 32 * k] = mv[k];
+  for (int k = 0; k < (NTRI + 31) / 32; k++) if (lane + 32 * k < NTRI) s.H[lane + 32 * k] = mv[k];
   const int ndof = uniform_int(s.nefc_dof, 8);
 #if NEQ > 0
   __syncwarp();
   for (int i = 0; i < NV; i++)
     for (int j = lane; j <= i; j += 32) {
-      float value = s.L[TRI(i, j)];
+      double value = s.H[TRI(i, j)];
       for (int r = 0; r < ndof; r++) {
         float ci = dof_row_coef(s, r, i), cj = dof_row_coef(s, r, j);
         if (ci == 0.f || cj == 0.f) continue;
         float ds, dd, cost;
         row_eval(s, r, s.efc_jar[r], &ds, &dd, &cost);
-        value += ci * cj * dd;
+        value += (double)ci * cj * dd;
       }
-      s.L[TRI(i, j)] = value;
+      s.H[TRI(i, j)] = value;
     }
 #else
 #if DK_HESS_DOFPAR
@@ -1388,7 +1390,7 @@ __device__ __forceinline__ void hessian(S& s, int ncon, const unsigned* world, c
     for (int r = lane; r < ndof; r += 32) {
       float ds, dd, c;
       row_eval(s, r, s.efc_jar[r], &ds, &dd, &c);
-      s.L[TRI(s.efc_a[r], s.efc_a[r])] += dd;
+      s.H[TRI(s.efc_a[r], s.efc_a[r])] += dd;
     }
   } else
 #endif
@@ -1403,7 +1405,7 @@ __device__ __forceinline__ void hessian(S& s, int ncon, const unsigned* world, c
     for (int k = 0; k < min(32, ndof - r0); k++) {
       int ek = __shfl_sync(0xffffffffu, e, k);
       float dk = __shfl_sync(0xffffffffu, dd, k);
-      if ((ek & 31) == lane) s.L[ek] += dk;
+      if ((ek & 31) == lane) s.H[ek] += dk;
     }
   }
 #endif
@@ -1412,7 +1414,7 @@ __device__ __forceinline__ void hessian(S& s, int ncon, const unsigned* world, c
   // the contacts on the lower triangles of their supports (dofs ascending: dof[a] >= dof[b]): first the world
   // contacts, a group (one body, one support) at a time, then each contact between two bodies. Per lane and set: the
   // pairs (a, b) of one column b, H_ab = J_a' G_b with G_b = C J_b once per contact, summed over the group before the
-  // update of L
+  // update of H
   for (int pass = 0; pass < 2; pass++)
   for (int tile = 0; tile < CON_TILES; tile++) {
     bool w = pass == 0;
@@ -1429,13 +1431,13 @@ __device__ __forceinline__ void hessian(S& s, int ncon, const unsigned* world, c
       for (int k = 0; k < HSETS; k++) {
         if (nd <= hlo[k]) break;  // no rows of this set in the support
         int db = dof[hb[k]], he[3];
-        float hv[3], lv[3];
+        double hv[3], lv[3];
 #pragma unroll
         for (int t = 0; t < 3; t++) {  // the entries of one support are distinct: loads first, stores after the sum
           int da = dof[ha[k][t]];
           he[t] = da * (da + 1) / 2 + db;
           hv[t] = 0.f;
-          if (nd > hthr[k][t]) lv[t] = s.L[he[t]];
+          if (nd > hthr[k][t]) lv[t] = s.H[he[t]];
         }
         unsigned mm = gm;
         int in = __ffs(mm) - 1;  // the next contact, found one iteration ahead
@@ -1446,18 +1448,24 @@ __device__ __forceinline__ void hessian(S& s, int ncon, const unsigned* world, c
           int cc = c0 + i, b = hb[k];
           const float *C = s.con_C[cc], *Jn = s.con_J[cc][0], *Ja = s.con_J[cc][1], *Jb = s.con_J[cc][2];
           float j0 = Jn[b], j1 = Ja[b], j2 = Jb[b];  // G_b (condim 1: C_nn only, the rest adds exact zeros)
-          float g0 = C[0] * j0 + C[1] * j1 + C[3] * j2, g1 = C[1] * j0 + C[2] * j1, g2 = C[3] * j0 + C[4] * j2;
+          double g0 = (double)C[0] * j0 + (double)C[1] * j1 + (double)C[3] * j2;
+          double g1 = (double)C[1] * j0 + (double)C[2] * j1, g2 = (double)C[3] * j0 + (double)C[4] * j2;
 #pragma unroll
           for (int t = 0; t < 3; t++) {
             int a = ha[k][t];
-            hv[t] = fmaf(Jb[a], g2, fmaf(Ja[a], g1, fmaf(Jn[a], g0, hv[t])));
+            hv[t] = fma((double)Jb[a], g2, fma((double)Ja[a], g1, fma((double)Jn[a], g0, hv[t])));
           }
         }
 #pragma unroll
-        for (int t = 0; t < 3; t++) if (nd > hthr[k][t]) s.L[he[t]] = lv[t] + hv[t];
+        for (int t = 0; t < 3; t++) if (nd > hthr[k][t]) s.H[he[t]] = lv[t] + hv[t];
       }
     }
   }
+  // Support entries can belong to different lanes between contacts. Publish
+  // their complete sums before the packed copy consumed by Cholesky.
+  __syncwarp();
+#pragma unroll
+  for (int e = lane; e < NTRI; e += 32) s.L[e] = (float)s.H[e];
 }
 
 // The two-root scene has block-diagonal smooth dynamics and one coupled constraint solve. Body work is tiled over
@@ -2163,6 +2171,7 @@ __device__ __forceinline__ void substep(S& s, const float* ctrl, int iterations,
 template <int NC, int NROW>
 struct SimNT {  // substep_post: Newton, implicitfast; capacity NC contacts, NR rows. Members whose lifetimes do not
   float M[NTRI], L[NTRI];  // overlap share storage (unions), the read-only ones the loop seldom reads stay in Hand
+  double H[NTRI];  // shared or Hand::big scratch; never part of the tape
   float qacc[NV], Ma[NV];
   union { float grad[NV], p[NV]; };  // grad is last read by p = -grad (in place)
   union { float Mp[NV], tmp[NV]; };  // Mp: line search to update; tmp: J'f (newton_grad), start's qacc, implicitfast

@@ -4,8 +4,10 @@ PYTHONPATH=src python scripts/model_generation_check.py
 These checks generate source; numerical CUDA qualification is a separate check.
 """
 
+from pathlib import Path
 import shutil
 import subprocess
+import tempfile
 import unittest
 
 import mujoco
@@ -138,6 +140,61 @@ class GenerationCheck(unittest.TestCase):
         result = subprocess.run(["c++", "-std=c++17", "-fsyntax-only", "-x", "c++", "-"],
                                 input=code, text=True, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipUnless(shutil.which("c++"), "Hessian accumulation check requires a C++ compiler")
+    def test_hessian_retains_small_contact_curvature_across_tiles(self):
+        model = dense_contact_model()
+        header = source.header(model, maxd=2, wpb=1).replace("#include <cuda_runtime.h>", "")
+        sim = step.STEP_DEVICE.split("struct Sim {", 1)[1].split("// a condition that", 1)[0]
+        hessian = step.STEP_KERNEL.split("template <class S>\n__device__ __forceinline__ void hessian", 1)[1]
+        hessian = "template <class S>\nvoid hessian" + hessian.split("// The two-root scene", 1)[0]
+        # All contacts have the same scalar curvature. This executes the real
+        # Hessian entry owned by lane zero; uniform ballots stand in for its
+        # warp, and the other lanes' identical con_C values are prefilled.
+        harness = r'''
+#include <cmath>
+#include <cstdio>
+#define __device__
+#define SUBPROF(x)
+inline void __syncwarp() {}
+inline unsigned __ballot_sync(unsigned, bool on) { return on ? ~0u : 0u; }
+template<class T> T __shfl_sync(unsigned, T value, int) { return value; }
+inline int __ffs(unsigned value) { return __builtin_ffs(value); }
+inline int uniform_int(int value, int) { return value; }
+template<class T> T min(T a, T b) { return a < b ? a : b; }
+template<class S> void row_eval(S&, int, float, float* ds, float* dd, float* cost) {
+  *ds=*dd=*cost=0;
+}
+'''
+        main = r'''
+// Negative control: per-contact float storage loses these valid contributions.
+struct FloatAccumulation : Sim { float H[NTRI]; };
+template<class S> float assembled_entry(S& s) {
+  s.M[0]=100000000.f;
+  for (int c=0;c<288;c++) {
+    s.con_nd[c]=KDOF; s.con_dim[c]=1; s.con_row[c]=c; s.con_nrow[c]=1;
+    s.con_C[c][0]=1; s.efc_jar[c]=-1; s.efc_D[c]=1;
+    s.con_J[c][0][0]=1;
+    for (int k=0;k<KDOF;k++) s.con_dof[c][k]=k;
+  }
+  unsigned world[CON_TILES]={}, group[CON_TILES]={};
+  hessian(s,288,world,group,0);
+  return s.L[0];
+}
+int main() {
+  static Sim real{}; static FloatAccumulation rounded{};
+  std::printf("%.0f %.0f\n", assembled_entry(real), assembled_entry(rounded));
+}
+'''
+        code = harness + header + step.step_header(model) + "struct Sim {" + sim + hessian + main
+        with tempfile.TemporaryDirectory(prefix="nabla-hessian-cpu-") as directory:
+            path = Path(directory)
+            (path / "hessian.cc").write_text(code)
+            compiled = subprocess.run(["c++", "-std=c++17", "-O2", str(path / "hessian.cc"),
+                                       "-o", str(path / "hessian")], text=True, capture_output=True)
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
+            result = subprocess.run([str(path / "hessian")], check=True, text=True, capture_output=True)
+        self.assertEqual([float(value) for value in result.stdout.split()], [100000288., 100000000.])
 
     def test_native_mesh_feature_tape_and_pair_mapping(self):
         model = mujoco.MjModel.from_xml_string('''<mujoco>
