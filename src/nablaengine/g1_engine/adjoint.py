@@ -1583,8 +1583,27 @@ __global__ void k_adjoint(int nw, int nsub, const float* tape, const float* fric
 #endif
   APROF_START();
   adj_init(s, lane);
-  for (int i = lane; i < NQ; i += 32) s.qbar[i] = gq_out[(size_t)w * NQ + i];
-  for (int i = lane; i < NV; i += 32) s.vbar[i] = gv_out[(size_t)w * NV + i];
+  float largest_cot = 0.f;
+  for (int i = lane; i < NQ; i += 32) {
+    s.qbar[i] = gq_out[(size_t)w * NQ + i];
+    largest_cot = fmaxf(largest_cot, fabsf(s.qbar[i]));
+  }
+  for (int i = lane; i < NV; i += 32) {
+    s.vbar[i] = gv_out[(size_t)w * NV + i];
+    largest_cot = fmaxf(largest_cot, fabsf(s.vbar[i]));
+  }
+  for (int offset = 16; offset; offset >>= 1)
+    largest_cot = fmaxf(largest_cot, __shfl_xor_sync(0xffffffffu, largest_cot, offset));
+  // For a fixed tape every cotangent path is linear. An exact power-of-two
+  // change of units keeps large finite seeds from overflowing intermediate
+  // contractions whose final sum still fits float32. Never form 2^exponent as
+  // a float: exponent 128 is valid even though that scale alone is infinite.
+  int cot_exponent = 0;
+  if (isfinite(largest_cot) && largest_cot > 1.f) frexpf(largest_cot, &cot_exponent);
+  if (cot_exponent) {
+    for (int i = lane; i < NQ; i += 32) s.qbar[i] = scalbnf(s.qbar[i], -cot_exponent);
+    for (int i = lane; i < NV; i += 32) s.vbar[i] = scalbnf(s.vbar[i], -cot_exponent);
+  }
   for (int i = lane; i < NU; i += 32) s.ubar[i] = 0.f;
   if (lane < COM_WIDTH) s.com[lane] = com[w * COM_WIDTH + lane];
   if (lane == 0) { s.fric = fric ? fric[w] : 0.f; s.kp_scale = kp_scale ? kp_scale[w] : 1.f; }
@@ -1601,13 +1620,23 @@ __global__ void k_adjoint(int nw, int nsub, const float* tape, const float* fric
     const size_t r = (size_t)w * nsub + k;
     adj_substep(s, tape + r * REC_WORDS, lane, dbg ? dbg + r * DBG_WORDS : nullptr,
                 ctrl ? ctrl + (size_t)w * (NU) : nullptr);
+#ifdef DK_ADJ_DEBUG
+    if (dbg && cot_exponent) {  // restore cotangent units; replayed state/row diagnostics stay unchanged
+      float* row = dbg + r * DBG_WORDS;
+      for (int i = lane; i < DBG_W_DIR; i += 32) row[i] = scalbnf(row[i], cot_exponent);
+      for (int i = DBG_ADJ_QPOS_M + lane; i < DBG_RESID; i += 32) row[i] = scalbnf(row[i], cot_exponent);
+      for (int i = DBG_CON_DIST_BAR + lane; i < DBG_CON_X; i += 32) row[i] = scalbnf(row[i], cot_exponent);
+    }
+#endif
   }
-  for (int i = lane; i < NQ; i += 32) gq_in[(size_t)w * NQ + i] = s.qbar[i];
+  for (int i = lane; i < NQ; i += 32)
+    gq_in[(size_t)w * NQ + i] = cot_exponent ? scalbnf(s.qbar[i], cot_exponent) : s.qbar[i];
   for (int i = lane; i < NV; i += 32) {
-    gv_in[(size_t)w * NV + i] = s.vbar[i];
-    if (gqfrc) gqfrc[(size_t)w * NV + i] = s.qfrcbar[i];
+    gv_in[(size_t)w * NV + i] = cot_exponent ? scalbnf(s.vbar[i], cot_exponent) : s.vbar[i];
+    if (gqfrc) gqfrc[(size_t)w * NV + i] = cot_exponent ? scalbnf(s.qfrcbar[i], cot_exponent) : s.qfrcbar[i];
   }
-  for (int i = lane; i < NU; i += 32) gctrl[(size_t)w * (NU) + i] = s.ubar[i];
+  for (int i = lane; i < NU; i += 32)
+    gctrl[(size_t)w * (NU) + i] = cot_exponent ? scalbnf(s.ubar[i], cot_exponent) : s.ubar[i];
   if (lane == 0) info[w] = s.flags;
 #ifdef DK_PROFILE
   APROF(APROF_IO);

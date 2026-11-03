@@ -196,6 +196,95 @@ int main() {
             result = subprocess.run([str(path / "hessian")], check=True, text=True, capture_output=True)
         self.assertEqual([float(value) for value in result.stdout.split()], [100000288., 100000000.])
 
+    @unittest.skipUnless(shutil.which("c++"), "adjoint scaling check requires a C++ compiler")
+    def test_adjoint_preconditions_large_cotangents_without_hiding_output_overflow(self):
+        # Execute the actual native entry/return code with one active lane. Its
+        # local linear VJP has a representable result but an overflowing float
+        # intermediate at the magnitude of the first captured H64 failure.
+        kernel = adjoint.ADJ_KERNEL.split("#ifndef DK_ADJ_WORLDS_PER_SM", 1)[0]
+        kernel = kernel.replace("extern __shared__ __align__(16) unsigned char dk_smem[];",
+                                "alignas(16) static unsigned char dk_smem[sizeof(Adj)];")
+        harness = r'''
+#include <cmath>
+#include <cstddef>
+#include <limits>
+using std::isfinite;
+#define __global__
+#define NQ 1
+#define NV 1
+#define NU 1
+#define COM_WIDTH 1
+#define REC_WORDS 1
+#define DK_ADJ_CLAMP_KV 0
+#define DK_ADJ_DEBUG
+#define ADJ_SOFT_PARAM
+#define APROF_START()
+#define APROF(x)
+#define DBG_W_DIR 2
+#define DBG_ADJ_QPOS_M 3
+#define DBG_RESID 7
+#define DBG_CON_DIST_BAR 8
+#define DBG_CON_X 10
+#define DBG_WORDS 12
+struct { int x=0; } threadIdx, blockIdx;
+inline void __syncwarp() {}
+inline float __shfl_xor_sync(unsigned, float, int) { return 0.f; }
+struct Adj {
+  float qbar[1],vbar[1],ubar[1],qfrcbar[1],com[1],fric,kp_scale;
+  const float* applied;
+  int flags;
+};
+int mode=0;
+void adj_init(Adj& s,int) { s.flags=0; s.qfrcbar[0]=0; }
+void adj_substep(Adj& s,const float*,int,float* dbg,const float*) {
+  // Both modes are linear. The first has an avoidable intermediate
+  // overflow; the second's true result exceeds the output representation.
+  volatile float intermediate=s.qbar[0]*32.f;
+  s.qbar[0]=mode ? intermediate : intermediate/32.f;
+  s.vbar[0]*=2.f;
+  s.ubar[0]+=s.qbar[0]*.125f;
+  s.qfrcbar[0]+=s.vbar[0]*.25f;
+  if(dbg) {
+    dbg[0]=s.qbar[0]; dbg[1]=s.vbar[0];
+    dbg[3]=s.qbar[0]; dbg[4]=s.vbar[0]; dbg[5]=s.ubar[0]; dbg[6]=s.qfrcbar[0];
+    dbg[8]=s.qbar[0]*.25f; dbg[9]=s.vbar[0]*.5f;
+    dbg[2]=7.f; dbg[7]=11.f; dbg[10]=13.f;
+  }
+}
+'''
+        main = r'''
+bool check(float q,float v) {
+  float record=0,friction=0,com=0,force=0,kp=1,gq,gv,gu,gf,dbg[DBG_WORDS]={}; int info;
+  k_adjoint(1,1,&record,&friction,&com,&q,&v,&gq,&gv,&gu,&info,dbg,nullptr,&force,&kp,&gf);
+  return gq==q && gv==2.f*v && gu==q*.125f && gf==v*.5f && info==0
+    // Lane zero restores the first entry of each cotangent debug range;
+    // the other lanes own the remaining entries in a real CUDA warp.
+    && dbg[0]==q && dbg[3]==q && dbg[8]==q*.25f
+    && dbg[2]==7.f && dbg[7]==11.f && dbg[10]==13.f;
+}
+int main() {
+  const float q=2.5991347605514315e37f,v=6.176665182989242e34f;
+  volatile float large=q, intermediate=large*32.f;
+  if(!std::isinf(intermediate/32.f)) return 1;  // negative control
+  if(!check(q,v) || !check(.75f,-.5f) || !check(2.75f,-.125f) || !check(0.f,0.f)) return 2;
+  // frexpf(FLT_MAX) returns exponent128, whose inverse scale cannot be
+  // materialized as a finite float. scalbnf must still restore this output.
+  if(!check(std::numeric_limits<float>::max(),1.f)) return 3;
+  mode=1;
+  float record=0,friction=0,com=0,gq,gv,gu,gf; int info;
+  k_adjoint(1,1,&record,&friction,&com,&q,&v,&gq,&gv,&gu,&info,nullptr,nullptr,nullptr,nullptr,&gf);
+  return std::isinf(gq) ? 0 : 4;
+}
+'''
+        with tempfile.TemporaryDirectory(prefix="nabla-adjoint-scale-cpu-") as directory:
+            path = Path(directory)
+            (path / "adjoint.cc").write_text(harness + kernel + main)
+            compiled = subprocess.run(["c++", "-std=c++17", "-O2", str(path / "adjoint.cc"),
+                                       "-o", str(path / "adjoint")], text=True, capture_output=True)
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
+            result = subprocess.run([str(path / "adjoint")], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_native_mesh_feature_tape_and_pair_mapping(self):
         model = mujoco.MjModel.from_xml_string('''<mujoco>
           <option integrator="implicitfast" solver="Newton" cone="pyramidal"/>

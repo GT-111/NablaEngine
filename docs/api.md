@@ -70,6 +70,11 @@ differences); `clamp_kv=0, normal=3` are the interface defaults. The forward doe
 `normal`, `clamp_soft` or `grad_decay`: one tape serves every adjoint variant, and the forward outputs are bitwise
 the same in every mode.
 
+The native adjoint uses one power-of-two scale per world's incoming state cotangents to avoid intermediate
+overflow, then restores that scale on every returned physics gradient. This is numerical preconditioning;
+the gradient convention, clipping and decay options are unchanged. Gradients outside the float32 output range
+remain nonfinite.
+
 A VJP through the custom call is a plain JAX VJP:
 
 ```python
