@@ -24,8 +24,22 @@ with dof frictionloss. Equality positions, velocities, Jacobians and constraint 
 3.17. These checks do not execute CUDA kernels or qualify a hand's forward accuracy, finite-difference VJP accuracy,
 runtime or contact behavior. Run forward and VJP checks on the actual compiled model and target GPU for those claims;
 use `clamp_kv=1, normal=0, grad_decay=1` for finite differences and report training mode separately.
-The synthetic models in this check have no collision geometry. They do not represent the normal DexForge five-hand
-native scenes, whose enabled convex-mesh contacts and multiple free roots remain unsupported by this candidate.
+The two-root cases also cover all 56 velocities / 58 positions, 64-bit ancestor masks, 12 soft joint equalities,
+implicit cross-root sphere contacts, native material mixing, and a nonzero off-diagonal contact Hessian. They check
+that native implicit mesh contacts remain rejected. Most synthetic cases have no collision geometry; none represents
+the full enabled convex-mesh contact graph of the normal DexForge five-hand native scenes.
+
+The first coupled CUDA snapshot has a finite check with explicit source, cache and result locations:
+
+```bash
+python scripts/coupled_physics_check.py --source-root "$NABLA_SOURCE" --cache "$NABLA_CACHE" \
+    --out "$NABLA_RESULTS/coupled-check.json" --device cuda:0 \
+    --cases coupled_contact,coupled_large,coupled_equalities,g1
+```
+
+It compares forward Q/V and directional Q/V/control/applied-force VJPs with float64 MuJoCo, checks a force on one
+root affects the other through contact, and reports the differentiated forward's status and tape diagnostics. It runs only on the selected local CUDA device;
+no CUDA result is implied by the script's presence.
 
 ## Data
 

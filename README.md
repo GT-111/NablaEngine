@@ -31,16 +31,19 @@ the engine's simulation gradients.
 
 ## Scope
 
-The generated engine supports a free root followed by one hinge at each body's origin, with at most 31 bodies,
+The generated engine uses a free root followed by one hinge at each body's origin, with at most 31 bodies,
 five children per body and 12 hinge ancestors. Position actuators may drive a subset of the hinges in any order;
 passive hinges retain their coordinates. The solver includes linear joint damping, dof frictionloss, hinge limits,
 up to six active soft linear joint equalities, symmetric actuator and joint force limits, and explicit sphere,
 capsule and floor contacts. Models with no contact pairs generate directly. Physics uses MuJoCo's Newton solver
 and implicitfast integration in float32. Unsupported features are rejected with their capability-check codes.
-Multiple free roots, implicit `contype` / `conaffinity` contacts and convex-mesh collisions remain unsupported.
+The current candidate adds two top-level FREE roots with full coordinates, up to 64 bodies, two compiled COM
+offsets, 12 soft linear joint equalities and generated `contype` / `conaffinity` primitive contacts. Smooth dynamics
+remain separate within each tree; contact rows enter one coupled Newton solve. Convex-mesh collisions remain
+unsupported, so the actual DexForge bilateral hand scenes are not yet admitted.
 
-The published numerical and performance results qualify the mjlab Unitree G1. The smaller-model extensions
-have CPU source-generation and MuJoCo row checks; those checks alone do not qualify CUDA forward or gradient accuracy.
+The published numerical and performance results qualify the mjlab Unitree G1. The model extensions
+have CPU source-generation and MuJoCo row checks; the two-root candidate still requires CUDA forward and VJP checks.
 The PyTorch interface can select the compiled COM-offset body by id and supply applied generalized forces and a
 per-world Kp scale (Kd stays fixed); see `docs/api_torch.md`.
 

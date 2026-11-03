@@ -67,14 +67,15 @@ def check_model(m):
     body_jntadr -1 (which would index the last joint): body_jntnum is checked first."""
     from nablaengine.model import capability
     capability.require(m, None, None, "kinematics", "kinematics outputs")
-    assert m.nbody <= 32 and m.nmocap == 0
+    assert m.nbody <= 64 and m.nmocap == 0
     assert not np.any(m.body_pos[0]) and np.array_equal(m.body_quat[0], [1.0, 0.0, 0.0, 0.0]) and m.body_mass[0] == 0
-    assert [b for b in range(1, m.nbody) if m.body_parentid[b] == 0] == [1]
-    assert all(int(m.body_rootid[b]) == 1 for b in range(1, m.nbody)) and int(m.body_rootid[0]) == 0
-    for b in range(2, m.nbody):
+    roots = [b for b in range(1, m.nbody) if m.body_parentid[b] == 0]
+    assert len(roots) in (1, 2) and int(m.body_rootid[0]) == 0
+    for b in range(1, m.nbody):
         assert m.body_jntnum[b] == 1 and m.body_jntadr[b] >= 0, f"body {b}: one joint (a jointless body has none)"
         j = m.body_jntadr[b]
-        assert m.jnt_type[j] == mujoco.mjtJoint.mjJNT_HINGE and m.qpos0[m.jnt_qposadr[j]] == 0.0
+        assert m.jnt_type[j] == (mujoco.mjtJoint.mjJNT_FREE if b in roots else mujoco.mjtJoint.mjJNT_HINGE)
+        assert b in roots or m.qpos0[m.jnt_qposadr[j]] == 0.0
     sub = np.array(m.body_mass, np.float64)
     for b in range(m.nbody - 1, 0, -1):
         sub[m.body_parentid[b]] += sub[b]
@@ -99,7 +100,7 @@ struct KinF {  // the forward's per-world state (2.4 KB)
     float cv[NB][6];  // then cvel (staged for the copy-out)
   };
   float C[NB][3], Mt[NB];  // the subtree sums of m xipos, then the subtree COMs; the subtree masses
-  float qpos[NQ], qvel[NV], com[3];
+  float qpos[NQ], qvel[NV], com[COM_WIDTH];
 };
 struct KinB {  // the VJP's per-world state (4.5 KB): the forward's, the sweeps' cotangents, the gradients
   float Q[NB][4], X[NB][3], W[NB][3], V[NB][3], Mt[NB];
@@ -107,7 +108,7 @@ struct KinB {  // the VJP's per-world state (4.5 KB): the forward's, the sweeps'
     float C[NB][3];  // the forward's subtree sums / COMs (C_1 is kept in registers before G overwrites them)
     float G[NB][3];  // sum over the path root .. b of the subtree sums' cotangents (the down sweep)
   };
-  float qpos[NQ], qvel[NV], com[3];
+  float qpos[NQ], qvel[NV], com[COM_WIDTH];
   float bW[NB][3], bV[NB][3], F[NB][3], N[NB][3], rb[NB][3];  // twists' cotangents, pose sweep F_b, N_b, r bar_b
   float gq[NQ], gv[NV];
 };
@@ -130,7 +131,7 @@ __device__ __forceinline__ int kin_children(int b, int* ch) {
 // then the subtree COMs C and masses Mt (MJX com_pos: leaf to root, own m xipos plus the children's sums in child
 // order; C_0 = C_1, body 0 being massless with body 1 its only child, at depth 1)
 template <class S>
-__device__ __forceinline__ void kin_state(S& s, int lane) {
+__device__ __forceinline__ void kin_state_single(S& s, int lane) {
   const int b = lane, d = b < NB ? c_depth[b] : -1, p = b < NB ? c_parent[b] : 0;
   float qb[4] = {1.f, 0.f, 0.f, 0.f}, pb[3] = {0.f, 0.f, 0.f}, ax[3] = {0.f, 0.f, 1.f}, ha[4] = {1.f, 0.f, 0.f, 0.f};
   float qd = 0.f;
@@ -198,11 +199,62 @@ __device__ __forceinline__ void kin_state(S& s, int lane) {
 }
 
 template <class S>
+__device__ void kin_state_coupled(S& s, int lane) {
+  if (lane == 0) {
+    s.Q[0][0] = 1.f; s.Q[0][1] = s.Q[0][2] = s.Q[0][3] = 0.f;
+    for (int k = 0; k < 3; k++) s.X[0][k] = s.W[0][k] = s.V[0][k] = 0.f;
+  }
+  __syncwarp();
+  for (int L = 1; L <= MAXD; L++) {
+    for (int b = lane; b < NB; b += 32)
+      if (c_depth[b] == L) {
+        int p = c_parent[b];
+        const float z[3] = {0.f, 0.f, 0.f};
+        float al[3], a[3];
+        fwd_body(b, s.Q[p], s.X[p], s.W[p], s.V[p], z, z, s.qpos, s.qvel, s.qvel,
+                 s.Q[b], s.X[b], s.W[b], s.V[b], al, a);
+      }
+    __syncwarp();
+  }
+  for (int b = lane; b < NB; b += 32) {
+    float ip[3], c[3];
+    body_ipos(b, s.com, ip); qrot(s.Q[b], ip, c);
+    s.Mt[b] = c_mass[b];
+    for (int k = 0; k < 3; k++) s.C[b][k] = c_mass[b] * (s.X[b][k] + c[k]);
+  }
+  __syncwarp();
+  for (int L = MAXD - 1; L >= 0; L--) {
+    for (int b = lane; b < NB; b += 32)
+      if (c_depth[b] == L) {
+        int nc = b ? c_nchild[b] : NR;
+        for (int j = 0; j < nc; j++) {
+          int c = b ? c_child[MAX_CHILD * b + j] : c_roots[j];
+          s.Mt[b] += s.Mt[c];
+          for (int k = 0; k < 3; k++) s.C[b][k] += s.C[c][k];
+        }
+      }
+    __syncwarp();
+  }
+  for (int b = lane; b < NB; b += 32)
+    for (int k = 0; k < 3; k++) s.C[b][k] /= s.Mt[b];
+  __syncwarp();
+}
+
+template <class S>
+__device__ __forceinline__ void kin_state(S& s, int lane) {
+#if NR == 2
+  kin_state_coupled(s, lane);
+#else
+  kin_state_single(s, lane);
+#endif
+}
+
+template <class S>
 __device__ __forceinline__ void kin_load(S& s, int w, const float* qpos, const float* qvel, const float* com,
                                          int lane) {
   kin_copy(s.qpos, qpos + (size_t)w * NQ, NQ, lane);
   kin_copy(s.qvel, qvel + (size_t)w * NV, NV, lane);
-  if (lane < 3) s.com[lane] = com[(size_t)w * 3 + lane];
+  if (lane < COM_WIDTH) s.com[lane] = com[(size_t)w * COM_WIDTH + lane];
   __syncwarp();
 }
 
@@ -216,24 +268,124 @@ __global__ void __launch_bounds__(32 * KIN_WPB) k_kin(int nw, const float* qpos,
   KinF& s = sm[threadIdx.x >> 5];
   kin_load(s, w, qpos, qvel, com, lane);
   kin_state(s, lane);
-  const int b = lane;
-  float o[6] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f};  // cvel_b = [W_b; V_b + W_b x (C_1 - X_b)], body 0: zeros
-  if (b >= 1 && b < NB) {
-    float r[3], u[3];
-    for (int k = 0; k < 3; k++) r[k] = s.C[1][k] - s.X[b][k];
-    cross(s.W[b], r, u);
-    for (int k = 0; k < 3; k++) { o[k] = s.W[b][k]; o[3 + k] = s.V[b][k] + u[k]; }
-  }
-  __syncwarp();  // (cv aliases W, V)
-  if (b < NB)
-    for (int k = 0; k < 6; k++) s.cv[b][k] = o[k];
+  float o[(NB + 31) / 32][6] = {};
+  for (int b = lane; b < NB; b += 32)
+    if (b) {
+      float r[3], u[3];
+      for (int k = 0; k < 3; k++) r[k] = s.C[c_root[b]][k] - s.X[b][k];
+      cross(s.W[b], r, u);
+      for (int k = 0; k < 3; k++) { o[b / 32][k] = s.W[b][k]; o[b / 32][3 + k] = s.V[b][k] + u[k]; }
+    }
+  __syncwarp();
+  for (int b = lane; b < NB; b += 32)
+    for (int k = 0; k < 6; k++) s.cv[b][k] = o[b / 32][k];
   __syncwarp();
   float* oq = qn + (size_t)w * NQ;
-  for (int i = lane; i < NQ; i += 32) oq[i] = i >= 3 && i < 7 ? s.Q[1][i - 3] : s.qpos[i];
+  for (int i = lane; i < NQ; i += 32) oq[i] = s.qpos[i];
+  __syncwarp();
+  for (int r = lane; r < NR; r += 32) {
+    int b = c_roots[r];
+    for (int k = 0; k < 4; k++) oq[c_qadr[b] + 3 + k] = s.Q[b][k];
+  }
   kin_copy(xpos + (size_t)w * KIN_QOUT, &s.X[0][0], KIN_QOUT, lane);
   kin_copy(xquat + (size_t)w * NB * 4, &s.Q[0][0], NB * 4, lane);
   kin_copy(cvel + (size_t)w * NB * 6, &s.cv[0][0], NB * 6, lane);
   kin_copy(sc + (size_t)w * KIN_QOUT, &s.C[0][0], KIN_QOUT, lane);
+}
+
+__device__ void kin_vjp_coupled(KinB& s, int w, const float* gqn, const float* gxpos, const float* gxquat,
+                                const float* gcvel, const float* gsc, const float* gq_in, const float* gv_in,
+                                float* gq, float* gv, int lane) {
+  for (int b = lane; b < NB; b += 32) {
+    if (!b) continue;
+    size_t row = (size_t)w * NB + b;
+    float vb[3], r[3], t[3];
+    for (int k = 0; k < 3; k++) { vb[k] = gcvel[row * 6 + 3 + k]; r[k] = s.C[c_root[b]][k] - s.X[b][k]; }
+    cross(r, vb, t);
+    for (int k = 0; k < 3; k++) { s.bW[b][k] = gcvel[row * 6 + k] + t[k]; s.bV[b][k] = vb[k]; }
+    cross(vb, s.W[b], s.rb[b]);
+    for (int k = 0; k < 3; k++) { s.F[b][k] = gxpos[row * 3 + k] - s.rb[b][k]; s.N[b][k] = 0.f; }
+    if (!c_isfree[b]) {
+      const float* q = s.Q[b], *g = gxquat + row * 4;
+      s.N[b][0] = 0.5f * (-g[0] * q[1] + g[1] * q[0] - g[2] * q[3] + g[3] * q[2]);
+      s.N[b][1] = 0.5f * (-g[0] * q[2] + g[1] * q[3] + g[2] * q[0] - g[3] * q[1]);
+      s.N[b][2] = 0.5f * (-g[0] * q[3] - g[1] * q[2] + g[2] * q[1] + g[3] * q[0]);
+    }
+  }
+  __syncwarp();
+  // C has been consumed by every body before its union is reused for the subtree-sum cotangents G.
+  for (int b = lane; b < NB; b += 32) {
+    for (int k = 0; k < 3; k++) s.G[b][k] = gsc[((size_t)w * NB + b) * 3 + k] / s.Mt[b];
+    if (b && c_isfree[b])
+      for (int j = 1; j < NB; j++)
+        if (c_root[j] == b)
+          for (int k = 0; k < 3; k++) s.G[b][k] += s.rb[j][k] / s.Mt[b];
+  }
+  __syncwarp();
+  for (int L = 1; L <= MAXD; L++) {
+    for (int b = lane; b < NB; b += 32)
+      if (c_depth[b] == L)
+        for (int k = 0; k < 3; k++) s.G[b][k] += s.G[c_parent[b]][k];
+    __syncwarp();
+  }
+  for (int b = lane; b < NB; b += 32)
+    if (b) {
+      float ip[3], c[3], g[3], t[3];
+      body_ipos(b, s.com, ip); qrot(s.Q[b], ip, c);
+      for (int k = 0; k < 3; k++) { g[k] = c_mass[b] * s.G[b][k]; s.F[b][k] += g[k]; }
+      cross(c, g, t);
+      for (int k = 0; k < 3; k++) s.N[b][k] += t[k];
+    }
+  __syncwarp();
+  for (int L = MAXD; L >= 1; L--) {
+    for (int b = lane; b < NB; b += 32)
+      if (c_depth[b] == L) {
+        int p = c_parent[b], d = c_dadr[b], q = c_qadr[b];
+        float bw[3], bv[3], f[3], n[3], t[3], u[3];
+        for (int k = 0; k < 3; k++) { bw[k] = s.bW[b][k]; bv[k] = s.bV[b][k]; f[k] = s.F[b][k]; n[k] = s.N[b][k]; }
+        for (int j = 0; j < c_nchild[b]; j++) {
+          int c = c_child[MAX_CHILD * b + j];
+          float r[3];
+          for (int k = 0; k < 3; k++) r[k] = s.X[c][k] - s.X[b][k];
+          cross(r, s.bV[c], t); cross(r, s.F[c], u);
+          for (int k = 0; k < 3; k++) {
+            bw[k] += s.bW[c][k] + t[k]; bv[k] += s.bV[c][k];
+            f[k] += s.F[c][k] - s.rb[c][k]; n[k] += s.N[c][k] + u[k];
+          }
+        }
+        if (!c_isfree[b]) {
+          float z[3], rb[3];
+          qrot(s.Q[b], c_axis + 3 * b, z);
+          s.gv[d] = dot3(z, bw);
+          for (int k = 0; k < 3; k++) u[k] = s.qvel[d] * bw[k];
+          cross(z, u, t); cross(bv, s.W[p], rb);
+          for (int k = 0; k < 3; k++) { n[k] += t[k]; f[k] += rb[k]; s.rb[b][k] = rb[k]; }
+          s.gq[q] = dot3(z, n);
+        } else {
+          qrot_inv(s.Q[b], bw, u);
+          for (int k = 0; k < 3; k++) { s.gv[d + k] = bv[k]; s.gv[d + 3 + k] = u[k]; s.gq[q + k] = f[k]; }
+          cross(s.W[b], bw, t);
+          for (int k = 0; k < 3; k++) n[k] += t[k];
+          float n0[4] = {0.f, n[0], n[1], n[2]}, a[4];
+          qmul(n0, s.Q[b], a);
+          size_t row = (size_t)w * NB + b;
+          for (int k = 0; k < 4; k++) a[k] = 2.f * a[k] + gxquat[row * 4 + k] + gqn[(size_t)w * NQ + q + 3 + k];
+          const float* input = s.qpos + q + 3;
+          float norm = sqrtf(dot4(input, input)), radial = dot4(s.Q[b], a);
+          for (int k = 0; k < 4; k++) s.gq[q + 3 + k] = (a[k] - s.Q[b][k] * radial) / norm;
+        }
+        for (int k = 0; k < 3; k++) { s.bW[b][k] = bw[k]; s.bV[b][k] = bv[k]; s.F[b][k] = f[k]; s.N[b][k] = n[k]; }
+      }
+    __syncwarp();
+  }
+  for (int i = lane; i < NQ; i += 32) {
+    bool quaternion = false;
+    for (int r = 0; r < NR; r++) { int q = c_qadr[c_roots[r]]; quaternion |= i >= q + 3 && i < q + 7; }
+    float value = s.gq[i] + (quaternion ? 0.f : gqn[(size_t)w * NQ + i]);
+    gq[(size_t)w * NQ + i] = value + (gq_in ? gq_in[(size_t)w * NQ + i] : 0.f);
+  }
+  for (int i = lane; i < NV; i += 32)
+    gv[(size_t)w * NV + i] = s.gv[i] + (gv_in ? gv_in[(size_t)w * NV + i] : 0.f);
 }
 
 // the VJP: cotangents of k_kin's outputs (gqn, gxpos, gxquat, gcvel, gsc, same layouts) -> gq (nw, NQ), gv (nw, NV)
@@ -250,6 +402,9 @@ __global__ void __launch_bounds__(32 * KIN_WPB) k_kin_vjp(int nw, const float* q
   KinB& s = sm[threadIdx.x >> 5];
   kin_load(s, w, qpos, qvel, com, lane);
   kin_state(s, lane);
+#if NR == 2
+  kin_vjp_coupled(s, w, gqn, gxpos, gxquat, gcvel, gsc, gq_in, gv_in, gq, gv, lane);
+#else
   const int b = lane, d = b < NB ? c_depth[b] : -1, p = b < NB ? c_parent[b] : 0;
   const bool body = b >= 1 && b < NB;
   const size_t row = (size_t)w * NB + (body ? b : 0);  // this lane's body row of the cotangents
@@ -354,6 +509,7 @@ __global__ void __launch_bounds__(32 * KIN_WPB) k_kin_vjp(int nw, const float* q
     oq[i] = gq_in ? gq_in[(size_t)w * NQ + i] + g : g;
   }
   for (int i = lane; i < NV; i += 32) ov[i] = gv_in ? gv_in[(size_t)w * NV + i] + s.gv[i] : s.gv[i];
+#endif
 }
 
 static inline unsigned kin_grid(int nw) { return (unsigned)((nw + KIN_WPB - 1) / KIN_WPB); }

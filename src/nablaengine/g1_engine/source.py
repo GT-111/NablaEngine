@@ -16,6 +16,8 @@ import numpy as np
 
 CONST_LAYOUT = (  # (symbol, kind, length in units of the body count or "nv", per-entry width)
     ("c_parent", "i", "nb", 1), ("c_depth", "i", "nb", 1), ("c_qadr", "i", "nb", 1), ("c_dadr", "i", "nb", 1),
+    ("c_isfree", "i", "nb", 1), ("c_root", "i", "nb", 1), ("c_roots", "i", "nr", 1),
+    ("c_dofqadr", "i", "nv", 1), ("c_doflocal", "i", "nv", 1), ("c_combody", "i", "nr", 1),
     ("c_nchild", "i", "nb", 1), ("c_child", "i", "nb", 3), ("c_pos", "f", "nb", 3), ("c_quat", "f", "nb", 4),
     ("c_axis", "f", "nb", 3), ("c_ipos", "f", "nb", 3), ("c_iquat", "f", "nb", 4), ("c_mass", "f", "nb", 1),
     ("c_inert", "f", "nb", 3), ("c_grav", "f", "one", 3), ("c_armature", "f", "nv", 1), ("c_nanc", "i", "nb", 1),
@@ -30,6 +32,14 @@ def max_children(m):
     return max(3, int(np.bincount(m.body_parentid[1:], minlength=m.nbody)[1:].max(initial=0)))
 
 
+def free_roots(m):
+    """The one or two actual top-level FREE bodies, in compiled coordinate order."""
+    joints = np.flatnonzero(m.jnt_type == mujoco.mjtJoint.mjJNT_FREE)
+    roots = np.asarray(m.jnt_bodyid[joints], dtype=int)
+    assert len(roots) in (1, 2) and np.all(m.body_parentid[roots] == 0)
+    return roots
+
+
 def const_layout(m):
     """CONST_LAYOUT with this model's child-table width."""
     return [(s, k, n, max_children(m) if s == "c_child" else w) for s, k, n, w in CONST_LAYOUT]
@@ -42,21 +52,30 @@ def constants(m, com_body_id=None):
     for b in range(1, nb):
         depth[b] = depth[m.body_parentid[b]] + 1
         children[m.body_parentid[b]].append(b)
-    assert nb <= 32 and max(len(c) for c in children[1:]) <= 5
-    assert m.jnt_type[m.body_jntadr[1]] == mujoco.mjtJoint.mjJNT_FREE and m.body_jntnum[1] == 1
+    roots = free_roots(m)
+    assert nb <= 64 and max(len(c) for c in children[1:]) <= 5
+    assert children[0] == list(roots)
     qadr, dadr, axis = np.zeros(nb), np.zeros(nb), np.zeros((nb, 3))
-    for b in range(2, nb):
+    isfree = np.zeros(nb, dtype=int)
+    isfree[roots] = 1
+    dofqadr, doflocal = np.zeros(m.nv, dtype=int), np.zeros(m.nv, dtype=int)
+    for b in range(1, nb):
         j = m.body_jntadr[b]
-        assert m.body_jntnum[b] == 1 and m.jnt_type[j] == mujoco.mjtJoint.mjJNT_HINGE and not m.jnt_pos[j].any()
+        assert m.body_jntnum[b] == 1 and (isfree[b] or m.jnt_type[j] == mujoco.mjtJoint.mjJNT_HINGE)
+        assert not m.jnt_pos[j].any()
         qadr[b], dadr[b], axis[b] = m.jnt_qposadr[j], m.jnt_dofadr[j], m.jnt_axis[j]
+        q, d = int(qadr[b]), int(dadr[b])
+        width = 6 if isfree[b] else 1
+        dofqadr[d:d + width] = q + np.arange(width)
+        doflocal[d:d + width] = np.arange(width)
     child = np.zeros((nb, max_children(m)))
     for b in range(1, nb):
         child[b, :len(children[b])] = children[b]
     nchild = np.array([len(children[b]) if b else 0 for b in range(nb)])
     anc, nanc = np.zeros((nb, 12)), np.zeros(nb)  # hinge-joint ancestors of each body (root excluded), nearest first
-    for b in range(2, nb):
+    for b in range(1, nb):
         k, lst = m.body_parentid[b], []
-        while k >= 2:
+        while k > 0 and not isfree[k]:
             lst.append(k)
             k = m.body_parentid[k]
         assert len(lst) <= 12
@@ -79,12 +98,16 @@ def constants(m, com_body_id=None):
         if m.jnt_actfrclimited[j]:
             frclim[dof] = min(frclim[dof], m.jnt_actfrcrange[j, 1])
             assert m.jnt_actfrcrange[j, 0] == -m.jnt_actfrcrange[j, 1]
-    torso = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, "torso_link") if com_body_id is None else int(com_body_id)
-    assert 1 <= torso < nb, "the compiled COM-offset body must be a non-world body"
-    parts = [m.body_parentid, depth, qadr, dadr, nchild, child, m.body_pos, m.body_quat, axis, m.body_ipos,
+    if com_body_id is None:
+        combody = [mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, "torso_link")]
+    else:
+        combody = np.atleast_1d(com_body_id).astype(int)
+    assert len(combody) == len(roots) and all(1 <= b < nb for b in combody)
+    parts = [m.body_parentid, depth, qadr, dadr, isfree, m.body_rootid, roots, dofqadr, doflocal, combody,
+             nchild, child, m.body_pos, m.body_quat, axis, m.body_ipos,
              m.body_iquat, m.body_mass, m.body_inertia, m.opt.gravity, m.dof_armature, nanc, anc, actid, kp, kv,
              m.dof_damping, frclim,
-             [m.opt.timestep, torso]]
+             [m.opt.timestep, combody[0]]]
     return np.concatenate([np.asarray(x, np.float64).ravel() for x in parts]).astype(np.float32), max(depth)
 
 
@@ -95,6 +118,8 @@ def header(m, maxd, wpb):
 #define NQ {m.nq}
 #define NV {m.nv}
 #define NU {m.nu}
+#define NR {len(free_roots(m))}
+#define COM_WIDTH (3 * NR)
 #define MAX_CHILD {max_children(m)}
 #define MAXD {maxd}
 #define WPB {wpb}
@@ -106,7 +131,7 @@ def header(m, maxd, wpb):
                        // dof (divergent addresses serialize in __constant__ memory); -DDKC=__constant__ for comparison
 #endif
 DKC int c_parent[NB], c_depth[NB], c_qadr[NB], c_dadr[NB], c_nchild[NB], c_child[NB * MAX_CHILD], c_nanc[NB],
-    c_anc[NB * 12], c_actid[NV];
+    c_anc[NB * 12], c_actid[NV], c_isfree[NB], c_root[NB], c_roots[NR], c_dofqadr[NV], c_doflocal[NV], c_combody[NR];
 DKC float c_pos[NB * 3], c_quat[NB * 4], c_axis[NB * 3], c_ipos[NB * 3], c_iquat[NB * 4], c_mass[NB],
     c_inert[NB * 3], c_grav[3], c_armature[NV], c_kp[NV], c_kv[NV], c_damping[NV], c_frclim[NV], c_misc[2];
 """
@@ -232,12 +257,14 @@ __device__ __forceinline__ void fwd_body(int b, const float* Qp, const float* Xp
                                          const float* ALp, const float* Ap, const float* qpos, const float* qvel,
                                          const float* qacc, float* Q, float* X, float* W, float* V, float* AL,
                                          float* A) {
-  if (b == 1) {  // free root: world position, quaternion, world linear / local angular velocity
-    float n = rsqrtf(RFMA(qpos[6], qpos[6], RFMA(qpos[5], qpos[5], RFMA(qpos[3], qpos[3], RMUL(qpos[4], qpos[4])))));
-    for (int k = 0; k < 4; k++) Q[k] = RMUL(qpos[3 + k], n);
-    for (int k = 0; k < 3; k++) { X[k] = qpos[k]; V[k] = qvel[k]; A[k] = RSUB(qacc[k], c_grav[k]); }
-    qrot_rn(Q, qvel + 3, W);
-    qrot_rn(Q, qacc + 3, AL);
+  if (c_isfree[b]) {  // world linear / local angular velocity at this root's compiled addresses
+    int q = c_qadr[b], d = c_dadr[b];
+    float n = rsqrtf(RFMA(qpos[q + 6], qpos[q + 6], RFMA(qpos[q + 5], qpos[q + 5],
+                            RFMA(qpos[q + 3], qpos[q + 3], RMUL(qpos[q + 4], qpos[q + 4])))));
+    for (int k = 0; k < 4; k++) Q[k] = RMUL(qpos[q + 3 + k], n);
+    for (int k = 0; k < 3; k++) { X[k] = qpos[q + k]; V[k] = qvel[d + k]; A[k] = RSUB(qacc[d + k], c_grav[k]); }
+    qrot_rn(Q, qvel + d + 3, W);
+    qrot_rn(Q, qacc + d + 3, AL);
     return;
   }
   float q0[4], ha[4];
@@ -278,10 +305,10 @@ __device__ __forceinline__ void accumulate(const float* Xb, const float* Xc, con
 }
 
 __device__ __forceinline__ void torques(int b, const float* Q, const float* F, const float* N, float* qfrc) {
-  if (b == 1) {
+  if (c_isfree[b]) {
     float l[3];
     qrot_inv(Q, N, l);
-    for (int k = 0; k < 3; k++) { qfrc[k] = F[k]; qfrc[3 + k] = l[k]; }
+    for (int k = 0; k < 3; k++) { qfrc[c_dadr[b] + k] = F[k]; qfrc[c_dadr[b] + 3 + k] = l[k]; }
   } else {
     float aw[3];
     qrot(Q, c_axis + 3 * b, aw);
@@ -328,12 +355,13 @@ __device__ __forceinline__ void apply_inertia(const float* J, const float* w, co
 // motion subspace of dof t of body k about O: w (angular), v (velocity of the point O)
 __device__ __forceinline__ void dof_motion(int k, int t, const float* Q, const float* X, const float* O, float* w,
                                            float* v) {
-  if (k == 1) {
+  if (c_isfree[k]) {
     float e[3] = {0.f, 0.f, 0.f};
     if (t < 3) { e[t] = 1.f; w[0] = w[1] = w[2] = 0.f; v[0] = e[0]; v[1] = e[1]; v[2] = e[2]; return; }
     e[t - 3] = 1.f;
     qrot(Q, e, w);  // local angular axes about the root origin = O
-    v[0] = v[1] = v[2] = 0.f;
+    float r[3] = {O[0] - X[0], O[1] - X[1], O[2] - X[2]};
+    cross(w, r, v);
     return;
   }
   float r[3] = {O[0] - X[0], O[1] - X[1], O[2] - X[2]};
@@ -343,7 +371,10 @@ __device__ __forceinline__ void dof_motion(int k, int t, const float* Q, const f
 
 // COM offset of body b in its frame, with the per-world torso offset (domain randomization) applied
 __device__ __forceinline__ void body_ipos(int b, const float* com, float* out) {
-  for (int k = 0; k < 3; k++) out[k] = c_ipos[3 * b + k] + (b == (int)c_misc[1] ? com[k] : 0.f);
+  for (int k = 0; k < 3; k++) {
+    out[k] = c_ipos[3 * b + k];
+    for (int r = 0; r < NR; r++) if (b == c_combody[r]) out[k] += com[3 * r + k];
+  }
 }
 
 // in-place Cholesky A = L L^T (lower triangle of a dense NV x NV shared matrix) by one warp, left-looking (Crout):

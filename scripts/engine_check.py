@@ -166,7 +166,7 @@ LOAD_CONSTS
 
 
 def load_consts_code(m):
-    n = {"nb": m.nbody, "nv": m.nv, "one": 1}
+    n = {"nb": m.nbody, "nv": m.nv, "one": 1, "nr": 1}
     lines, tmp = [], 0
     for sym, kind, cnt, width in const_layout(m):
         size = n[cnt] * width

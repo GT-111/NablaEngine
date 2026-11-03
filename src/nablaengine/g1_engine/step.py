@@ -66,14 +66,52 @@ SOLVER_LAYOUT = (  # (symbol, kind, length in units of the body count, "nv", or 
 EQ_LAYOUT = (("c_eqdof1", "i", 1), ("c_eqdof2", "i", 1), ("c_eqpoly", "f", 2),
              ("c_eqsolref", "f", 2), ("c_eqsolimp", "f", 5), ("c_eqinvw", "f", 1))
 GEOM_TYPE = {int(mujoco.mjtGeom.mjGEOM_PLANE): 0, int(mujoco.mjtGeom.mjGEOM_SPHERE): 1,
-             int(mujoco.mjtGeom.mjGEOM_CAPSULE): 2, int(mujoco.mjtGeom.mjGEOM_BOX): 3}
+             int(mujoco.mjtGeom.mjGEOM_CAPSULE): 2, int(mujoco.mjtGeom.mjGEOM_BOX): 3,
+             int(mujoco.mjtGeom.mjGEOM_MESH): 4}
+
+
+def contact_pairs(m):
+    """Actual explicit and eligible mask-filtered pairs, in the generated contact-table order."""
+    from nablaengine.model.capability import filter_pairs
+    return tuple((int(a), int(b)) for a, b in zip(m.pair_geom1, m.pair_geom2)) + tuple(filter_pairs(m))
+
+
+def contact_parameters(m):
+    """MuJoCo's explicit parameters and priority/solmix mixing for implicit pairs."""
+    pairs = contact_pairs(m)
+    dim, friction, solref, solimp, margin, gap = [], [], [], [], [], []
+    for p, (g1, g2) in enumerate(pairs):
+        if p < m.npair:
+            dim.append(m.pair_dim[p]); friction.append(m.pair_friction[p])
+            solref.append(m.pair_solref[p]); solimp.append(m.pair_solimp[p])
+            margin.append(m.pair_margin[p]); gap.append(m.pair_gap[p])
+            continue
+        priority = m.geom_priority[[g1, g2]]
+        if priority[0] != priority[1]:
+            g = g1 if priority[0] > priority[1] else g2
+            cd, fr, sr, si = m.geom_condim[g], m.geom_friction[g], m.geom_solref[g], m.geom_solimp[g]
+        else:
+            cd = max(m.geom_condim[g1], m.geom_condim[g2])
+            fr = np.maximum(m.geom_friction[g1], m.geom_friction[g2])
+            weight = m.geom_solmix[g1] + m.geom_solmix[g2]
+            mix = m.geom_solmix[g1] / weight if weight >= mujoco.mjMINVAL else 0.5
+            sr = (mix * m.geom_solref[g1] + (1 - mix) * m.geom_solref[g2]
+                  if np.all(m.geom_solref[[g1, g2]] > 0) else np.minimum(m.geom_solref[g1], m.geom_solref[g2]))
+            si = mix * m.geom_solimp[g1] + (1 - mix) * m.geom_solimp[g2]
+        dim.append(cd); friction.append(fr[[0, 0, 1, 2, 2]])
+        solref.append(sr); solimp.append(si)
+        margin.append(max(m.geom_margin[g1], m.geom_margin[g2])); gap.append(max(m.geom_gap[g1], m.geom_gap[g2]))
+    n = len(pairs)
+    return dict(dim=np.asarray(dim, int), friction=np.asarray(friction, float).reshape(n, 5),
+                solref=np.asarray(solref, float).reshape(n, 2), solimp=np.asarray(solimp, float).reshape(n, 5),
+                margin=np.asarray(margin, float), gap=np.asarray(gap, float))
 
 
 def maxcon(m):
     """Contact capacity per world: 32 for the Menagerie model (49 pairs, at most 11 contacts seen), 64 for the mjlab
     model (502 pairs; up to 28 foot contacts alone). $DK_MAXCON overrides it (experiments); it
     changes every build, the FFI library included, so it warns."""
-    default = 32 if m.npair <= 64 else 64
+    default = 32 if len(contact_pairs(m)) <= 64 else 64
     if os.environ.get("DK_MAXCON"):
         warnings.warn(f"DK_MAXCON={os.environ['DK_MAXCON']} overrides the contact capacity (default {default}) of the "
                       "engine builds and the FFI library (an experiment switch)", RuntimeWarning, stacklevel=2)
@@ -86,13 +124,12 @@ def max_support(m):
     pairs (16 for both G1 models: a hand on the floor, root 6 + waist 3 + arm 7)."""
     dofbody, mask = extra_constants(m)
     return max((sum(1 for i in range(m.nv) if ((mask[b1] >> int(dofbody[i])) ^ (mask[b2] >> int(dofbody[i]))) & 1)
-                for b1, b2 in ((m.geom_bodyid[m.pair_geom1[p]], m.geom_bodyid[m.pair_geom2[p]])
-                               for p in range(m.npair))), default=0)
+                for b1, b2 in ((m.geom_bodyid[g1], m.geom_bodyid[g2]) for g1, g2 in contact_pairs(m))), default=0)
 
 
 def collision_geoms(m):
     """The geoms that appear in a contact pair, in model order (index into the geom table)."""
-    return sorted(set(int(g) for g in m.pair_geom1) | set(int(g) for g in m.pair_geom2))
+    return sorted({g for pair in contact_pairs(m) for g in pair})
 
 
 def pair_word(g1, g2, pset, dim, foot, plane=0):
@@ -107,8 +144,9 @@ def pair_param_sets(m):
     """(unique (mu, solref, solimp) rows as an (n, PSET_WIDTH) array, index of each pair's row): the 502 mjlab pairs
     share a handful of parameter sets, so the pair table is one word per pair."""
     keys, index = {}, []
-    for i in range(m.npair):
-        key = (float(m.pair_friction[i, 0]), *map(float, m.pair_solref[i]), *map(float, m.pair_solimp[i]))
+    params = contact_parameters(m)
+    for i in range(len(contact_pairs(m))):
+        key = (float(params["friction"][i, 0]), *map(float, params["solref"][i]), *map(float, params["solimp"][i]))
         index.append(keys.setdefault(key, len(keys)))
     return np.asarray(list(keys), np.float64).reshape(len(keys), PSET_WIDTH), index
 
@@ -118,7 +156,7 @@ def const_layout(m):
     ng = len(collision_geoms(m))
     sizes = {"nb": m.nbody, "nv": m.nv, "nv2": 2 * m.nv}
     npset = len(pair_param_sets(m)[0])
-    entries = ([(s, k, m.npair * w) for s, k, w in PAIR_LAYOUT] + [("c_pset", "f", npset * PSET_WIDTH)]
+    entries = ([(s, k, len(contact_pairs(m)) * w) for s, k, w in PAIR_LAYOUT] + [("c_pset", "f", npset * PSET_WIDTH)]
                + [(s, k, ng * w) for s, k, w in GEOM_LAYOUT]
                + [(s, k, sizes[w] if isinstance(w, str) else w) for s, k, w in SOLVER_LAYOUT]
                + [(s, k, m.neq * w) for s, k, w in EQ_LAYOUT])
@@ -131,14 +169,14 @@ def pair_constants(m, foot_pairs):
     geoms = collision_geoms(m)
     gid = {g: i for i, g in enumerate(geoms)}
     sets, words = pair_param_sets(m), []
+    pairs, params = contact_pairs(m), contact_parameters(m)
     foot = set(int(x) for x in foot_pairs)
-    assert foot <= set(range(m.npair)), f"foot pairs {sorted(foot)}: not all contact pair indices (0..{m.npair - 1})"
-    for i in range(m.npair):
-        g1, g2 = int(m.pair_geom1[i]), int(m.pair_geom2[i])
+    assert foot <= set(range(len(pairs))), "friction overrides must name generated contact-pair indices"
+    for i, (g1, g2) in enumerate(pairs):
         if GEOM_TYPE[int(m.geom_type[g1])] > GEOM_TYPE[int(m.geom_type[g2])]:
             g1, g2 = g2, g1
-        assert m.pair_margin[i] == 0 and m.pair_gap[i] == 0 and m.pair_friction[i, 0] == m.pair_friction[i, 1]
-        words.append(pair_word(gid[g1], gid[g2], sets[1][i], int(m.pair_dim[i]), int(i in foot),
+        assert params["margin"][i] == 0 and params["gap"][i] == 0 and params["friction"][i, 0] == params["friction"][i, 1]
+        words.append(pair_word(gid[g1], gid[g2], sets[1][i], int(params["dim"][i]), int(i in foot),
                                int(GEOM_TYPE[int(m.geom_type[g1])] == 0)))
     words = np.asarray(words, np.int64)
     out = [np.stack([words & 0xFFFF, words >> 16], 1).ravel(), np.asarray(sets[0], np.float64).ravel()]
@@ -153,7 +191,7 @@ def pair_constants(m, foot_pairs):
     assert (m.dof_solimp == m.dof_solimp[0]).all() and m.opt.cone == mujoco.mjtCone.mjCONE_PYRAMIDAL
     out += [m.body_invweight0[:, 0], m.dof_invweight0, m.dof_frictionloss, jr, jlim, m.jnt_solref[1], m.jnt_solimp[1],
             m.dof_solref[0], m.dof_solimp[0],
-            [m.opt.impratio, m.stat.meaninertia, m.opt.tolerance, m.npair]]
+            [m.opt.impratio, m.stat.meaninertia, m.opt.tolerance, len(pairs)]]
     d1, d2 = m.jnt_dofadr[m.eq_obj1id], m.jnt_dofadr[m.eq_obj2id]
     # MuJoCo's joint-equality inverse-weight approximation omits the mimic slope.
     out += [d1, d2, m.eq_data[:, :2], m.eq_solref, m.eq_solimp,
@@ -193,7 +231,7 @@ def floor_geom(m):
 
 def solimp_pow2(m):
     """Whether every solimp power the rows use (contact pairs, joint limits, dof frictionloss) is 2."""
-    pw = (list(m.pair_solimp[:, 4]) + list(m.jnt_solimp[1:, 4])
+    pw = (list(contact_parameters(m)["solimp"][:, 4]) + list(m.jnt_solimp[1:, 4])
           + list(m.dof_solimp[m.dof_frictionloss > 0, 4]) + list(m.eq_solimp[:, 4]))
     return all(float(x) == 2.0 for x in pw)
 
@@ -206,7 +244,7 @@ def dof_body_root6(m):
 
 
 def step_header(m, max_contacts=None):
-    p, g, kdof = m.npair, len(collision_geoms(m)), max_support(m)
+    p, g, kdof = len(contact_pairs(m)), len(collision_geoms(m)), max_support(m)
     hs = hess_columns(kdof)
     hcol = [a | b << 8 | thr << 16 for _, _, tab in hs for row in tab for a, b, thr in row]
     return f"""
@@ -281,7 +319,7 @@ struct Sim {
   float M[NTRI], L[NTRI];  // mass matrix and Cholesky scratch, packed lower triangles TRI(i, j)
   float qpos[NQ], qvel[NV], zero[NV], qsm[NV], qacc0[NV], qacc[NV], Ma[NV], grad[NV], p[NV], Mp[NV], tmp[NV];
   alignas(16) float cbuf[72];  // CHOL_SOLVE's scratch (chol_solve_bcast)
-  float com[3], fric;
+  float com[COM_WIDTH], fric;
   float gx[NGEOMC_STORAGE][3], gq[NGEOMC_STORAGE][4];  // world poses of the collision geoms
   int ncon, nefc, unsupported;
   int min_nu_bits;  // tape: smallest centre / axis distance (before the radii) of a sphere or capsule self contact, as
@@ -1257,7 +1295,8 @@ __device__ __forceinline__ float eq_jv(int e, const float* v) {
   return v[c_eqdof1[e]] - c_eqpoly[2 * e + 1] * v[c_eqdof2[e]];
 }
 __device__ __forceinline__ float eq_pos(int e, const float* q) {
-  return RSUB(q[c_eqdof1[e] + 1], RFMA(c_eqpoly[2 * e + 1], q[c_eqdof2[e] + 1], c_eqpoly[2 * e]));
+  return RSUB(q[c_dofqadr[c_eqdof1[e]]],
+              RFMA(c_eqpoly[2 * e + 1], q[c_dofqadr[c_eqdof2[e]]], c_eqpoly[2 * e]));
 }
 template <class S>
 __device__ __forceinline__ float dof_row_coef(const S& s, int r, int i) {
@@ -1544,7 +1583,7 @@ __device__ __noinline__ void integrate_root(float* qpos, const float* qvel, floa
 STEP_KERNEL = r"""
 // a contact's support as dof bits (con_mask) from x = the body mask of its two chains' symmetric difference (bit b:
 // body b on exactly one of them): the dofs whose body is in x
-__device__ __forceinline__ unsigned long long support_mask(unsigned x) {
+__device__ __forceinline__ unsigned long long support_mask(unsigned long long x) {
 #if DOF_BODY_ROOT6
   return (unsigned long long)(x >> 2) << 6 | ((x & 2u) ? 0x3full : 0ull);
 #else
@@ -1693,6 +1732,76 @@ __device__ __forceinline__ void hessian(S& s, int ncon, unsigned long long world
   }
 }
 
+// The two-root scene has block-diagonal smooth dynamics and one coupled constraint solve. Body work is tiled over
+// the warp; every depth finishes before either tile reads the next depth.
+template <class S>
+__device__ void coupled_smooth(S& s, int lane) {
+  for (int L = 1; L <= MAXD; L++) {
+    for (int b = lane; b < NB; b += 32)
+      if (c_depth[b] == L) {
+        int p = c_parent[b];
+        fwd_body(b, s.Q[p], s.X[p], s.W[p], s.V[p], s.AL[p], s.A[p], s.qpos, s.qvel, s.zero,
+                 s.Q[b], s.X[b], s.W[b], s.V[b], s.AL[b], s.A[b]);
+      }
+    __syncwarp();
+  }
+  SUBPROF(14);
+  for (int b = lane; b < NB; b += 32) {
+    if (!b) continue;
+    int root = c_root[b];
+    float ip[3];
+    body_ipos(b, s.com, ip);
+    body_force(b, s.Q[b], s.W[b], s.AL[b], s.A[b], ip, s.F[b], s.N[b]);
+    body_inertia(b, s.Q[b], s.X[b], s.X[root], ip, s.J[b]);
+    if (!c_isfree[b]) {
+      float w[3], v[3];
+      dof_motion(b, 0, s.Q[b], s.X[b], s.X[root], w, v);
+      for (int k = 0; k < 3; k++) { s.W[b][k] = w[k]; s.V[b][k] = v[k]; }
+    }
+  }
+  __syncwarp();
+  SUBPROF(15);
+  for (int L = MAXD - 1; L >= 1; L--) {
+    for (int b = lane; b < NB; b += 32)
+      if (c_depth[b] == L)
+        for (int j = 0; j < c_nchild[b]; j++) {
+          int c = c_child[MAX_CHILD * b + j];
+          accumulate(s.X[b], s.X[c], s.F[c], s.N[c], s.F[b], s.N[b]);
+          for (int k = 0; k < 10; k++) s.J[b][k] += s.J[c][k];
+        }
+    __syncwarp();
+  }
+  SUBPROF(16);
+  for (int b = lane; b < NB; b += 32) {
+    if (!b) continue;
+    torques(b, s.Q[b], s.F[b], s.N[b], s.qsm);
+    const int root = c_root[b], droot = c_dadr[root], d = c_dadr[b];
+    float n[3], f[3], sw[3], sv[3], kw[3], kv[3];
+    if (c_isfree[b]) {
+      for (int j = 0; j < 6; j++) {
+        dof_motion(b, j, s.Q[b], s.X[b], s.X[b], sw, sv);
+        apply_inertia(s.J[b], sw, sv, n, f);
+        for (int i = 0; i <= j; i++) {
+          dof_motion(b, i, s.Q[b], s.X[b], s.X[b], kw, kv);
+          s.M[TRI(d + j, d + i)] = dot3(kw, n) + dot3(kv, f) + (i == j ? c_armature[d + j] : 0.f);
+        }
+      }
+    } else {
+      apply_inertia(s.J[b], s.W[b], s.V[b], n, f);
+      s.M[TRI(d, d)] = dot3(s.W[b], n) + dot3(s.V[b], f) + c_armature[d];
+      for (int j = 0; j < c_nanc[b]; j++) {
+        int a = c_anc[12 * b + j];
+        s.M[TRI(d, c_dadr[a])] = dot3(s.W[a], n) + dot3(s.V[a], f);
+      }
+      for (int j = 0; j < 6; j++) {
+        dof_motion(root, j, s.Q[root], s.X[root], s.X[root], kw, kv);
+        s.M[TRI(d, droot + j)] = dot3(kw, n) + dot3(kv, f);
+      }
+    }
+  }
+  __syncwarp();
+}
+
 // one substep for the world in s (qpos, qvel, qacc warm start, com, fric set); ctrl: this world's NU setpoints.
 // Two halves (substep_pre: smooth dynamics, collision, Jacobians, rows; substep_post: Newton, implicitfast) so that they can
 // also run as separate kernels with the state in global memory (engine_step_check.py --split).
@@ -1718,6 +1827,7 @@ __device__ void substep_pre(S& s, const float* ctrl, int lane, float* rec, const
   for (int i = lane; i < NV; i += 32) s.zero[i] = 0.f;
   for (int i = lane; i < NTRI; i += 32) s.M[i] = 0.f;
   PROF_START();
+#if NR == 1
   // The tree passes below read what they need from shared memory into registers before they store anything: the
   // compiler cannot tell a body's arrays from its parent's or children's (same arrays, variable indices), so a load
   // after a store would wait for it (one shared-memory latency per element). The arithmetic is unchanged
@@ -1811,6 +1921,10 @@ __device__ void substep_pre(S& s, const float* ctrl, int lane, float* rec, const
       }
     }
   }
+#else
+  coupled_smooth(s, lane);
+  const float O[3] = {s.X[1][0], s.X[1][1], s.X[1][2]};
+#endif
   __syncwarp();
   SUBPROF(17);
   for (int i0 = 0; i0 < NV; i0 += 32) {  // qfrc_smooth = clamped actuator force - bias
@@ -1819,7 +1933,7 @@ __device__ void substep_pre(S& s, const float* ctrl, int lane, float* rec, const
     if (i < NV) {
       float act = 0.f;
       if (c_actid[i] >= 0) {
-        act = kp_scale * c_kp[i] * (ctrl[c_actid[i]] - s.qpos[i + 1]) - c_kv[i] * s.qvel[i];
+        act = kp_scale * c_kp[i] * (ctrl[c_actid[i]] - s.qpos[c_dofqadr[i]]) - c_kv[i] * s.qvel[i];
         act = fminf(fmaxf(act, -c_frclim[i]), c_frclim[i]);
         clamp = act <= -c_frclim[i] || act >= c_frclim[i];  // at the limit: MuJoCo Warp's actuator_lam test
       }
@@ -1889,21 +2003,19 @@ __device__ void substep_pre(S& s, const float* ctrl, int lane, float* rec, const
     static_assert(NV <= 64 && MAXCON <= 64, "two dofs and two contacts per lane");
     float dw[2][3], dv[2][3];
     int dbody[2];
-    unsigned am1[2], am2[2];
+    unsigned long long am1[2], am2[2];
 #pragma unroll
     for (int h = 0; h < 2; h++) {
       int i = lane + 32 * h, c = lane + 32 * h;
       dbody[h] = i < NV ? c_dofbody[i] : 0;
-      if (dbody[h] == 1) dof_motion(1, i, q1, O, O, dw[h], dv[h]);
-      else if (dbody[h] >= 2)
-        for (int t = 0; t < 3; t++) { dw[h][t] = s.W[dbody[h]][t]; dv[h][t] = s.V[dbody[h]][t]; }
+      if (i < NV) dof_motion(dbody[h], c_doflocal[i], s.Q[dbody[h]], s.X[dbody[h]], O, dw[h], dv[h]);
       int pr = c < ncon ? s.con_pair[c] : 0;
       am1[h] = c_ancmask[c_gbody[PG1(pr)]];
       am2[h] = c_ancmask[c_gbody[PG2(pr)]];
     }
     for (int c = 0; c < ncon; c++) {
-      unsigned m1 = __shfl_sync(0xffffffffu, c < 32 ? am1[0] : am1[1], c & 31);
-      unsigned m2 = __shfl_sync(0xffffffffu, c < 32 ? am2[0] : am2[1], c & 31);
+      unsigned long long m1 = __shfl_sync(0xffffffffu, c < 32 ? am1[0] : am1[1], c & 31);
+      unsigned long long m2 = __shfl_sync(0xffffffffu, c < 32 ? am2[0] : am2[1], c & 31);
       float pos[3], fr[9];
       for (int t = 0; t < 3; t++) pos[t] = s.con_pos[c][t];
       for (int t = 0; t < 9; t++) fr[t] = s.con_frame[c][t];
@@ -1954,8 +2066,8 @@ __device__ void substep_pre(S& s, const float* ctrl, int lane, float* rec, const
   for (int i0 = 0; i0 < NV; i0 += 32) {
     int i = min(i0 + lane, NV - 1);  // clamped so that the loads need no branch
     float dmin, dmax;
-    limit_dists(i, s.qpos[i + 1], &dmin, &dmax);
-    bool on = i0 + lane < NV && i >= 6 && c_jlim[i] != 0.f && fminf(dmin, dmax) < 0.f;
+    limit_dists(i, s.qpos[c_dofqadr[i]], &dmin, &dmax);
+    bool on = i0 + lane < NV && !c_isfree[c_dofbody[i]] && c_jlim[i] != 0.f && fminf(dmin, dmax) < 0.f;
     unsigned bal = __ballot_sync(0xffffffffu, on);
     if (on) {
       int r = ndof + __popc(bal & below);
@@ -1985,7 +2097,7 @@ __device__ void substep_pre(S& s, const float* ctrl, int lane, float* rec, const
         } else {
           bool fl = s.efc_kind[j] == 0;
           float dmin, dmax;
-          limit_dists(i, s.qpos[i + 1], &dmin, &dmax);
+          limit_dists(i, s.qpos[c_dofqadr[i]], &dmin, &dmax);
           iw = c_dinvw[i];
           pos = fl ? 0.f : fminf(dmin, dmax);
           sref = fl ? c_dsolref : c_jsolref; simp = fl ? c_dsolimp : c_jsolimp;
@@ -2025,8 +2137,8 @@ __device__ void substep_pre(S& s, const float* ctrl, int lane, float* rec, const
   PROF(4);
   if (rec)  // tape: the contact table in contact (= row) order, two 16-bit entries pair | slot << 9 per word
     for (int i = lane; i < (MAXCON + 1) / 2; i += 32) {
-      unsigned e0 = 2 * i < ncon ? (unsigned)s.con_pair[2 * i] | (unsigned)s.con_slot[2 * i] << 9 : TAPE_CON_NONE;
-      unsigned e1 = 2 * i + 1 < ncon ? (unsigned)s.con_pair[2 * i + 1] | (unsigned)s.con_slot[2 * i + 1] << 9
+      unsigned e0 = 2 * i < ncon ? (unsigned)s.con_pair[2 * i] | (unsigned)s.con_slot[2 * i] << TAPE_PAIR_BITS : TAPE_CON_NONE;
+      unsigned e1 = 2 * i + 1 < ncon ? (unsigned)s.con_pair[2 * i + 1] | (unsigned)s.con_slot[2 * i + 1] << TAPE_PAIR_BITS
                                      : TAPE_CON_NONE;
       __stcs(rec + OFF_CON + i, __uint_as_float(e0 | e1 << 16));
     }
@@ -2246,8 +2358,12 @@ __device__ void substep_post(S& s, int iterations, int lane, int* niter_out, flo
   }
   for (int i = lane; i < NV; i += 32) s.qvel[i] += h * s.tmp[i];
   __syncwarp();
-  if (lane == 0) integrate_root(s.qpos, s.qvel, h);
-  for (int i = 6 + lane; i < NV; i += 32) s.qpos[i + 1] += h * s.qvel[i];
+  for (int r = lane; r < NR; r += 32) {
+    int b = c_roots[r];
+    integrate_root(s.qpos + c_qadr[b], s.qvel + c_dadr[b], h);
+  }
+  for (int i = lane; i < NV; i += 32)
+    if (!c_isfree[c_dofbody[i]]) s.qpos[c_dofqadr[i]] += h * s.qvel[i];
   __syncwarp();
   PROF(11);
 }
@@ -2272,22 +2388,22 @@ __device__ __forceinline__ void substep(S& s, const float* ctrl, int iterations,
 #ifndef SPLIT_NEFC
 #define SPLIT_NEFC (NEFC < 128 ? NEFC : 128)  // and constraint rows
 #endif
-template <int NC, int NR>
+template <int NC, int NROW>
 struct SimNT {  // substep_post: Newton, implicitfast; capacity NC contacts, NR rows. Members whose lifetimes do not
   float M[NTRI], L[NTRI];  // overlap share storage (unions), the read-only ones the loop seldom reads stay in Hand
   float qacc[NV], Ma[NV];
   union { float grad[NV], p[NV]; };  // grad is last read by p = -grad (in place)
   union { float Mp[NV], tmp[NV]; };  // Mp: line search to update; tmp: J'f (newton_grad), start's qacc, implicitfast
-  float efc_D[NR], efc_jar[NR];
-  unsigned char efc_kind[NR], efc_a[NR];
-  signed char efc_b[NR];
+  float efc_D[NROW], efc_jar[NROW];
+  unsigned char efc_kind[NROW], efc_a[NROW];
+  signed char efc_b[NROW];
   int ncon, nefc, unsupported, min_nu_bits, nefc_dof;
   union {
     float con_C[NC][5];  // the Hessian assembly only (J p, the forces and their per-contact sums are dead there)
     alignas(16) float cbuf[72];  // CHOL_SOLVE's scratch: the factorizations (con_C is dead from there on)
     struct {
       union { float con_dot[NC][3], con_f[NC][3]; };
-      float efc_jv[NR];
+      float efc_jv[NROW];
     };
   };
   unsigned short con_row[NC];
@@ -2333,7 +2449,7 @@ struct SimP {  // substep_pre: smooth dynamics, qacc_smooth, collision, contact 
   };
   float* M;  // in Hand (the stores of the CRB, the loads of qacc_smooth's factorization)
   float qpos[NQ], qvel[NV], zero[NV], qsm[NV], qacc0[NV];
-  float com[3], fric;
+  float com[COM_WIDTH], fric;
   int ncon, nefc, unsupported, min_nu_bits, nefc_dof;
   int con_pair[MAXCON], con_dim[MAXCON], con_row[MAXCON], con_nrow[MAXCON], con_nd[MAXCON];
   float con_mu[MAXCON];
@@ -2355,13 +2471,13 @@ struct SimP {  // substep_pre: smooth dynamics, qacc_smooth, collision, contact 
 def extra_constants(m):
     """dof -> body map and per-body ancestor bitmasks (bit k: body k is the body or one of its ancestors)."""
     dofbody = np.asarray(m.dof_bodyid, np.float64)
-    mask = np.zeros(m.nbody, np.int64)
+    mask = np.zeros(m.nbody, np.uint64)
     for b in range(m.nbody):
         k = b
         while k > 0:
-            mask[b] |= 1 << k
+            mask[b] |= np.uint64(1) << np.uint64(k)
             k = m.body_parentid[k]
     return dofbody, mask
 
 
-EXTRA_HEADER = "DKC int c_dofbody[NV];\nDKC unsigned int c_ancmask[NB];\n"
+EXTRA_HEADER = "DKC int c_dofbody[NV];\nDKC unsigned long long c_ancmask[NB];\n"

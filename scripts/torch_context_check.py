@@ -6,6 +6,10 @@ fake shapes, not CUDA numerical correctness. CUDA uses two real model artifacts.
 
 import argparse
 from contextlib import contextmanager
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -22,7 +26,8 @@ def contexts():
     for index, cid in enumerate(ids):
         nq, nv, nu, nb, rec = 8+index, 7+index, 1+index, 3+index, 9+index*8
         context = F.ModelContext(cid)
-        context._state["info"] = dict(nq=nq, nv=nv, nu=nu, nbody=nb, rec_words=rec)
+        nr = 1+index%2
+        context._state["info"] = dict(nq=nq, nv=nv, nu=nu, nbody=nb, nr=nr, com_width=3*nr, rec_words=rec)
         F._CONTEXTS[cid] = context
         values.append(context)
     try:
@@ -35,7 +40,7 @@ def contexts():
 def inputs(context, device="cpu", requires_grad=False):
     i, B = context.info, 2
     values = [torch.zeros(shape, device=device) for shape in
-              ((B, i["nq"]), (B, i["nv"]), (B, i["nv"]), (B, i["nu"]), (B,), (B, 3),
+              ((B, i["nq"]), (B, i["nv"]), (B, i["nv"]), (B, i["nu"]), (B,), (B, i["com_width"]),
                (B, i["nv"]), (B,))]
     for index in (0, 1, 3, 6):
         values[index].requires_grad_(requires_grad)
@@ -43,6 +48,30 @@ def inputs(context, device="cpu", requires_grad=False):
 
 
 class ContextChecks(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("c++"), "host loader source check requires a C++ compiler")
+    def test_uint64_constant_loader_retains_high_body_bits(self):
+        from nablaengine.g1_engine.host import loader
+
+        statements = loader((("mask", "q", "nb", 1),), {"nb": 2})
+        source = """#include <cassert>
+#include <cstring>
+unsigned long long mask[2];
+#define cudaMemcpyToSymbol(symbol, data, bytes) std::memcpy(symbol, data, bytes)
+int main() {
+  const float words[] = {2, 0, 16384, 0, 65535, 65535, 65535, 32768};
+  const float* p = words;
+""" + statements + """
+  assert(mask[0] == ((1ull << 46) | 2ull));
+  assert(mask[1] == 0x8000ffffffffffffull);
+  assert(p == words + 8);
+}
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            (path/"loader.cc").write_text(source)
+            subprocess.run(("c++", str(path/"loader.cc"), "-o", str(path/"loader")), check=True)
+            subprocess.run((str(path/"loader"),), check=True)
+
     def test_diagnostics_are_context_owned_and_default_switch_stays_lazy(self):
         with patch.object(F, "_DEFAULT_CONTEXT", None), patch.object(F, "_DEFAULT_DIAGNOSTICS_ON", True), \
                 patch.object(F, "init", side_effect=AssertionError("must stay lazy")), contexts() as owners:
@@ -104,6 +133,45 @@ class ContextChecks(unittest.TestCase):
                     self.assertTrue(torch.equal(batch[6].grad, torch.full_like(batch[6], gain)))
                     self.assertTrue(torch.equal(batch[3].grad, torch.full_like(batch[3], gain * owner.info["nv"])))
 
+    def test_optional_info_preserves_state_and_kinematic_vjps_in_eager_and_aot(self):
+        def forward(q, v, w, u, fr, com, force, kp, iterations, substeps, tape, kin, cid):
+            info = torch.tensor((3, 4, 12, F.OVERFLOW_ROWS), dtype=torch.int32).expand(q.shape[0], -1).clone()
+            tp = q.new_zeros((q.shape[0], substeps * F._sizes(cid)[4]))
+            result = [2*q, v+u.sum(-1, keepdim=True)+force, w.clone(), info, tp]
+            return result + [2*q, *(q.new_zeros(shape) for shape in F._kin_shapes(q.shape[0], cid)[1:])] if kin else result
+
+        def backward(tp, fr, com, gq, gv, ctrl, ks, kc, substeps, kv, normal, soft, force, kp, cid):
+            qbar = 2*gq + (2*kc[0] if kc else 0)
+            ubar = gv.sum(-1, keepdim=True).expand(-1, F._sizes(cid)[2]).clone()
+            return [qbar, gv.clone(), ubar, tp.new_zeros((tp.shape[0],), dtype=torch.int32), gv.clone()]
+
+        F._custom_ops()
+        with contexts() as owners, patch.dict(F._IMPL, forward=forward, backward=backward), \
+                patch.object(F, "_forward_impl", forward), patch.object(F, "_backward_impl", backward):
+            owner = owners[1]  # two FREE roots, six COM operands
+            for compiled in (False, True):
+                for kin in (False, True):
+                    for return_info in (False, True):
+                        def program(*args):
+                            return owner.step(*args, kinematics=kin, return_info=return_info)
+                        run = torch.compile(program, backend="aot_eager", fullgraph=True) if compiled else program
+                        batch = inputs(owner, requires_grad=True)
+                        output = run(*batch)
+                        self.assertEqual(len(output), 3+int(return_info)+5*int(kin))
+                        if return_info:
+                            self.assertEqual(output[3].dtype, torch.int32)
+                            self.assertFalse(output[3].requires_grad)
+                            self.assertTrue(torch.equal(output[3], torch.tensor((3, 4, 12, F.OVERFLOW_ROWS)).expand(2, -1)))
+                        loss = output[0].sum()+output[1].sum()
+                        if kin:
+                            loss = loss+output[3+int(return_info)].sum()
+                        grads = torch.autograd.grad(loss, [batch[i] for i in (0, 1, 3, 6)])
+                        for observed, expected in zip(grads, (2+2*int(kin), 1, owner.info["nv"], 1), strict=True):
+                            self.assertTrue(torch.equal(observed, torch.full_like(observed, expected)))
+                        with torch.no_grad():
+                            plain = run(*batch)
+                        self.assertTrue(all(torch.equal(left, right) for left, right in zip(output, plain, strict=True)))
+
 
 def cuda_check(artifacts):
     """Real isolation/late VJP and eager/compiled/CUDA-graph equality on one GPU."""
@@ -113,7 +181,8 @@ def cuda_check(artifacts):
     batches = []
     for owner in owners:
         batch = inputs(owner, device="cuda", requires_grad=True)
-        batch[0].data[:, 3] = 1  # each supported model has one FREE quaternion
+        with torch.no_grad():
+            batch[0].copy_(torch.tensor(owner.info["qpos0"], dtype=torch.float32, device="cuda"))
         batch[4].fill_(1.)
         batch[7].fill_(1.)
         batches.append(batch)

@@ -2,14 +2,14 @@
 stream.
 
   step(qpos, qvel, warm, ctrl, friction, com, qfrc_applied=None, kp_scale=None, *, iterations=10, substeps=4, clamp_kv=0, normal=3, clamp_soft=None,
-       grad_decay=1.0, kinematics=False) -> (qpos', qvel', warm'[, qpos_n, xpos, xquat, cvel, subtree_com])
+       grad_decay=1.0, kinematics=False, return_info=False) -> (qpos', qvel', warm'[, info][, qpos_n, xpos, xquat, cvel, subtree_com])
   kinematics(qpos, qvel, com) -> (qpos_n, xpos, xquat, cvel, subtree_com)
   create_context(...) -> ModelContext (independent model library and dimensions)
   scale_grad(tree, gamma)
 
 Arguments and outputs as jax_ffi.step / jax_ffi.kinematics (see that module's docstring): float32 tensors on one CUDA
 device, contiguous, leading dimension B (the worlds): qpos (B, nq), qvel (B, nv), warm (B, nv), ctrl (B, nu), friction
-(B,), com (B, 3) (mjlab G1: nq 36, nv 35, nu 29). Other dtypes, devices or shapes raise TypeError; nothing is cast or
+(B,), com (B, 3*nr) for one or two FREE roots (mjlab G1: nr 1, nq 36, nv 35, nu 29). Other dtypes, devices or shapes raise TypeError; nothing is cast or
 copied implicitly. step is differentiable (torch.autograd): when any input requires grad, the forward also writes the
 tape (B, substeps * REC_WORDS float32, 5888 B per world and substep) and keeps it for the backward (the analytic
 adjoint, deterministic), which returns d/dqpos (36-dimensional qpos form), d/dqvel, d/dctrl and d/dqfrc_applied,
@@ -65,7 +65,7 @@ _OVERFLOW_WARN = [os.environ.get("DK_OVERFLOW_WARN", "0") not in ("", "0")]  # s
 NONFINITE_QPOS, NONFINITE_QVEL, NONFINITE_CTRL, NONFINITE_COT, NONFINITE_SHIFT = 1, 2, 4, 8, 16
 VARIANTS = tuple((kv, n) for kv in (0, 1, 2) for n in (0, 1, 2, 3))  # adjoint builds (clamp_kv, normal)
 FWD_UNIT = "dk_fwd"
-ARTIFACT_VERSION = 2
+ARTIFACT_VERSION = 3
 # the package files the library is generated from: an artifact records their hash, a different hash means stale
 SOURCES = ("cuda.py", "jax_ffi.py", "torch_ffi.py", "fixtures.py", "g1_engine/*.py", "model/*.py")
 
@@ -249,7 +249,7 @@ def build(arch, model_dir=None, model=None, foot_pairs=None, set_current=True, c
     that init() loads by default (torch_<arch>_current.json); False for another model's, loaded by its path."""
     import nablaengine
     from nablaengine import jax_ffi
-    from nablaengine.g1_engine import kinematics as g1_kin, step as g1_step, tape as g1_tape
+    from nablaengine.g1_engine import kinematics as g1_kin, source as g1_source, step as g1_step, tape as g1_tape
     from nablaengine.model import capability
     m, fp = jax_ffi._model(model_dir, model, foot_pairs)
     capability.require(m, fp, capability.COM_BODY if com_body_id is None else com_body_id, "engine", "torch_ffi.build")
@@ -271,15 +271,21 @@ def build(arch, model_dir=None, model=None, foot_pairs=None, set_current=True, c
         kin_error = f"the model does not meet the kinematics outputs' assumptions ({e!r})"
     stem = path.with_suffix("")
     np.save(stem.with_suffix(".npy"), consts)
+    nr = len(g1_source.free_roots(m))
+    com_ids = (int(m.body("torso_link").id),) if com_body_id is None else tuple(int(x) for x in np.atleast_1d(com_body_id))
     meta = dict(artifact_version=ARTIFACT_VERSION, library=path.name, consts=stem.with_suffix(".npy").name, key=key,
                 arch=arch, version=nablaengine.__version__, sources_sha256=sources_sha256(),
                 consts_sha256=hashlib.sha256(consts.tobytes()).hexdigest(), rec_words=g1_tape.rec_words(m),
-                nq=m.nq, nv=m.nv, nu=m.nu, nbody=m.nbody, maxcon=g1_step.maxcon(m),
+                nq=m.nq, nv=m.nv, nu=m.nu, nbody=m.nbody, nr=nr, com_width=3*nr, com_body_ids=com_ids,
+                qpos0=np.asarray(m.qpos0).tolist(),
+                root_qpos_addresses=[int(m.jnt_qposadr[m.body_jntadr[r]]) for r in g1_source.free_roots(m)],
+                root_dof_addresses=[int(m.jnt_dofadr[m.body_jntadr[r]]) for r in g1_source.free_roots(m)],
+                maxcon=g1_step.maxcon(m),
                 off_flags=int(g1_tape.layout(m)["flags"][0]), forward_unit=plan["forward_unit"],
                 variants=[list(v) for v in VARIANTS], kinematics_error=kin_error, timestep=float(m.opt.timestep),
                 foot_pairs=[int(p) for p in fp], arch_flags=plan["arch_flags"],
                 forward_defines=plan["forward_defines"], built=built,
-                com_body_id=com_body_id, default_model=model_dir is None and model is None)
+                default_model=model_dir is None and model is None)
     js = stem.with_suffix(".json")
     js.write_text(json.dumps(meta, indent=1) + "\n")
     if set_current:
@@ -540,6 +546,10 @@ def _sizes(context_id):
     return i["nq"], i["nv"], i["nu"], i["nbody"], i["rec_words"]
 
 
+def _com_width(context_id):
+    return _context(context_id).info["com_width"]
+
+
 def tape_bytes(nworld, substeps=SUBSTEPS, steps=1, *, context=None):
     """Bytes of the tapes of `steps` differentiated control steps."""
     return 4 * _context(_resolve_context(context)).info["rec_words"] * substeps * nworld * steps
@@ -556,7 +566,7 @@ def _forward_impl(qpos, qvel, warm, ctrl, friction, com, qfrc_applied, kp_scale,
     nq, nv, nu, nb, rec = _sizes(context_id)
     B = qpos.shape[0]
     for name, x, shape in (("qpos", qpos, (B, nq)), ("qvel", qvel, (B, nv)), ("warm", warm, (B, nv)),
-                           ("ctrl", ctrl, (B, nu)), ("friction", friction, (B,)), ("com", com, (B, 3))):
+                           ("ctrl", ctrl, (B, nu)), ("friction", friction, (B,)), ("com", com, (B, _com_width(context_id)))):
         _check(name, x, shape, dev)
     if qfrc_applied is not None:
         _check("qfrc_applied", qfrc_applied, (B, nv), dev)
@@ -601,7 +611,7 @@ def _backward_impl(tape, friction, com, g_qpos, g_qvel, ctrl, kin_state, kin_cot
     dev = _ready(tape, context)
     nq, nv, nu, nb, rec = _sizes(context_id)
     B = tape.shape[0]
-    for name, x, shape in (("tape", tape, (B, substeps * rec)), ("friction", friction, (B,)), ("com", com, (B, 3)),
+    for name, x, shape in (("tape", tape, (B, substeps * rec)), ("friction", friction, (B,)), ("com", com, (B, _com_width(context_id))),
                            ("g_qpos", g_qpos, (B, nq)), ("g_qvel", g_qvel, (B, nv))):
         _check(name, x, shape, dev)
     v = (int(clamp_kv), int(normal))
@@ -650,7 +660,7 @@ def _kinematics_impl(qpos, qvel, com, context_id):
     dev = _ready(qpos, context)
     nq, nv, _, _, _ = _sizes(context_id)
     B = qpos.shape[0]
-    for name, x, shape in (("qpos", qpos, (B, nq)), ("qvel", qvel, (B, nv)), ("com", com, (B, 3))):
+    for name, x, shape in (("qpos", qpos, (B, nq)), ("qvel", qvel, (B, nv)), ("com", com, (B, _com_width(context_id)))):
         _check(name, x, shape, dev)
     out = _kin_empty(B, qpos.device, context_id)
     if B:
@@ -666,7 +676,7 @@ def _kinematics_backward_impl(qpos, qvel, com, g_qpos_n, g_xpos, g_xquat, g_cvel
     dev = _ready(qpos, context)
     nq, nv, _, nb, _ = _sizes(context_id)
     B = qpos.shape[0]
-    for name, x, shape in (("qpos", qpos, (B, nq)), ("qvel", qvel, (B, nv)), ("com", com, (B, 3)),
+    for name, x, shape in (("qpos", qpos, (B, nq)), ("qvel", qvel, (B, nv)), ("com", com, (B, _com_width(context_id))),
                            ("g_qpos_n", g_qpos_n, (B, nq)), ("g_xpos", g_xpos, (B, nb, 3)),
                            ("g_xquat", g_xquat, (B, nb, 4)), ("g_cvel", g_cvel, (B, nb, 6)),
                            ("g_subtree_com", g_subtree_com, (B, nb, 3))):
@@ -868,20 +878,24 @@ def _make_step_fn():
     class _Step(torch.autograd.Function):
         @staticmethod
         def forward(ctx, qpos, qvel, warm, ctrl, friction, com, qfrc_applied, kp_scale, iterations, substeps,
-                    clamp_kv, normal, clamp_soft, grad_decay, kin, context_id):
+                    clamp_kv, normal, clamp_soft, grad_decay, kin, return_info, context_id):
             r = _ops()["forward"](qpos, qvel, warm, ctrl, friction, com, qfrc_applied, kp_scale, iterations, substeps,
                                    True, kin, context_id)
             q1, v1, w1, info, tp = r[:5]
             ctx.save_for_backward(tp, friction, com, ctrl, q1, v1, qfrc_applied, kp_scale)
-            ctx.opts = (substeps, clamp_kv, normal, clamp_soft, grad_decay, kin)
+            ctx.opts = (substeps, clamp_kv, normal, clamp_soft, grad_decay, kin, return_info)
             ctx.context_id = context_id
-            ctx.mark_non_differentiable(w1)
-            return (q1, v1, w1) + tuple(r[5:])
+            if return_info:
+                ctx.mark_non_differentiable(w1, info)
+            else:
+                ctx.mark_non_differentiable(w1)
+            return (q1, v1, w1) + ((info,) if return_info else ()) + tuple(r[5:])
 
         @staticmethod
-        def backward(ctx, g_q1, g_v1, g_w1, *g_kin):
+        def backward(ctx, g_q1, g_v1, g_w1, *g_extra):
             tp, friction, com, ctrl, q1, v1, qfrc_applied, kp_scale = ctx.saved_tensors
-            substeps, clamp_kv, normal, clamp_soft, grad_decay, kin = ctx.opts
+            substeps, clamp_kv, normal, clamp_soft, grad_decay, kin, return_info = ctx.opts
+            g_kin = g_extra[1:] if return_info else g_extra
             g_q1 = torch.zeros_like(q1) if g_q1 is None else g_q1.contiguous()
             g_v1 = torch.zeros_like(v1) if g_v1 is None else g_v1.contiguous()
             kin_state, kin_cot = [], []
@@ -895,7 +909,7 @@ def _make_step_fn():
                                                ctx.context_id)
             if grad_decay != 1.0:  # the state cotangent through this step's physics times it, ctrl's not
                 gq, gv = gq * grad_decay, gv * grad_decay  # grad_decay a float32 value: one float32 product
-            return gq, gv, None, gu, None, None, gf if qfrc_applied is not None else None, None, None, None, None, None, None, None, None, None
+            return gq, gv, None, gu, None, None, gf if qfrc_applied is not None else None, None, None, None, None, None, None, None, None, None, None
 
     return _Step
 
@@ -938,11 +952,12 @@ def _fn(name, make):
 
 def step(qpos, qvel, warm, ctrl, friction, com, qfrc_applied=None, kp_scale=None, *, iterations=ITERATIONS,
          substeps=SUBSTEPS, clamp_kv=CLAMP_KV, normal=NORMAL, clamp_soft=None, grad_decay=GRAD_DECAY,
-         kinematics=False, context=None):
+         kinematics=False, return_info=False, context=None):
     """One control step: (qpos', qvel', warm'); kinematics=True: (qpos', qvel', warm', qpos_n, xpos, xquat, cvel,
     subtree_com), the output state's kinematics. Options as jax_ffi.step (clamp_kv, normal, clamp_soft and
-    grad_decay act on the backward only). Differentiable in qpos, qvel and ctrl when any input requires grad (then the
-    forward also writes the tape); warm' is not differentiable."""
+    grad_decay act on the backward only). return_info=True inserts the nondifferentiable (B, 4) int32 forward status
+    after warm', before any kinematics outputs. Differentiable in qpos, qvel, ctrl and applied generalized force
+    when any input requires grad (then the forward also writes the tape); warm' is not differentiable."""
     import torch
     if int(clamp_kv) not in (0, 1, 2) or int(normal) not in (0, 1, 2, 3):
         raise _err("clamp_kv in {0, 1, 2}, normal in 0..3", ValueError)
@@ -954,9 +969,9 @@ def step(qpos, qvel, warm, ctrl, friction, com, qfrc_applied=None, kp_scale=None
     args = (qpos, qvel, warm, ctrl, friction, com, qfrc_applied, kp_scale)
     if torch.is_grad_enabled() and any(isinstance(x, torch.Tensor) and x.requires_grad for x in args):
         return _fn("step", _make_step_fn).apply(*args, int(iterations), int(substeps), int(clamp_kv), int(normal),
-                                                soft, gd, bool(kinematics), context_id)
+                                                soft, gd, bool(kinematics), bool(return_info), context_id)
     r = _ops()["forward"](*args, int(iterations), int(substeps), False, bool(kinematics), context_id)
-    return tuple(r[:3]) + tuple(r[5:])
+    return tuple(r[:4] if return_info else r[:3]) + tuple(r[5:])
 
 
 def kinematics(qpos, qvel, com, *, context=None):

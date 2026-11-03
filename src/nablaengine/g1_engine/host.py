@@ -34,7 +34,7 @@ __global__ void k_substep(int nw, const float* qpos, const float* qvel, const fl
   if (w >= nw) return;
   for (int i = lane; i < NQ; i += 32) s.qpos[i] = qpos[(size_t)w * NQ + i];
   for (int i = lane; i < NV; i += 32) { s.qvel[i] = qvel[(size_t)w * NV + i]; s.qacc[i] = warm[(size_t)w * NV + i]; }
-  if (lane < 3) s.com[lane] = com[w * 3 + lane];
+  if (lane < COM_WIDTH) s.com[lane] = com[w * COM_WIDTH + lane];
   if (lane == 0) { s.fric = fric[w]; s.unsupported = 0; }
 #ifdef DK_PROFILE
   if (lane < NPROF) s.prof[lane] = 0;
@@ -138,7 +138,7 @@ __device__ __forceinline__ void pre_world(SimP& s, Hand& g, int w, int lane, con
                                           const float* kp_scale = nullptr) {
   for (int i = lane; i < NQ; i += 32) s.qpos[i] = qpos[(size_t)w * NQ + i];
   for (int i = lane; i < NV; i += 32) s.qvel[i] = qvel[(size_t)w * NV + i];
-  if (lane < 3) s.com[lane] = com[w * 3 + lane];
+  if (lane < COM_WIDTH) s.com[lane] = com[w * COM_WIDTH + lane];
   if (lane == 0) {
     s.fric = fric[w];
     s.unsupported = k ? g.unsupported : 0;  // accumulated over the substeps (the post half does not change it)
@@ -340,7 +340,7 @@ static inline cudaError_t dk_forward_split(cudaStream_t st, int nw, const float*
 def loader(layouts, sizes):
     """C++ statements copying the packed constants (float32 array at the host pointer p, advanced as they are read)
     into the DKC symbols of layouts [(symbol, kind, count, width)] with sizes {unit: n}: kind "i" int, "u" unsigned 32-bit
-    as two 16-bit halves, else float."""
+    as two 16-bit halves, "q" unsigned 64-bit as four 16-bit words, else float."""
     lines, tmp = [], 0
     for sym, kind, cnt, width in layouts:
         size = (sizes[cnt] if isinstance(cnt, str) else cnt) * width
@@ -353,6 +353,12 @@ def loader(layouts, sizes):
             lines.append(f"  {{ static unsigned int t{tmp}[{n}]; for (int i = 0; i < {n}; i++) "
                          f"t{tmp}[i] = (unsigned int)p[2 * i] | ((unsigned int)p[2 * i + 1] << 16); "
                          f"cudaMemcpyToSymbol({sym}, t{tmp}, {n * 4}); p += {2 * n}; }}")
+            tmp += 1
+        elif kind == "q":
+            n = size
+            value = " | ".join(f"((unsigned long long)p[4 * i + {k}] << {16*k})" for k in range(4))
+            lines.append(f"  {{ static unsigned long long t{tmp}[{n}]; for (int i = 0; i < {n}; i++) "
+                         f"t{tmp}[i] = {value}; cudaMemcpyToSymbol({sym}, t{tmp}, {n * 8}); p += {4 * n}; }}")
             tmp += 1
         else:
             lines.append(f"  cudaMemcpyToSymbol({sym}, p, {size * 4}); p += {size};")

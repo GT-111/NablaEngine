@@ -390,7 +390,7 @@ def tape_checks(args, m, mt, arr, run, main, K):
     # limit rows (the engine's float32 test) and the clamp mask against a float64 recomputation
     c1c = source.constants(m)[0]
     lay = {s: n for s, n in zip([x[0] for x in source.const_layout(m)], np.cumsum([0] + [
-        (dict(nb=m.nbody, nv=m.nv, one=1)[c] if isinstance(c, str) else c) * w for _, _, c, w in source.const_layout(m)]))}
+        (dict(nb=m.nbody, nv=m.nv, one=1, nr=len(source.free_roots(m)))[c] if isinstance(c, str) else c) * w for _, _, c, w in source.const_layout(m)]))}
     cget = lambda s, n: c1c[lay[s]:lay[s] + n]  # noqa: E731
     kp, kv, frc = cget("c_kp", nv), cget("c_kv", nv), cget("c_frclim", nv)
     actid = cget("c_actid", nv).astype(int)
@@ -621,12 +621,12 @@ def binary_source(m, foot_pairs):
     c1, maxd = source.constants(m)
     c2 = step.pair_constants(m, foot_pairs)
     dofbody, mask = step.extra_constants(m)
-    halves = np.stack([mask & 0xFFFF, mask >> 16], 1).ravel()
+    halves = np.stack([(mask >> shift) & 0xFFFF for shift in (0, 16, 32, 48)], 1).ravel()
     consts = np.concatenate([c1, c2, dofbody.astype(np.float32), halves.astype(np.float32)])
-    sizes = {"nb": m.nbody, "nv": m.nv, "one": 1, "nv2": 2 * m.nv}
+    sizes = {"nb": m.nbody, "nv": m.nv, "one": 1, "nv2": 2 * m.nv, "nr": len(source.free_roots(m))}
     lay1 = source.const_layout(m)
     lay2 = [(s, k, n, 1) for s, k, n in step.const_layout(m)]
-    lay3 = [("c_dofbody", "i", "nv", 1), ("c_ancmask", "u", "nb", 1)]
+    lay3 = [("c_dofbody", "i", "nv", 1), ("c_ancmask", "q", "nb", 1)]
     src = (source.header(m, maxd, 1) + step.EXTRA_HEADER + step.step_header(m) + tape.header(m) + source.DEVICE
            + step.STEP_DEVICE + step.STEP_KERNEL + KERNEL
            + HOST.replace("LOAD_CONSTS", loader(list(lay1) + lay2 + lay3, sizes)).replace("NCONST", str(len(consts))))

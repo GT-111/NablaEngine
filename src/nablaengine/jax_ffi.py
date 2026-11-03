@@ -6,8 +6,8 @@ mjx.kinematics + com_pos + com_vel with their VJP, for differentiable rollouts (
   kinematics(qpos, qvel, com) -> (qpos_n, xpos, xquat, cvel, subtree_com)
 
 one control step (substeps engine substeps of h = 5 ms) for B worlds; all float32, shapes (B, nq), (B, nv), (B, nv),
-(B, nu), (B,), (B, 3) (mjlab G1: nq 36, nv 35, nu 29); warm is the Newton warm start (warm' = the last substep's
-acceleration, for the next call); friction is each world's foot-floor friction, com its torso COM offset. B is read
+(B, nu), (B,), (B, 3*nr) for one or two FREE roots (mjlab G1: nr 1, nq 36, nv 35, nu 29); warm is the Newton warm start (warm' = the last substep's
+acceleration, for the next call); friction is each world's selected-pair sliding coefficient, com the selected bodies' local COM offsets. B is read
 from the arrays at run time: one library serves every batch size, and JAX traces once per shape. jax.custom_vjp: the
 forward under differentiation (dk_step_fwd) also writes the tape, (B, substeps * REC_WORDS) float32 (5888 B per world
 and substep), kept with friction and com as the residuals; the backward (dk_step_bwd, the analytic adjoint k_adjoint,
@@ -167,13 +167,12 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-import mujoco
 import numpy as np
 
 import nablaengine
 from nablaengine import cuda, fixtures, provenance
 from nablaengine.model import capability
-from nablaengine.g1_engine import adjoint, host, kinematics as g1_kin, step as g1_step, tape as g1_tape
+from nablaengine.g1_engine import adjoint, host, kinematics as g1_kin, source as g1_source, step as g1_step, tape as g1_tape
 
 ITERATIONS, SUBSTEPS, CLAMP_KV, NORMAL = 10, 4, 0, 3  # the interface defaults
 CLAMP_SOFT, GRAD_DECAY = 0.2, 1.0  # clamp_kv=2's default delta; the default gradient decay factor (no decay)
@@ -523,8 +522,8 @@ static ffi::Error forward_impl(cudaStream_t st, ffi::ScratchAllocator& scratch, 
   if (d.size() != 2 || d[1] != NQ) return bad("qpos must be (B, nq) float32");
   const int64_t B = d[0];
   if (!dims_are(qvel, {B, NV}) || !dims_are(warm, {B, NV}) || !dims_are(ctrl, {B, NU}) || !dims_are(fric, {B})
-      || !dims_are(com, {B, 3}))
-    return bad("shapes: qpos (B, nq), qvel (B, nv), warm (B, nv), ctrl (B, nu), friction (B,), com (B, 3)");
+      || !dims_are(com, {B, COM_WIDTH}))
+    return bad("shapes: qpos (B, nq), qvel (B, nv), warm (B, nv), ctrl (B, nu), friction (B,), com (B, COM_WIDTH)");
   if (substeps < 1 || iterations < 0) return bad("substeps >= 1 and iterations >= 0");
   if (!dims_are(*qo, {B, NQ}) || !dims_are(*vo, {B, NV}) || !dims_are(*wo, {B, NV}) || !dims_are(*info, {B, 4}))
     return bad("outputs: qpos' (B, nq), qvel' (B, nv), warm' (B, nv) float32, info (B, 4) int32");
@@ -620,8 +619,8 @@ static ffi::Error bwd_impl(cudaStream_t st, ffi::Buffer<ffi::F32> tape, ffi::Buf
   if (substeps < 1 || d.size() != 2 || d[1] != (int64_t)substeps * REC_WORDS)
     return bad("tape must be (B, substeps * REC_WORDS) float32");
   const int64_t B = d[0];
-  if (!dims_are(fric, {B}) || !dims_are(com, {B, 3}) || !dims_are(gq_out, {B, NQ}) || !dims_are(gv_out, {B, NV}))
-    return bad("shapes: friction (B,), com (B, 3), g_qpos (B, nq), g_qvel (B, nv)");
+  if (!dims_are(fric, {B}) || !dims_are(com, {B, COM_WIDTH}) || !dims_are(gq_out, {B, NQ}) || !dims_are(gv_out, {B, NV}))
+    return bad("shapes: friction (B,), com (B, COM_WIDTH), g_qpos (B, nq), g_qvel (B, nv)");
   if (ctrl && !dims_are(*ctrl, {B, NU})) return bad("ctrl must be (B, nu) float32");
   if (kin && (!dims_are(*kin->q1, {B, NQ}) || !dims_are(*kin->v1, {B, NV})
               || !kin_shapes(B, *kin->gqn, *kin->gxp, *kin->gxq, *kin->gcv, *kin->gsc)))
@@ -704,7 +703,7 @@ static ffi::Error kin_state_dims(const BufF& qpos, const BufF& qvel, const BufF&
   auto d = qpos.dimensions();
   if (d.size() != 2 || d[1] != NQ) return bad("qpos must be (B, nq) float32");
   *B = d[0];
-  if (!dims_are(qvel, {*B, NV}) || !dims_are(com, {*B, 3})) return bad("shapes: qpos (B, nq), qvel (B, nv), com (B, 3)");
+  if (!dims_are(qvel, {*B, NV}) || !dims_are(com, {*B, COM_WIDTH})) return bad("shapes: qpos (B, nq), qvel (B, nv), com (B, COM_WIDTH)");
   if (*B > INT_MAX) return bad("B too large");
   return ffi::Error::Success();
 }
@@ -853,7 +852,8 @@ def library_sources(m, foot_pairs, forward_unit=False, target=None, com_body_id=
     fp = FWD_UNIT if forward_unit else _tag(FWD_VARIANT)  # the unit with the forward and kinematics entries
     defines[f"{fp}.cu"] += cuda.unit_defines("forward", target, defines[f"{fp}.cu"])  # sm_90: the register caps
     defs = [f"#define {k} {val}" for k, val in (
-        ("NQ", m.nq), ("NV", m.nv), ("NU", m.nu), ("NB", m.nbody), ("MAXCON", g1_step.maxcon(m)),
+        ("NQ", m.nq), ("NV", m.nv), ("NU", m.nu), ("NB", m.nbody), ("COM_WIDTH", 3*len(g1_source.free_roots(m))),
+        ("MAXCON", g1_step.maxcon(m)),
         ("REC_WORDS", g1_tape.rec_words(m)),
         ("OFF_FLAGS", g1_tape.layout(m)["flags"][0]), ("TAPE_REFACT", f"{g1_tape.FLAG_REFACT}u"),
         ("TAPE_NONCONV", f"{g1_tape.FLAG_NONCONV}u"), ("TAPE_SINGULAR", f"{g1_tape.FLAG_SINGULAR}u"),
@@ -1022,7 +1022,7 @@ def _build(units, defines, arch, include, consts, unit_arch=None, prefix="libdk_
     return out, True, key
 
 
-def init(model_dir=None, model=None, foot_pairs=None):
+def init(model_dir=None, model=None, foot_pairs=None, com_body_id=None):
     """Load the library for the model (build it on first use), hand it the model constants and register the FFI
     targets; idempotent (later calls return the loaded library; a different model raises). model_dir: a fixtures
     directory (default $DK_FIXTURES, else fixtures/mjlab); model, foot_pairs: an MjModel instead (e.g. the same mjlab
@@ -1041,9 +1041,9 @@ def init(model_dir=None, model=None, foot_pairs=None):
             return _STATE["info"]
         m, fp = _model(model_dir, model, foot_pairs)
         # the model must be one the engine supports (nablaengine.model.capability), checked before anything is built
-        capability.require(m, fp, capability.COM_BODY, "engine", "jax_ffi.init")
+        capability.require(m, fp, capability.COM_BODY if com_body_id is None else com_body_id, "engine", "jax_ffi.init")
         arch = _arch()
-        plan = build_plan(m, fp, arch)
+        plan = build_plan(m, fp, arch, com_body_id=com_body_id)
         units, consts, defines, unit_arch = plan["units"], plan["consts"], plan["defines"], plan["unit_arch"]
         fwd_flags, adj_flags, split = plan["arch_flags"]["forward"], plan["arch_flags"]["adjoint"], plan["split"]
         fwd_defines = plan["forward_defines"]
@@ -1076,7 +1076,9 @@ def init(model_dir=None, model=None, foot_pairs=None):
                           ("kin_bwd", "DkKinBwd")):
             targets[kind] = f"dk_{kind}_{key[:8]}"
             jax.ffi.register_ffi_target(targets[kind], jax.ffi.pycapsule(getattr(lib, sym)), platform="CUDA")
-        torso = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, "torso_link")  # as source.constants
+        com_ids = (int(m.body("torso_link").id),) if com_body_id is None else tuple(int(x) for x in np.atleast_1d(com_body_id))
+        nr = len(g1_source.free_roots(m))
+        torso = com_ids[0]
         try:  # the kinematics outputs' assumptions (kinematics.check_model); the kinematics entries raise without them
             g1_kin.check_model(m)
             kin_error = None
@@ -1086,7 +1088,8 @@ def init(model_dir=None, model=None, foot_pairs=None):
         commit, dirty = provenance.source_commit()
         info = dict(path=str(path), key=key, arch=arch, built=built, version=nablaengine.__version__, commit=commit,
                     dirty=dirty, rec_words=rec, nq=m.nq, nv=m.nv, nu=m.nu,
-                    nbody=m.nbody, kinematics_error=kin_error, maxcon=g1_step.maxcon(m), nefc=g1_step.NEFC,
+                    nbody=m.nbody, nr=nr, com_width=3*nr, com_body_ids=com_ids, kinematics_error=kin_error,
+                    maxcon=g1_step.maxcon(m), nefc=g1_step.NEFC,
                     sizeof_sim=int(sz[0, 0]), sizeof_adj={_tag(v): int(r[1]) for v, r in zip(VARIANTS, sz)},
                     variants=[list(v) for v in VARIANTS], timestep=float(m.opt.timestep), torso_id=int(torso),
                     foot_pairs=[int(p) for p in fp], consts_sha256=chash,
@@ -1148,7 +1151,7 @@ def forward(qpos, qvel, warm, ctrl, friction, com, *, iterations=ITERATIONS, sub
     B = qpos.shape[0]
     nq, nv, nu = lib["nq"], lib["nv"], lib["nu"]
     for name, x, shape in (("qpos", qpos, (B, nq)), ("qvel", qvel, (B, nv)), ("warm", warm, (B, nv)),
-                           ("ctrl", ctrl, (B, nu)), ("friction", friction, (B,)), ("com", com, (B, 3))):
+                           ("ctrl", ctrl, (B, nu)), ("friction", friction, (B,)), ("com", com, (B, lib["com_width"]))):
         _check(name, x, shape)
     f32 = jnp.float32
     outs = [jax.ShapeDtypeStruct((B, nq), f32), jax.ShapeDtypeStruct((B, nv), f32), jax.ShapeDtypeStruct((B, nv), f32),
@@ -1163,13 +1166,13 @@ def forward(qpos, qvel, warm, ctrl, friction, com, *, iterations=ITERATIONS, sub
 
 
 def kinematics_forward(qpos, qvel, com):
-    """The kinematics outputs of the states (qpos (B, nq), qvel (B, nv), com (B, 3)) without custom_vjp (dk_kin):
+    """The kinematics outputs of the states (qpos (B, nq), qvel (B, nv), com (B, 3*nr)) without custom_vjp (dk_kin):
     (qpos_n (B, nq), xpos (B, nbody, 3), xquat (B, nbody, 4), cvel (B, nbody, 6), subtree_com (B, nbody, 3)), MJX's
     mjx.kinematics + com_pos + com_vel (g1_engine.kinematics)."""
     import jax
     lib = _kin_lib()
     B = qpos.shape[0]
-    for name, x, shape in (("qpos", qpos, (B, lib["nq"])), ("qvel", qvel, (B, lib["nv"])), ("com", com, (B, 3))):
+    for name, x, shape in (("qpos", qpos, (B, lib["nq"])), ("qvel", qvel, (B, lib["nv"])), ("com", com, (B, lib["com_width"]))):
         _check(name, x, shape)
     return tuple(jax.ffi.ffi_call(_STATE["targets"]["kin"], _kin_structs(lib, B))(qpos, qvel, com))
 
@@ -1182,7 +1185,7 @@ def kinematics_backward(qpos, qvel, com, g_qpos_n, g_xpos, g_xquat, g_cvel, g_su
     lib = _kin_lib()
     B = qpos.shape[0]
     nq, nv = lib["nq"], lib["nv"]
-    for name, x, shape in (("qpos", qpos, (B, nq)), ("qvel", qvel, (B, nv)), ("com", com, (B, 3))):
+    for name, x, shape in (("qpos", qpos, (B, nq)), ("qvel", qvel, (B, nv)), ("com", com, (B, lib["com_width"]))):
         _check(name, x, shape)
     gk = (g_qpos_n, g_xpos, g_xquat, g_cvel, g_subtree_com)
     _check_kin(lib, B, gk, "g_")
@@ -1252,7 +1255,7 @@ def backward(tape, friction, com, g_qpos, g_qvel, *, substeps=SUBSTEPS, clamp_kv
     B = tape.shape[0]
     nq, nv, nu = lib["nq"], lib["nv"], lib["nu"]
     for name, x, shape in (("tape", tape, (B, substeps * lib["rec_words"])), ("friction", friction, (B,)),
-                           ("com", com, (B, 3)), ("g_qpos", g_qpos, (B, nq)), ("g_qvel", g_qvel, (B, nv))):
+                           ("com", com, (B, lib["com_width"])), ("g_qpos", g_qpos, (B, nq)), ("g_qvel", g_qvel, (B, nv))):
         _check(name, x, shape)
     if (int(clamp_kv), int(normal)) not in VARIANTS:
         raise ValueError(f"nablaengine.jax_ffi: no adjoint variant clamp_kv={clamp_kv} normal={normal}")
@@ -1537,7 +1540,7 @@ def check_model(mjm, foot_pairs=None, torso_id=None):
         elif not np.array_equal(consts.view(np.uint32), np.asarray(mine, np.float32).view(np.uint32)):
             names, at = [], 0  # the constant arrays that differ, in packing order
             for sym, kind, count, width in lays:  # host.loader's packing ("u": two 16-bit halves per value)
-                n = (sizes[count] if isinstance(count, str) else int(count)) * width * (2 if kind == "u" else 1)
+                n = (sizes[count] if isinstance(count, str) else int(count)) * width * ({"u": 2, "q": 4}.get(kind, 1))
                 if not np.array_equal(consts[at:at + n].view(np.uint32), np.asarray(mine[at:at + n]).view(np.uint32)):
                     names.append(sym)
                 at += n

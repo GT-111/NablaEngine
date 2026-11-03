@@ -9,7 +9,7 @@ Sections (--sections, default all):
   fixtures   the mjlab G1 (fixtures/mjlab/g1_train.mjb) has 0 errors and 0 warnings in every scope (one info: H11c, the
              engine does not clamp ctrl); nablaengine.fixtures.load_model checks it
   variants   the G1 rebuilt as an MjSpec from the fixture's arrays (spec_from_model: bodies, joints, geoms, pairs,
-             actuators, options) checks clean, then each deliberately modified variant (contype contacts, condim 4,
+             actuators, options) checks clean, then each deliberately modified unsupported variant (condim 4,
              Euler, negative solref, qpos0 != 0, a tendon, gravcomp, the CG solver;
              actuator-level damping / armature / delay, damping polynomials, a motor actuator, a cylinder pair, a ball
              joint body, the waist roll and pitch welded, a direct damping solref (0.02,
@@ -17,7 +17,7 @@ Sections (--sections, default all):
              frictionloss disabled with frictionloss) must raise exactly its own codes (new errors relative to the
              base) in the scope it names, and capability.require and nablaengine.jax_ffi.init(model=...) must reject
              it with UnsupportedModel before anything is built. Supported on purpose (no new error and no new
-             warning, require accepts): contype contacts that only duplicate explicit pairs (MuJoCo 3.17 collides
+             warning, require accepts): eligible implicit contype contacts, contype contacts that only duplicate explicit pairs (MuJoCo 3.17 collides
              such a geom pair once, with the pair's parameters: measured), a box-box pair at the CCD defaults
              (forward scope), renamed bodies and joints, visual-only geoms with a camera and a light, sites and
              sensors, another gravity vector, disable flags of physics the model does not have (springs, dampers,
@@ -262,8 +262,8 @@ def variants():
         m.dof_frictionloss[m.jnt_dofadr[j]] = 0.1
 
     return dict(
-        contype=("contype / conaffinity 1 on the pelvis and hip geoms (pelvis - hip roll: no explicit pair)", contype,
-                 "engine", {"H15"}),
+        contype=("contype / conaffinity 1 on the pelvis and hip geoms (pelvis - hip roll: generated implicit pair)", contype,
+                 "engine", set()),
         contype_covered=("contype / conaffinity 1 on 3 hand / wrist geoms whose filter pairs are all explicit pairs "
                          "(MuJoCo collides a geom pair once, with the pair's parameters): supported", contype_covered,
                          "engine", set()),

@@ -24,6 +24,10 @@ FLAG_VERIFY_DIFF = 1 << 11  # -DDK_TAPE_VERIFY: L_H differs from a re-assembly a
 SINGULAR_NU = 5e-3  # m
 CON_NONE = 0xFFFF  # contact table entry past ncon
 
+
+def pair_bits(m):
+    return max(9, (len(step.contact_pairs(m)) - 1).bit_length())
+
 # (name, #define, length: callable of (nq, nv, ntri, maxcon) or an int); a None name pads to the next ALIGN boundary
 _FIELDS = (
     ("hdr", "OFF_HDR", 1),  # ncon | nefc << 8 | nlim << 16 | niter << 24 (u8 each)
@@ -48,7 +52,7 @@ _FIELDS = (
 def _table(m, max_contacts=None):
     nc = max_contacts or step.maxcon(m)
     nv, ntri = m.nv, m.nv * (m.nv + 1) // 2
-    assert nv <= 64 and m.npair <= 512 and nc <= 255 and step.NEFC <= 255, "field widths (clamp u64, pair 9 bits, u8)"
+    assert nv <= 64 and len(step.contact_pairs(m)) <= 2048 and nc <= 255 and step.NEFC <= 255, "tape field widths"
     out, off = [], 0
     for name, define, n in _FIELDS:
         if name is None:
@@ -77,7 +81,8 @@ def header(m, max_contacts=None):
     lines += [f"#define {define} {off}  // {name}, {n} words" for name, define, off, n in tab]
     lines += [f"#define TAPE_REFACT {FLAG_REFACT}u", f"#define TAPE_NONCONV {FLAG_NONCONV}u",
               f"#define TAPE_SINGULAR {FLAG_SINGULAR}u", f"#define TAPE_VERIFY_DIFF {FLAG_VERIFY_DIFF}u",
-              f"#define TAPE_SINGULAR_NU {SINGULAR_NU}f", f"#define TAPE_CON_NONE {CON_NONE}u"]
+              f"#define TAPE_SINGULAR_NU {SINGULAR_NU}f", f"#define TAPE_CON_NONE {CON_NONE}u",
+              f"#define TAPE_PAIR_BITS {pair_bits(m)}", f"#define TAPE_PAIR_MASK {(1 << pair_bits(m)) - 1}u"]
     return "\n" + "\n".join(lines) + "\n"
 
 
@@ -115,7 +120,7 @@ def decode(arr, m, max_contacts=None):
     nc = max_contacts or step.maxcon(m)
     e = np.ascontiguousarray(u[..., sl("con")]).view(np.uint16)[..., :nc].astype(np.int64)  # little endian: low half first
     past = np.arange(nc) >= out["ncon"][..., None]
-    out["pair"], out["slot"] = np.where(past, -1, e & 511), np.where(past, -1, e >> 9)
+    out["pair"], out["slot"] = np.where(past, -1, e & ((1 << pair_bits(m)) - 1)), np.where(past, -1, e >> pair_bits(m))
     for name in ("qpos", "qvel", "qacc", "qacc_adv", "L_H", "L_Q"):
         out[name] = a[..., sl(name)]
     return out
