@@ -96,6 +96,21 @@ class NativeGeometry:
             load.append(f"for(int i=0;i<{size};i++) {name}[i]=({ 'int' if kind == 'i' else 'float' })*p++;")
         wrapper = r'''
 extern "C" void cm_load(const float* p) { LOAD }
+extern "C" int cm_support_gap() {
+  const float vertices[6]={1.f,1.f,0.f,1.f,1.00000011920928955078125f,0.f};
+  const int graph[10]={2,4,0,2,0,1,1,-1,0,-1}, extrema[27]={};
+  cm::mjCCDObj object={};
+  object.geom_type=7; object.vertindex=object.meshindex=-1;
+  object.mat[0]=object.mat[4]=object.mat[8]=1;
+  object.data.mesh.vert=vertices; object.data.mesh.nvert=2;
+  object.data.mesh.graph=graph; object.data.mesh.extrema=extrema;
+  const cm::mjtNum direction[3]={1,.001,0}; cm::mjtNum result[3];
+  cm::mjc_meshSupport(result,&object,direction);
+  int ordered=object.vertindex==1;
+  object.vertindex=object.meshindex=-1;
+  cm::mjc_hillclimbSupport(result,&object,direction);
+  return ordered | ((object.vertindex==1)<<1);
+}
 struct GuardedScratch { uint64_t before; CMScratch scratch; uint64_t after; };
 extern "C" int cm_forward(int g1,int g2,const float* x,const float* q,float* out,int* feature,int* error) {
   GuardedScratch guard; guard.before=0x18273645; guard.after=0x54637281;
@@ -253,6 +268,11 @@ class ConvexMeshCheck(unittest.TestCase):
                 reverse, _ = self.engines[id(model)].forward(x, q, pair=(1, 0))
                 self.assertEqual(len(reverse), len(actual))
                 np.testing.assert_allclose(sorted(reverse[:, 0]), sorted(actual[:, 0]), atol=3e-6)
+
+    def test_native_support_preserves_gaps_below_float_dot_product_precision(self):
+        # Adjacent float32 hull vertices can have distinct support values whose
+        # dot products round equal in float32, selecting a different EPA face.
+        self.assertEqual(self.engines[id(self.mesh)].library.cm_support_gap(), 3)
 
     def test_touching_separated_rotated_and_deep_penetration(self):
         for offset, angle in ((2 * float(np.float32(.1)), 0), (0.23, .13), (.085, .21), (.174, .18)):

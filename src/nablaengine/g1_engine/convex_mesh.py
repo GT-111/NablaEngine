@@ -20,7 +20,7 @@ Third-party portions below are adapted from MuJoCo 3.17.0, engine_collision_gjk.
 and the mesh/box supports in engine_collision_convex.c. Copyright 2021, 2024
 DeepMind Technologies Limited. Licensed under the Apache License, Version 2.0:
 https://www.apache.org/licenses/LICENSE-2.0 . See the retained notice in SOURCE.
-Modified: compiled-hull tables, float32 CUDA, iterative EPA horizon traversal,
+Modified: compiled-hull tables, float32 geometry replay, iterative EPA horizon traversal,
 caller-owned bounded scratch, and feature-based analytic contact derivatives.
 The specialized box-box source is adapted from engine_collision_box.c,
 Copyright 2016 Svetoslav Kolev, under the same Apache License, Version 2.0.
@@ -90,8 +90,8 @@ def scratch_bytes(m):
     iterations = int(m.opt.ccd_iterations)
     polygon, degree = max(16, m.npolygonmax), max(3, m.nmeshdegmax)
     edges = 24 + max(0, iterations - 35)
-    # Native Vertex is 44B, Face is 36B; a pointer is 8B on both supported targets.
-    epa = sum(map(_align8, (44 * (5 + iterations), 36 * 6 * iterations,
+    # Native double-precision Vertex is 80B, Face is 56B; pointers are 8B.
+    epa = sum(map(_align8, (80 * (5 + iterations), 56 * 6 * iterations,
                            8 * 6 * iterations, 4 * edges, 4 * edges)))
     # Replay uses one dual (value, derivative) per scalar, with the native layout.
     multiccd = 2 * _align8(4 * degree) + 3 * _align8(8 * 3 * degree)
@@ -125,7 +125,7 @@ def header(m, geoms):
 #endif
 #endif
 #define CM_CCD_ITERS {int(m.opt.ccd_iterations)}
-#define CM_CCD_TOL {float(m.opt.ccd_tolerance):.9e}f
+#define CM_CCD_TOL {float(m.opt.ccd_tolerance):.17e}
 #define CM_POLYGON_MAX {max(16, m.npolygonmax)}
 #define CM_DEGREE_MAX {max(3, m.nmeshdegmax)}
 #define CM_MULTI {int(not (int(m.opt.disableflags) & int(mujoco.mjtDisableBit.mjDSBL_MULTICCD)))}
@@ -238,9 +238,11 @@ CM_DEVICE bool operator==(Dual a, Dual b) { return a.v == b.v; }
 CM_DEVICE bool operator!=(Dual a, Dual b) { return a.v != b.v; }
 template<class T> CM_DEVICE T number(float value, float derivative) { return T(value, derivative); }
 template<> CM_DEVICE float number<float>(float value, float derivative) { return value; }
+template<> CM_DEVICE double number<double>(float value, float derivative) { return value; }
 template<class T> CM_DEVICE T absn(T x) { return x < T(0) ? -x : x; }
 template<class T> CM_DEVICE T sqrtn(T x);
 template<> CM_DEVICE float sqrtn<float>(float x) { return sqrtf(x); }
+template<> CM_DEVICE double sqrtn<double>(double x) { return sqrt(x); }
 template<> CM_DEVICE Dual sqrtn<Dual>(Dual x) {
   float value = sqrtf(x.v);
   return {value, x.d / (2.f * value)};
@@ -1181,8 +1183,10 @@ template<class T> CM_DEVICE int mjc_multicontact(Obj<T>* obj1, Obj<T>* obj2, T* 
 } // namespace cmgeom
 
 namespace cm {
-typedef float mjtNum;
-typedef Obj<float> mjCCDObj;
+// Float support sums can tie on distinct hull vertices and select a different
+// manifold. Keep the native CCD decisions in the reference model's precision.
+typedef double mjtNum;
+typedef Obj<mjtNum> mjCCDObj;
 enum {
   mjEPA_NOCONTACT=-1, mjEPA_SUCCESS=0, mjEPA_P2_INVALID_FACES,
   mjEPA_P2_NONCONVEX, mjEPA_P2_ORIGIN_ON_FACE, mjEPA_P3_BAD_NORMAL,
@@ -1190,30 +1194,30 @@ enum {
   mjEPA_P3_ORIGIN_ON_FACE, mjEPA_P4_MISSING_ORIGIN
 };
 struct mjCCDConfig {
-  int max_iterations; float tolerance; int max_contacts; float dist_cutoff;
+  int max_iterations; mjtNum tolerance; int max_contacts; mjtNum dist_cutoff;
   void* buffer; int npolygonmax, nmeshdegmax; int* stack;
 };
 struct mjCCDStatus {
-  int separated; float dist[8], x1[24], x2[24]; int nx;
-  int max_iterations; float tolerance; int max_contacts; float dist_cutoff;
+  int separated; mjtNum dist[8], x1[24], x2[24]; int nx;
+  int max_iterations; mjtNum tolerance; int max_contacts; mjtNum dist_cutoff;
   int gjk_iterations, epa_iterations, epa_status, fault, final_sign;
 };
-#define mjMINVAL 1e-15f
+#define mjMINVAL 1e-15
 #define mjMINVAL2 (mjMINVAL * mjMINVAL)
-#define mjMAXVAL 1e10f
+#define mjMAXVAL 1e10
 #define mjMAXVAL2 (mjMAXVAL * mjMAXVAL)
-#define mjMAX_LIMIT FLT_MAX
-#define mjMINDIST2 1e-10f
-#define mjMINDIST3 1e-10f
-#define mjMINDIST4 1e-17f
-#define mjMINEPATOL 1e-7f
-CM_DEVICE void mulMatTVec3(float* res, const float* mat, const float* vec) {
+#define mjMAX_LIMIT DBL_MAX
+#define mjMINDIST2 mjMINVAL2
+#define mjMINDIST3 mjMINVAL2
+#define mjMINDIST4 mjMINVAL2
+#define mjMINEPATOL mjMINVAL
+CM_DEVICE void mulMatTVec3(mjtNum* res, const mjtNum* mat, const mjtNum* vec) {
   for(int i=0;i<3;i++) res[i]=mat[i]*vec[0]+mat[3+i]*vec[1]+mat[6+i]*vec[2];
 }
-CM_DEVICE void localToGlobal(float* res,const float* mat,const float* vec,const float* pos) {
+CM_DEVICE void localToGlobal(mjtNum* res,const mjtNum* mat,const mjtNum* vec,const mjtNum* pos) {
   for(int i=0;i<3;i++) res[i]=mat[3*i]*vec[0]+mat[3*i+1]*vec[1]+mat[3*i+2]*vec[2]+pos[i];
 }
-CM_DEVICE void mulMatVec3(float* res,const float* mat,const float* vec) {
+CM_DEVICE void mulMatVec3(mjtNum* res,const mjtNum* mat,const mjtNum* vec) {
   for(int i=0;i<3;i++) res[i]=mat[3*i]*vec[0]+mat[3*i+1]*vec[1]+mat[3*i+2]*vec[2];
 }
 CM_DEVICE void mjc_boxSupport(mjtNum res[3], mjCCDObj* obj, const mjtNum dir[3]) {
@@ -1343,7 +1347,7 @@ CM_DEVICE void mjc_hillclimbSupport(mjtNum res[3], mjCCDObj* obj, const mjtNum d
   // transform result to global frame
   localToGlobal(res, mat, local_dir, pos);
 }
-CM_DEVICE void native_support(float* res,mjCCDObj* o,const float* dir) {
+CM_DEVICE void native_support(mjtNum* res,mjCCDObj* o,const mjtNum* dir) {
   if(o->geom_type==mjGEOM_BOX) mjc_boxSupport(res,o,dir);
   else if(o->data.mesh.nvert<10) mjc_meshSupport(res,o,dir);
   else mjc_hillclimbSupport(res,o,dir);
@@ -1456,7 +1460,7 @@ CM_DEVICE mjtNum dot3(const mjtNum v1[3], const mjtNum v2[3]) {
 
 // norm of v
 CM_DEVICE mjtNum norm3(const mjtNum v[3]) {
-  return sqrtf(dot3(v, v));
+  return sqrt(dot3(v, v));
 }
 
 // res = v
@@ -1530,7 +1534,7 @@ CM_DEVICE void gjk(mjCCDStatus* status, mjCCDObj* obj1, mjCCDObj* obj2) {
 
   for (; k < kmax; k++) {
     // in tolerance for geoms to be in contact, or x_norm has stagnated
-    if (x_norm < min_norm || fabsf(x_norm_prev - x_norm) < mjMINVAL) {
+    if (x_norm < min_norm || fabs(x_norm_prev - x_norm) < mjMINVAL) {
       break;
     }
 
@@ -1727,7 +1731,7 @@ CM_DEVICE mjtNum signedDistance(mjtNum normal[3], const Vertex* v1, const Vertex
   cross3(normal, diff1, diff2);
   mjtNum norm2 = dot3(normal, normal);
   if (norm2 > mjMINVAL2 && norm2 < mjMAXVAL2) {
-    scl3(normal, normal, 1 / sqrtf(norm2));
+    scl3(normal, normal, 1 / sqrt(norm2));
     return dot3(normal, v1->vert);
   }
   return mjMAX_LIMIT;  // cannot recover normal (ignore face)
@@ -2031,7 +2035,7 @@ CM_DEVICE void S2D(mjtNum lambda[3], const mjtNum s1[3], const mjtNum s2[3], con
   // exclude the axis with the largest projection of the simplex using the computed minors
   mjtNum M_max = 0;
   mjtNum s1_2D[2], s2_2D[2], s3_2D[2], p_o_2D[2];
-  mjtNum mu1 = fabsf(M_14), mu2 = fabsf(M_24), mu3 = fabsf(M_34);
+  mjtNum mu1 = fabs(M_14), mu2 = fabs(M_24), mu3 = fabs(M_34);
   if (mu1 >= mu2 && mu1 >= mu3) {
     M_max = M_14;
     s1_2D[0] = s1[1];
@@ -2154,13 +2158,13 @@ CM_DEVICE void S1D(mjtNum lambda[2], const mjtNum s1[3], const mjtNum s2[3]) {
   int index = 0;
 
   mu = s1[1] - s2[1];
-  if (fabsf(mu) >= fabsf(mu_max)) {
+  if (fabs(mu) >= fabs(mu_max)) {
     mu_max = mu;
     index = 1;
   }
 
   mu = s1[2] - s2[2];
-  if (fabsf(mu) >= fabsf(mu_max)) {
+  if (fabs(mu) >= fabs(mu_max)) {
     mu_max = mu;
     index = 2;
   }
@@ -2280,8 +2284,8 @@ CM_DEVICE int polytope2(Polytope* pt, mjCCDStatus* status, mjCCDObj* obj1, mjCCD
   mjtNum value = mjMAX_LIMIT;
   int index = 0;
   for (int i = 0; i < 3; i++) {
-    if (fabsf(diff[i]) < value) {
-      value = fabsf(diff[i]);
+    if (fabs(diff[i]) < value) {
+      value = fabs(diff[i]);
       index = i;
     }
   }
@@ -2360,7 +2364,7 @@ CM_DEVICE void triAffineCoord(mjtNum lambda[3], const mjtNum v1[3], const mjtNum
   // exclude one of the axes with the largest projection of the simplex using the computed minors
   mjtNum M_max = 0;
   int x, y;
-  mjtNum mu1 = fabsf(M_14), mu2 = fabsf(M_24), mu3 = fabsf(M_34);
+  mjtNum mu1 = fabs(M_14), mu2 = fabs(M_24), mu3 = fabs(M_34);
   if (mu1 >= mu2 && mu1 >= mu3) {
     M_max = M_14;
     x = 1;
@@ -2699,7 +2703,7 @@ CM_DEVICE mjtNum epaWitness(const Polytope* pt, const Face* face, mjtNum x1[3], 
   // witness point on geom 2
   lincomb(x2, lambda, 3, v1->vert2, v2->vert2, v3->vert2, NULL);
 
-  return -sqrtf(face->dist2);
+  return -sqrt(face->dist2);
 }
 
 
@@ -2740,7 +2744,7 @@ CM_DEVICE Face* epa(mjCCDStatus* status, Polytope* pt, mjCCDObj* obj1, mjCCDObj*
     }
 
     // compute support point w from the closest face's normal
-    mjtNum lower = sqrtf(lower2);
+    mjtNum lower = sqrt(lower2);
     int wi = epaSupport(pt, obj1, obj2, face->v, lower);
     const Vertex* w = pt->verts + wi;
     mjtNum upper_k = dot3(face->v, w->vert) / lower;  // upper bound for kth iteration
@@ -2852,7 +2856,7 @@ CM_DEVICE Face* epa(mjCCDStatus* status, Polytope* pt, mjCCDObj* obj1, mjCCDObj*
   if (face) {
     status->dist[0] = epaWitness(pt, face, status->x1, status->x2);
     int fi[3]=EPA_VERT_EXPAND(face->verts);
-    float raw_projection[3];
+    mjtNum raw_projection[3];
     projectOriginPlane(raw_projection,pt->verts[fi[2]].vert,pt->verts[fi[1]].vert,pt->verts[fi[0]].vert);
     status->final_sign=dot3(raw_projection,face->v)<0 ? -1 : 1;
     status->nx = 1;
@@ -2933,7 +2937,7 @@ CM_DEVICE mjtNum mjc_ccd(const mjCCDConfig* config, mjCCDStatus* status, mjCCDOb
 
       // get multiple contacts if requested
       if (config->max_contacts > 1 && face) {
-        status->nx = cmgeom::mjc_multicontact<float>(obj1, obj2, status->x1, status->x2, status->dist,
+        status->nx = cmgeom::mjc_multicontact<mjtNum>(obj1, obj2, status->x1, status->x2, status->dist,
                                       status->max_contacts, config->nmeshdegmax,
                                       config->npolygonmax, (uint8_t*)config->buffer);
       }
@@ -3064,7 +3068,7 @@ CM_DEVICE void convex_manifold(int g1,int g2,const float* gx,const float* gq,
   bool flip=cm_type[g1]>cm_type[g2] || (cm_type[g1]==cm_type[g2] && g1>g2);
   if(flip){int tmp=g1;g1=g2;g2=tmp;}
   cm::mjCCDObj a,b;
-  cm::init<float>(&a,g1,gx,gq); cm::init<float>(&b,g2,gx,gq);
+  cm::init<cm::mjtNum>(&a,g1,gx,gq); cm::init<cm::mjtNum>(&b,g2,gx,gq);
   cm::mjCCDConfig config;
   config.max_iterations=CM_CCD_ITERS; config.tolerance=CM_CCD_TOL;
   config.max_contacts=1; config.dist_cutoff=0;
@@ -3072,7 +3076,7 @@ CM_DEVICE void convex_manifold(int g1,int g2,const float* gx,const float* gq,
   config.buffer=scratch->bytes;
   config.stack=(int*)(scratch->bytes+CM_SCRATCH_BYTES-cm::align8(4*4*6*CM_CCD_ITERS));
   cm::mjCCDStatus status={};
-  float distance=cm::mjc_ccd(&config,&status,&a,&b);
+  cm::mjtNum distance=cm::mjc_ccd(&config,&status,&a,&b);
   manifold->status=status.fault;
   if(distance>=0 || status.nx==0) return;
   if(a.nsupp!=3 || b.nsupp!=3) { manifold->status|=16; return; }
