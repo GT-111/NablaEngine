@@ -59,10 +59,11 @@ from nablaengine.g1_engine import step
 
 
 def check_model(m):
-    """The contact adjoint's collision geoms are planes, spheres and capsules (no boxes)."""
+    """Primitive contacts and the native mesh / specialized box-box routes."""
     types = {int(m.geom_type[g]) for g in step.collision_geoms(m)}
-    assert int(mujoco.mjtGeom.mjGEOM_BOX) not in types, "the adjoint has no box collisions (mjlab model only)"
-    assert {step.GEOM_TYPE[t] for t in types} <= {0, 1, 2}, "collision geoms other than plane / sphere / capsule"
+    codes = {tuple(sorted(step.GEOM_TYPE[int(m.geom_type[g])] for g in pair)) for pair in step.contact_pairs(m)}
+    assert codes <= {(0, 1), (0, 2), (1, 1), (1, 2), (2, 2), (3, 3), (3, 4), (4, 4)}, \
+        "contact adjoint combination outside primitive / native convex routes"
     planes = [g for g in step.collision_geoms(m) if int(m.geom_type[g]) == int(mujoco.mjtGeom.mjGEOM_PLANE)]
     assert all(int(m.geom_bodyid[g]) == 0 for g in planes), "a plane not on the world body (it gets no cotangent)"
 
@@ -84,7 +85,7 @@ def header(m):
 #ifndef DK_ADJ_PARALLEL_EPS
 #define DK_ADJ_PARALLEL_EPS 1.2e-3f  // sin^2(theta) = |a1 x a2|^2 / (|a1|^2 |a2|^2) of DK_ADJ_PARALLEL 1 (strict <):
 #endif                               // ~sin^2(2 degrees) (theta < 1.99 degrees)
-static_assert(!HAS_BOX, "the contact adjoint has no box collisions");
+static_assert(!HAS_PRIMITIVE_BOX, "the contact adjoint has no primitive box collisions");
 // adj_contact_geom's branch bits (its return value; -1: a type combination without a VJP)
 #define ADJ_BR_FREE1 1      // capsule-capsule: segment parameter x1 free (inside, not clamped)
 #define ADJ_BR_FREE2 2      // capsule-capsule x2 / sphere-capsule t free

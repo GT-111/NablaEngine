@@ -11,7 +11,7 @@ import unittest
 import mujoco
 import numpy as np
 
-from nablaengine.g1_engine import adjoint, source, step
+from nablaengine.g1_engine import adjoint, source, step, tape
 from nablaengine.model import capability
 
 
@@ -45,6 +45,25 @@ def hand_model(nhinge=12, fingers=5, *, passive=False, damping=0.0, frictionloss
 
 
 class GenerationCheck(unittest.TestCase):
+    def test_reference_com_invalidates_compiled_sameframe_shortcut(self):
+        from coupled_physics_check import set_reference_com
+
+        model = hand_model(7, 3, roots=2)
+        roots = source.free_roots(model)
+        before = mujoco.MjData(model)
+        mujoco.mj_forward(model, before)
+        offsets = np.asarray((.001, -.002, .003, -.004, .005, -.006))
+        set_reference_com(model, model.body_ipos.copy(), model.body_sameframe.copy(), roots, offsets)
+        after = mujoco.MjData(model)
+        mujoco.mj_forward(model, after)
+        for r, body in enumerate(roots):
+            offset = offsets[3*r:3*r+3]
+            np.testing.assert_allclose(after.xipos[body], after.xpos[body] + offset, atol=1e-15)
+            dof = int(model.body_dofadr[body])
+            expected = model.body_mass[body] * np.cross(offset, -model.opt.gravity)
+            np.testing.assert_allclose(after.qfrc_bias[dof+3:dof+6] - before.qfrc_bias[dof+3:dof+6],
+                                       expected, atol=1e-14)
+
     @unittest.skipUnless(shutil.which("c++"), "state layout check requires a C++ compiler")
     def test_state_layout_compiles_with_root_count_macro(self):
         model = hand_model(22, roots=2)
@@ -57,7 +76,7 @@ class GenerationCheck(unittest.TestCase):
                                 input=code, text=True, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_implicit_mesh_contacts_remain_guarded(self):
+    def test_native_mesh_feature_tape_and_pair_mapping(self):
         model = mujoco.MjModel.from_xml_string('''<mujoco>
           <option integrator="implicitfast" solver="Newton" cone="pyramidal"/>
           <asset><mesh name="hull" vertex="0 0 0  0.1 0 0  0 0.1 0  0 0 0.1"/></asset>
@@ -67,8 +86,21 @@ class GenerationCheck(unittest.TestCase):
           </worldbody></mujoco>''')
         self.assertEqual(model.npair, 0)
         self.assertEqual(step.contact_pairs(model), ((0, 1),))
-        errors = capability.check(model, [], source.free_roots(model)).codes("error")
-        self.assertTrue({"H14a", "H14b", "H14c"} <= set(errors))
+        roots = source.free_roots(model)
+        capability.require(model, [0], roots)
+        self.assertEqual(tape.layout(model)["feature"][1], 12 * step.maxcon(model))
+        packed, layout, sizes = adjoint.engine_constants(model, [0], roots)
+        expected = sum((sizes[count] if isinstance(count, str) else count) * width
+                       * (4 if kind == "q" else 2 if kind == "u" else 1)
+                       for _, kind, count, width in layout)
+        self.assertEqual(len(packed), expected)
+        self.assertIn("cm_vert", {row[0] for row in layout})
+        self.assertIn("#define HAS_NATIVE_COLLISION 1", adjoint.cuda_source(model, com_body_id=roots))
+        model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_NATIVECCD)
+        self.assertIn("H24b", capability.check(model, [0], roots).codes("error"))
+        model.opt.disableflags &= ~int(mujoco.mjtDisableBit.mjDSBL_NATIVECCD)
+        model.geom_type[1] = mujoco.mjtGeom.mjGEOM_SPHERE
+        self.assertIn("H14c", capability.check(model, [0], roots).codes("error"))
 
     def test_native_cross_root_pairs_and_material_mix(self):
         model = mujoco.MjModel.from_xml_string('''<mujoco>
@@ -137,6 +169,8 @@ class GenerationCheck(unittest.TestCase):
             mujoco.mj_fullM(model, data, mass)
             split = int(model.body_dofadr[roots[1]])
             np.testing.assert_array_equal(mass[:split, split:], 0)
+        single = hand_model(31, 5)
+        self.assertIn("H1", capability.check(single, [], 1, scope="forward").codes("error"))
 
     def test_soft_equalities_and_frictionloss(self):
         model = hand_model(passive=True, damping=0.1, frictionloss=0.05, equality=True)

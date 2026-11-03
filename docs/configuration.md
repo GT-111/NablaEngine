@@ -81,7 +81,6 @@ generates the header.
 | `CHOL_INLINE` | `__noinline__` | `source.py` | Inlining of the unrolled register Cholesky. | can (contraction follows the context) |
 | `DK_INL_GRAD`, `DK_INL_MATVEC`, `DK_INL_COLLIDE`, `DK_INL_ROWSJV`, `DK_INL_COST` | `__noinline__`, `__forceinline__`, empty, empty, empty | `step.py` | Inlining of helpers (code size against call overhead). | can (contraction follows the context); check with `--tape --save-outputs` |
 | `DKC` | `__device__` | `source.py` | Memory space of the model arrays (global, L1-cached); `__constant__` for comparison. | performance experiment; not checked |
-| `BOX_BOX_CCD` | `1` | `step.py` | Box-box contacts (a model with boxes only; the mjlab G1 has none): 1 as MuJoCo Warp's native CCD single contact, 0 the full separating-axis primitive. | yes (box-box contacts) |
 | `DK_PROFILE` | undefined | `step.py`, `host.py`, `adjoint.py` | Per-phase cycle counters (`engine_step_check.py --profile`). | timing build (the phase marks synchronize in every build) |
 | `DK_TAPE_VERIFY` | undefined | `step.py` | Debug: re-assembles the Newton Hessian at the final zones and flags differences in the tape (bit 11). | debug |
 | `KIN_WPB` | `4` | `kinematics.py` | Worlds per block of the kinematics kernels. | no (layout) |

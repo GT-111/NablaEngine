@@ -35,7 +35,12 @@ __global__ void k_substep(int nw, const float* qpos, const float* qvel, const fl
   for (int i = lane; i < NQ; i += 32) s.qpos[i] = qpos[(size_t)w * NQ + i];
   for (int i = lane; i < NV; i += 32) { s.qvel[i] = qvel[(size_t)w * NV + i]; s.qacc[i] = warm[(size_t)w * NV + i]; }
   if (lane < COM_WIDTH) s.com[lane] = com[w * COM_WIDTH + lane];
-  if (lane == 0) { s.fric = fric[w]; s.unsupported = 0; }
+  if (lane == 0) {
+    s.fric = fric[w]; s.unsupported = 0;
+#if HAS_NATIVE_COLLISION
+    s.cm_scratch = &s.cm_storage;
+#endif
+  }
 #ifdef DK_PROFILE
   if (lane < NPROF) s.prof[lane] = 0;
 #endif
@@ -145,6 +150,9 @@ __device__ __forceinline__ void pre_world(SimP& s, Hand& g, int w, int lane, con
     s.M = g.M; s.con_dist = g.con_dist; s.con_pos = g.con_pos; s.con_frame = g.con_frame;
     s.con_J = g.con_J; s.con_dof = g.con_dof; s.con_mask = g.con_mask;
     s.efc_kind = g.efc_kind; s.efc_a = g.efc_a; s.efc_b = g.efc_b; s.efc_D = g.efc_D; s.efc_aref = g.efc_aref;
+#if HAS_NATIVE_COLLISION
+    s.cm_scratch = &g.cm_storage;
+#endif
   }
 #ifdef DK_PROFILE
   if (lane < NPROF) s.prof[lane] = 0;

@@ -92,8 +92,7 @@ FIELDS = {
     # ---- geoms
     "geom_type": _f("consumed", "H14a"), "geom_contype": _f("consumed", "H15"),
     "geom_conaffinity": _f("consumed", "H15"), "geom_condim": _f("consumed", "H17"),
-    "geom_bodyid": _f("consumed"), "geom_dataid": _f("derived", "H14a", "mesh / height field of a geom (the "
-                                                     "collision geoms' types are checked)"),
+    "geom_bodyid": _f("consumed"), "geom_dataid": _f("consumed", "H14a", "compiled collision mesh id"),
     "geom_matid": _f("irrelevant", note=VISUAL), "geom_group": _f("irrelevant", note=VISUAL),
     "geom_priority": _f("consumed", "H15"), "geom_plugin": _f("default", "H25", "geom plugins (SDF)"),
     "geom_sameframe": _f("derived"), "geom_solmix": _f("consumed", "H15"),
@@ -113,6 +112,10 @@ FIELDS = {
     "pair_adhesion": _f("default", "H16", "contact adhesion"),
     "pair_friction": _f("consumed", "H16", "tangential friction; spin and rolling unused at condim 1 / 3 (H17)"),
     "exclude_signature": _f("consumed", "H15", "excluded body pairs of contype / conaffinity contacts"),
+    **{name: _f("consumed", "H14a", "compiled native convex hull") for name in (
+        "mesh_vertadr", "mesh_vertnum", "mesh_vert", "mesh_polyadr", "mesh_polynum", "mesh_graphadr", "mesh_graph",
+        "mesh_extrema", "mesh_polymapadr", "mesh_polymapnum", "mesh_polymap", "mesh_polyvertadr", "mesh_polyvertnum",
+        "mesh_polyvert", "mesh_polynormal")},
     # ---- actuators
     "actuator_trntype": _f("consumed", "H11a"), "actuator_dyntype": _f("checked", "H11b"),
     "actuator_gaintype": _f("checked", "H11b"), "actuator_biastype": _f("consumed", "H11a"),
@@ -161,8 +164,7 @@ FIELDS = {
     "opt.ls_tolerance": _f("irrelevant", note="the engine's line search is exact (a converged Newton solve gives "
                                                "MuJoCo's unique minimizer)"),
     "opt.noslip_tolerance": _f("irrelevant", "H24b", "noslip is off (H24b)"),
-    "opt.ccd_tolerance": _f("checked", "H14d", "native CCD: box-box only (MuJoCo Warp's GJK / EPA, whose converged "
-                                               "result the forward computes): at most the default"),
+    "opt.ccd_tolerance": _f("consumed", "H14d", "native mesh GJK / EPA convergence tolerance"),
     "opt.sleep_tolerance": _f("irrelevant", "H24b", "island sleeping is off (H24b)"),
     "opt.gravity": _f("consumed"), "opt.wind": _f("checked", "H22"),
     "opt.magnetic": _f("irrelevant", note="magnetometer sensors only"),
@@ -177,8 +179,7 @@ FIELDS = {
     "opt.iterations": _f("consumed", note="the default of EnginePhysics' iterations (a call option)"),
     "opt.ls_iterations": _f("irrelevant", note="the engine's line search is exact (at most 40 steps)"),
     "opt.noslip_iterations": _f("checked", "H24b"),
-    "opt.ccd_iterations": _f("checked", "H14d", "native CCD: box-box only (MuJoCo Warp's GJK / EPA, whose converged "
-                                                "result the forward computes): at least the default"),
+    "opt.ccd_iterations": _f("consumed", "H14d", "native mesh GJK / EPA iteration and scratch bound"),
     "opt.disableflags": _f("checked", "H24b"), "opt.enableflags": _f("checked", "H24b"),
     "opt.disableactuator": _f("checked", "H24b"),
     "opt.sdf_initpoints": _f("irrelevant", "H14a", "SDF collisions: none"),
@@ -206,8 +207,9 @@ SIZES = {  # mjModel's sizes: consumed / checked as their arrays, derived counts
     **{k: _f("irrelevant", note=VISUAL) for k in (
         "noct", "nsite", "ncam", "nlight", "nmesh", "nmeshvert", "nmeshnormal", "nmeshtexcoord", "nmeshface",
         "nmeshgraph", "nmeshpoly", "nmeshpolyvert", "nmeshpolymap", "nskin", "nskinvert", "nskintexvert", "nskinface",
-        "nskinbone", "nskinbonevert", "nhfield", "nhfielddata", "ntex", "ntexdata", "nmat", "npolygonmax",
-        "nmeshdegmax")},
+        "nskinbone", "nskinbonevert", "nhfield", "nhfielddata", "ntex", "ntexdata", "nmat")},
+    "npolygonmax": _f("consumed", "H14a", "native convex clipping scratch bound"),
+    "nmeshdegmax": _f("consumed", "H14a", "native convex incident-face scratch bound"),
     **{k: _f("irrelevant", note="sensors, custom data, keyframes, names: not read") for k in (
         "nsensor", "nsensordata", "nnumeric", "nnumericdata", "ntext", "ntextdata", "ntuple", "ntupledata", "nkey",
         "nuser_body", "nuser_jnt", "nuser_geom", "nuser_site", "nuser_cam", "nuser_tendon", "nuser_actuator",

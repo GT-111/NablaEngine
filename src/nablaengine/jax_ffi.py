@@ -201,6 +201,7 @@ REMAT_NAMES = (TAPE_NAME, OUT_NAME, KIN_NAME)
 
 VARIANT_UNIT = r"""
 #include <cuda_runtime.h>
+@ENGINE_INCLUDES@
 namespace {  // internal linkage: every variant's kernels, device functions and DKC constants are its own
 @ENGINE@
 // per device: k_adjoint's dynamic shared memory, adj_launch_smem()'s production choice for that GPU (on V100 more
@@ -830,13 +831,21 @@ def library_sources(m, foot_pairs, forward_unit=False, target=None, com_body_id=
     load = re.sub(r"cudaMemcpyToSymbol\(([^;]*)\);", r"cudaMemcpyToSymbolAsync(\1, 0, cudaMemcpyHostToDevice, st);", load)
     assert "cudaMemcpyToSymbol(" not in load
     engine = adjoint.cuda_source(m, com_body_id=com_body_id)
+    # Native collision's standard declarations must stay outside the variant namespace.
+    includes = []
+    for header in ("stdint.h", "stddef.h", "float.h", "math.h"):
+        line = f"#include <{header}>\n"
+        if line in engine:
+            includes.append(line.rstrip())
+            engine = engine.replace(line, "")
     assert engine.count("#include <cuda_runtime.h>\n") == 1 and engine.count("#include") == 1, \
-        "the engine source may only include cuda_runtime.h (it is wrapped in a namespace)"
+        "the engine source has an unexpected include inside the variant namespace"
     engine = engine.replace("#include <cuda_runtime.h>\n", "")
     units, defines = {}, {}
 
     def unit(v, fwd, pfx):
         src = (VARIANT_UNIT.replace("@FWD_SHIM@", FWD_SHIM if fwd else "")
+               .replace("@ENGINE_INCLUDES@", "\n".join(includes))
                .replace("@FWD_ATTR@", "  cudaFuncSetAttribute(k_substep, cudaFuncAttributeMaxDynamicSharedMemorySize, "
                                       "(int)sizeof(Sim));" if fwd else "")
                .replace("@PFX@", pfx).replace("@MAX_DEVICES@", str(MAX_DEVICES))

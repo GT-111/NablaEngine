@@ -183,9 +183,14 @@ The engine's model class is a free root and one hinge per later body, with at mo
 and 12 hinge ancestors. Position actuators may drive any unique subset of hinges, with independent `nu`; passive
 hinges remain in `qpos` and `qvel`. Linear joint damping, dof frictionloss and up to six active soft linear hinge
 equalities are represented. Contact pairs may be absent. Sphere, capsule and world-plane contact pairs have an
-analytic adjoint; boxes remain forward-only. The published numerical qualification is for the mjlab G1; CPU
+analytic adjoint; primitive plane-box and capsule-box pairs remain forward-only. The published numerical qualification is for the mjlab G1; CPU
 generation checks for smaller models are described in `docs/verification.md`.
-Multiple free roots, implicit `contype` / `conaffinity` contacts and convex-mesh collisions remain unsupported.
+The current candidate additionally generates two top-level FREE roots with up to 64 bodies, two compiled COM
+offsets and 12 soft linear joint equalities. Implicit `contype` / `conaffinity` primitive pairs use the authored masks,
+exclusions and material mixing. The native mesh / specialized box-box collision candidate records discrete contact
+features and differentiates the witnesses, normal and frame. These extensions require numerical CUDA qualification;
+the published accuracy and performance receipts remain specific to the G1 fixture. Capacity or native narrowphase
+failures set nonzero forward status and must be treated as failed steps by a native-physics adapter.
 Disabling contacts changes the simulated condition; a successful check of such a model does not qualify its original
 contact-enabled scene.
 

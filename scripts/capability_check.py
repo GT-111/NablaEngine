@@ -13,13 +13,13 @@ Sections (--sections, default all):
              Euler, negative solref, qpos0 != 0, a tendon, gravcomp, the CG solver;
              actuator-level damping / armature / delay, damping polynomials, a motor actuator, a cylinder pair, a ball
              joint body, the waist roll and pitch welded, a direct damping solref (0.02,
-             0), a box-box pair with fewer native-CCD iterations than MuJoCo's default, contacts disabled,
+             0), contacts disabled,
              frictionloss disabled with frictionloss) must raise exactly its own codes (new errors relative to the
              base) in the scope it names, and capability.require and nablaengine.jax_ffi.init(model=...) must reject
              it with UnsupportedModel before anything is built. Supported on purpose (no new error and no new
              warning, require accepts): eligible implicit contype contacts, contype contacts that only duplicate explicit pairs (MuJoCo 3.17 collides
              such a geom pair once, with the pair's parameters: measured), a box-box pair at the CCD defaults
-             (forward scope), renamed bodies and joints, visual-only geoms with a camera and a light, sites and
+             (forward scope, including changed CCD options: native 3.17 box-box uses specialized SAT), renamed bodies and joints, visual-only geoms with a camera and a light, sites and
              sensors, another gravity vector, disable flags of physics the model does not have (springs, dampers,
              equality, frictionloss); linear joint damping, a soft linear joint equality and dof frictionloss;
              and the welded-waist G1 with its fused body named torso_link, which must warn U1
@@ -295,7 +295,7 @@ def variants():
                         "engine", {"H19"}),
         boxbox=("a box-box pair at MuJoCo's native-CCD defaults (forward scope): supported", boxbox, "forward",
                 set()),
-        boxbox_ccd=("a box-box pair with ccd_iterations 5 (forward scope)", boxbox_ccd, "forward", {"H14d"}),
+        boxbox_ccd=("a box-box pair with ccd_iterations 5 (specialized native SAT is unchanged)", boxbox_ccd, "forward", set()),
         renamed=("bodies, joints and geoms renamed (not torso_link): supported", renamed, "engine", set()),
         visual=("visual-only mesh and cylinder geoms, a camera and a light: supported", visual, "engine", set()),
         sensors=("a site, a gyro and a joint-position sensor: supported", sensors, "engine", set()),

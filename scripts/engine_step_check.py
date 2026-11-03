@@ -60,7 +60,7 @@ import numpy as np
 
 from nablaengine import checks, cuda, fixtures, provenance, workdir
 from nablaengine.cuda import compile_cuda
-from nablaengine.g1_engine import source, step, tape
+from nablaengine.g1_engine import adjoint, convex_mesh, source, step, tape
 # the forward kernel k_substep and the constant loader (in the package, shared with nablaengine.jax_ffi; other
 # scripts use them as ESC.KERNEL and ESC.loader)
 from nablaengine.g1_engine.host import KERNEL, loader  # noqa: F401
@@ -100,7 +100,7 @@ int main(int argc, char** argv) {  // dir nworld iterations reps substeps [block
   const float* p = cf.data();
 LOAD_CONSTS
 #define IN(name, n) snprintf(path, sizeof path, "%s/" #name ".bin", dir); float* d_##name = up(readf(path, (size_t)nw * (n)));
-  IN(qpos, NQ) IN(qvel, NV) IN(warm, NV) IN(ctrl, NU) IN(fric, 1) IN(com, 3)
+  IN(qpos, NQ) IN(qvel, NV) IN(warm, NV) IN(ctrl, NU) IN(fric, 1) IN(com, COM_WIDTH)
   float *oq, *ov, *ow, *oc; int* oi;
   cudaMalloc(&oc, (size_t)nw * MAXCON * 8 * 4);
   cudaMalloc(&oq, (size_t)nw * NQ * 4); cudaMalloc(&ov, (size_t)nw * NV * 4); cudaMalloc(&ow, (size_t)nw * NV * 4);
@@ -615,21 +615,16 @@ def tape_checks(args, m, mt, arr, run, main, K):
     return out
 
 
-def binary_source(m, foot_pairs):
+def binary_source(m, foot_pairs, com_body_id=None):
     """(CUDA source, packed constants) of this script's engine binary for model m (the forward kernels k_pre / k_post /
     k_substep, KERNEL and HOST's main; scripts/identity_gate.py hashes it)."""
-    c1, maxd = source.constants(m)
-    c2 = step.pair_constants(m, foot_pairs)
-    dofbody, mask = step.extra_constants(m)
-    halves = np.stack([(mask >> shift) & 0xFFFF for shift in (0, 16, 32, 48)], 1).ravel()
-    consts = np.concatenate([c1, c2, dofbody.astype(np.float32), halves.astype(np.float32)])
-    sizes = {"nb": m.nbody, "nv": m.nv, "one": 1, "nv2": 2 * m.nv, "nr": len(source.free_roots(m))}
-    lay1 = source.const_layout(m)
-    lay2 = [(s, k, n, 1) for s, k, n in step.const_layout(m)]
-    lay3 = [("c_dofbody", "i", "nv", 1), ("c_ancmask", "q", "nb", 1)]
-    src = (source.header(m, maxd, 1) + step.EXTRA_HEADER + step.step_header(m) + tape.header(m) + source.DEVICE
+    maxd = source.constants(m, com_body_id)[1]
+    consts, layout, sizes = adjoint.engine_constants(m, foot_pairs, com_body_id)
+    native = (convex_mesh.header(m, step.collision_geoms(m)) + convex_mesh.source(m, step.collision_geoms(m))
+              if step.native_collision(m) else "")
+    src = (source.header(m, maxd, 1) + step.EXTRA_HEADER + step.step_header(m) + tape.header(m) + native + source.DEVICE
            + step.STEP_DEVICE + step.STEP_KERNEL + KERNEL
-           + HOST.replace("LOAD_CONSTS", loader(list(lay1) + lay2 + lay3, sizes)).replace("NCONST", str(len(consts))))
+           + HOST.replace("LOAD_CONSTS", loader(layout, sizes)).replace("NCONST", str(len(consts))))
     return src, consts
 
 

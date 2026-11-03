@@ -16,7 +16,7 @@ import numpy as np
 from nablaengine.g1_engine import step
 
 ALIGN = 32  # words (128 bytes): record and block alignment
-FLAG_UNSUPPORTED = 31  # flags bits 0-4: s.unsupported, accumulated over the substeps so far (as out_info)
+FLAG_UNSUPPORTED = 63  # flags bits 0-5: unsupported geometry, capacity or native narrowphase failure (as out_info)
 FLAG_REFACT = 1 << 8  # the zones changed after the last Newton factorization: H re-assembled and re-factored for the tape
 FLAG_NONCONV = 1 << 9  # the Newton iterations ran out before the stopping test held
 FLAG_SINGULAR = 1 << 10  # min_nu < SINGULAR_NU: a self contact whose geom axes (or centres) nearly meet
@@ -37,6 +37,7 @@ _FIELDS = (
     ("clamp", "OFF_CLAMP", lambda nq, nv, ntri, nc: -(-nv // 32)),  # dof bits: actuator force at its limit
     ("zone", "OFF_ZONE", lambda nq, nv, ntri, nc: -(-step.NEFC // 32)),  # row bits: quadratic zone (row in the Hessian)
     ("con", "OFF_CON", lambda nq, nv, ntri, nc: -(-nc // 2)),  # u16 per contact (row order): pair | slot << 9
+    ("feature", "OFF_FEATURE", lambda nq, nv, ntri, nc: 12 * nc),  # raw native CMFeature words per contact
     ("qpos", "OFF_QPOS", lambda nq, nv, ntri, nc: nq),  # substep input
     ("qvel", "OFF_QVEL", lambda nq, nv, ntri, nc: nv),
     ("qacc", "OFF_QACC", lambda nq, nv, ntri, nc: nv),  # final Newton acceleration a* (the warm start of the next one)
@@ -55,6 +56,8 @@ def _table(m, max_contacts=None):
     assert nv <= 64 and len(step.contact_pairs(m)) <= 2048 and nc <= 255 and step.NEFC <= 255, "tape field widths"
     out, off = [], 0
     for name, define, n in _FIELDS:
+        if name == "feature" and not step.native_collision(m):
+            continue
         if name is None:
             off = -(-off // n) * n
             continue
@@ -121,6 +124,8 @@ def decode(arr, m, max_contacts=None):
     e = np.ascontiguousarray(u[..., sl("con")]).view(np.uint16)[..., :nc].astype(np.int64)  # little endian: low half first
     past = np.arange(nc) >= out["ncon"][..., None]
     out["pair"], out["slot"] = np.where(past, -1, e & ((1 << pair_bits(m)) - 1)), np.where(past, -1, e >> pair_bits(m))
+    if "feature" in lay:
+        out["feature"] = u[..., sl("feature")].reshape(a.shape[:-1] + (nc, 12))
     for name in ("qpos", "qvel", "qacc", "qacc_adv", "L_H", "L_Q"):
         out[name] = a[..., sl(name)]
     return out

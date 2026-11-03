@@ -39,8 +39,9 @@ capsule and floor contacts. Models with no contact pairs generate directly. Phys
 and implicitfast integration in float32. Unsupported features are rejected with their capability-check codes.
 The current candidate adds two top-level FREE roots with full coordinates, up to 64 bodies, two compiled COM
 offsets, 12 soft linear joint equalities and generated `contype` / `conaffinity` primitive contacts. Smooth dynamics
-remain separate within each tree; contact rows enter one coupled Newton solve. Convex-mesh collisions remain
-unsupported, so the actual DexForge bilateral hand scenes are not yet admitted.
+remain separate within each tree; contact rows enter one coupled Newton solve. The native collision candidate adds
+MuJoCo 3.17 mesh GJK/EPA and polygon manifolds, saved contact features, and analytic geometry replay. The specialized
+native box-box route and full bilateral hand scenes still require CUDA qualification before adapter admission.
 
 The published numerical and performance results qualify the mjlab Unitree G1. The model extensions
 have CPU source-generation and MuJoCo row checks; the two-root candidate still requires CUDA forward and VJP checks.

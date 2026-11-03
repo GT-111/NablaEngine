@@ -26,7 +26,7 @@ runtime or contact behavior. Run forward and VJP checks on the actual compiled m
 use `clamp_kv=1, normal=0, grad_decay=1` for finite differences and report training mode separately.
 The two-root cases also cover all 56 velocities / 58 positions, 64-bit ancestor masks, 12 soft joint equalities,
 implicit cross-root sphere contacts, native material mixing, and a nonzero off-diagonal contact Hessian. They check
-that native implicit mesh contacts remain rejected. Most synthetic cases have no collision geometry; none represents
+native mesh constant packing and feature-tape layout. Most synthetic cases have no collision geometry; none represents
 the full enabled convex-mesh contact graph of the normal DexForge five-hand native scenes.
 
 The first coupled CUDA snapshot has a finite check with explicit source, cache and result locations:
@@ -40,6 +40,12 @@ python scripts/coupled_physics_check.py --source-root "$NABLA_SOURCE" --cache "$
 It compares forward Q/V and directional Q/V/control/applied-force VJPs with float64 MuJoCo, checks a force on one
 root affects the other through contact, and reports the differentiated forward's status and tape diagnostics. It runs only on the selected local CUDA device;
 no CUDA result is implied by the script's presence.
+
+The current driver also checks every input coordinate, using Qpos tangent / Qvel / control / applied-force relative
+gates of `2e-3 / 5e-4 / 1e-4 / 1e-4` and full-gradient cosine at least `0.99999`. Each coordinate records centered
+finite differences at `h` and `2h`, their difference and the float64 scalar-cancellation floor, raw absolute/relative
+errors, and the error above that floor. Native finite fixtures are selected with
+`--cases coupled_mesh,coupled_box_mesh,coupled_box_box`; they keep enabled contacts and the original pyramidal rows.
 
 ## Data
 

@@ -46,16 +46,18 @@ ALLOW_VAR = "DK_ALLOW_UNSUPPORTED"
 COM_BODY = "torso_link"  # the body that takes the per-world COM offset (source.constants, jax_ffi.init)
 SCOPES = {"forward": ("forward",), "engine": ("forward", "adjoint"), "kinematics": ("kinematics",)}
 J, G, T = mujoco.mjtJoint, mujoco.mjtGeom, mujoco.mjtTrn
-GEOM_CODE = {int(G.mjGEOM_PLANE): 0, int(G.mjGEOM_SPHERE): 1, int(G.mjGEOM_CAPSULE): 2, int(G.mjGEOM_BOX): 3}
-FORWARD_TYPES = {0, 1, 2, 3}  # step.GEOM_TYPE: plane, sphere, capsule, box
-ADJOINT_TYPES = {0, 1, 2}  # adjoint_contact.check_model: no boxes
-DISPATCHED = {(0, 1), (0, 2), (0, 3), (1, 1), (1, 2), (2, 2), (2, 3), (3, 3)}  # step.py collide_pair's combinations
-CONTACTS_PER_PAIR = {(0, 1): 1, (0, 2): 2, (0, 3): 4, (1, 1): 1, (1, 2): 1, (2, 2): 2, (2, 3): 2, (3, 3): 8}
+GEOM_CODE = {int(G.mjGEOM_PLANE): 0, int(G.mjGEOM_SPHERE): 1, int(G.mjGEOM_CAPSULE): 2, int(G.mjGEOM_BOX): 3,
+             int(G.mjGEOM_MESH): 4}
+FORWARD_TYPES = {0, 1, 2, 3, 4}
+ADJOINT_PAIRS = {(0, 1), (0, 2), (1, 1), (1, 2), (2, 2), (3, 3), (3, 4), (4, 4)}
+DISPATCHED = ADJOINT_PAIRS | {(0, 3), (2, 3)}
+CONTACTS_PER_PAIR = {(0, 1): 1, (0, 2): 2, (0, 3): 4, (1, 1): 1, (1, 2): 1, (2, 2): 2, (2, 3): 2,
+                     (3, 3): 8, (3, 4): 4, (4, 4): 4}
 D, E = mujoco.mjtDisableBit, mujoco.mjtEnableBit
 # disable flags that cannot change the engine's results: sensors (the engine computes none), Euler damping (Euler is
 # rejected), auto reset, midphase / island bookkeeping of MuJoCo's own collision and solver paths, the parent filter
 # (the generated implicit pair table applies this flag), ctrl clamping (the engine never clamps); the CCD
-# flags only without box pairs (box-box follows MuJoCo Warp's native CCD, step.py BOX_BOX_CCD; no other pair uses CCD)
+# flags are modeled for mesh pairs; the specialized box-box route does not use CCD
 DISABLE_OK = (D.mjDSBL_SENSOR, D.mjDSBL_EULERDAMP, D.mjDSBL_AUTORESET, D.mjDSBL_MIDPHASE, D.mjDSBL_ISLAND,
               D.mjDSBL_FILTERPARENT, D.mjDSBL_CLAMPCTRL, D.mjDSBL_CONTACT)
 DISABLE_OK_NO_BOX = (D.mjDSBL_NATIVECCD, D.mjDSBL_MULTICCD)
@@ -216,7 +218,8 @@ def check(m, foot_pairs=None, com_body=COM_BODY, scope="engine"):
     # ---- tree, joints, dofs
     roots = [b for b in range(1, nb) if m.body_jntnum[b] == 1 and m.body_jntadr[b] >= 0
              and m.jnt_type[m.body_jntadr[b]] == J.mjJNT_FREE]
-    add("H1", nb <= 64, "error", "at most 64 bodies (two body tiles, 64-bit ancestor masks)", nb,
+    add("H1", nb <= (31 if len(roots) == 1 else 64), "error", "at most 31 bodies for one FREE root or 64 bodies "
+        "for two FREE roots (two body tiles, 64-bit ancestor masks)", nb,
         ("forward", "kinematics"))
     add("H2", nb <= (31 if len(roots) == 1 else 64), "error", "at most 31 bodies in the single-root adjoint, "
         "64 in the two-root adjoint", nb,
@@ -301,22 +304,21 @@ def check(m, foot_pairs=None, com_body=COM_BODY, scope="engine"):
     pair_codes = [tuple(sorted(GEOM_CODE.get(int(m.geom_type[g]), -1) for g in pair)) for pair in generated_pairs]
     types = {GEOM_CODE.get(int(m.geom_type[g]), -1) for g in cg}
     tnames = sorted({mujoco.mjtGeom(int(m.geom_type[g])).name for g in cg})
-    add("H14a", types <= FORWARD_TYPES, "error", "contact pair geoms are planes, spheres, capsules or boxes", tnames)
+    add("H14a", types <= FORWARD_TYPES, "error", "contact pair geoms are planes, spheres, capsules, boxes or meshes", tnames)
     planes_off_world = [g for g in cg if m.geom_type[g] == G.mjGEOM_PLANE and m.geom_bodyid[g] != 0]
-    add("H14b", types <= ADJOINT_TYPES and not planes_off_world, "error", "contact pair geoms are planes (on the world "
-        "body), spheres or capsules in the adjoint", dict(types=tnames, planes_off_world=planes_off_world[:4]),
+    add("H14b", set(pair_codes) <= ADJOINT_PAIRS and not planes_off_world, "error", "contact adjoint routes are plane "
+        "(on world)-sphere/capsule, sphere/capsule pairs, box-box, box-mesh or mesh-mesh",
+        dict(types=tnames, planes_off_world=planes_off_world[:4]),
         ("adjoint",))
     combos = sorted(set(pair_codes) - DISPATCHED)
     add("H14c", not combos, "error", "every pair's type combination is one the forward collides (not plane-plane, "
         "sphere-box)", combos)
-    # box-box follows MuJoCo Warp's native CCD (GJK / EPA with opt.ccd_iterations and ccd_tolerance) by its converged
-    # result (step.py box_box, BOX_BOX_CCD): fewer iterations or a looser tolerance change MuJoCo Warp's contacts, not
-    # the engine's (no other pair type of the engine uses CCD)
-    d_it, d_tol = F.option_default("ccd_iterations"), F.option_default("ccd_tolerance")
+    # Native mesh GJK/EPA uses the authored CCD options. MuJoCo 3.17 dispatches
+    # box-box to its specialized SAT collider independently of those options.
     boxbox = pair_codes.count((3, 3))
-    add("H14d", not boxbox or (m.opt.ccd_iterations >= d_it and m.opt.ccd_tolerance <= d_tol), "error",
-        f"box-box pairs: native CCD at least as converged as MuJoCo's default (ccd_iterations >= {d_it}, ccd_tolerance "
-        f"<= {d_tol:g}), whose converged contact the forward computes",
+    native_mesh = 4 in types
+    add("H14d", not native_mesh or m.opt.ccd_iterations > 0, "error",
+        "native mesh CCD has at least one iteration; box-box uses the specialized native SAT collider",
         dict(boxbox_pairs=boxbox, ccd_iterations=int(m.opt.ccd_iterations), ccd_tolerance=float(m.opt.ccd_tolerance)))
     fp = filter_pairs(m)
     add("H15", True, "info", "explicit and eligible contype / conaffinity pairs are generated",
@@ -356,12 +358,12 @@ def check(m, foot_pairs=None, com_body=COM_BODY, scope="engine"):
         mujoco.mjtIntegrator(int(m.opt.integrator)).name)
     add("H24a", m.opt.solver == mujoco.mjtSolver.mjSOL_NEWTON, "error", "Newton solver",
         mujoco.mjtSolver(int(m.opt.solver)).name)
-    has_box = any(m.geom_type[g] == G.mjGEOM_BOX for g in cg)
     noop = tuple(x for x in DISABLE_NOOP if x != D.mjDSBL_DAMPER or not m.dof_damping.any())
     noop = tuple(x for x in noop if x != D.mjDSBL_EQUALITY or not m.neq)
     noop += ((D.mjDSBL_FRICTIONLOSS,) if not (m.dof_frictionloss > 0).any() else ()) + (
         (D.mjDSBL_LIMIT,) if not np.asarray(m.jnt_limited).any() else ())
-    dis = int(m.opt.disableflags) & ~_mask(DISABLE_OK + noop + (() if has_box else DISABLE_OK_NO_BOX))
+    collision_flags = ((D.mjDSBL_MULTICCD,) if native_mesh else DISABLE_OK_NO_BOX)
+    dis = int(m.opt.disableflags) & ~_mask(DISABLE_OK + noop + collision_flags)
     en = int(m.opt.enableflags) & ~_mask(ENABLE_OK)
     add("H24b", dis == 0 and en == 0 and m.opt.noslip_iterations == 0 and m.opt.disableactuator == 0, "error",
         "no disable / enable flags that change the physics, noslip off, no disabled actuator groups",

@@ -76,7 +76,7 @@ Records the forward flagged (REFACT, NONCONV, SINGULAR, unsupported bits) are pr
 reported in info. Self-checks in info: ADJ_REPLAY_MISMATCH (a replayed contact is not penetrating, or the replayed limit
 rows are not the tape's count).
 
-The adjoint supports the floating-root, hinge-body model class (no box contacts). cuda_source(m) is one
+The adjoint supports the floating-root, hinge-body model class, primitive contacts and native mesh / box-box contacts. cuda_source(m) is one
 compilation unit with the forward (source.DEVICE, step.STEP_DEVICE / STEP_KERNEL: shared DKC constants and device
 functions) and the contact VJPs (adjoint_contact.source); the caller adds its __global__ forward kernel and host code
 (the adjoint check binary of nablaengine.checks).
@@ -85,7 +85,7 @@ functions) and the contact VJPs (adjoint_contact.source); the caller adds its __
 import mujoco
 import numpy as np
 
-from nablaengine.g1_engine import adjoint_contact, source, step, tape
+from nablaengine.g1_engine import adjoint_contact, convex_mesh, source, step, tape
 
 ADJ_ROWS_SKIPPED = 1 << 12  # info: a record has contacts or constraint rows that this build does not differentiate
 ADJ_REPLAY_MISMATCH = 1 << 13  # info: a replayed contact is not penetrating, or the replayed limit rows differ in number
@@ -170,8 +170,7 @@ def solimp_powers(m):
 
 def header(m):
     """#defines of the adjoint (stage, options, debug layout, the model's solimp power)."""
-    assert not any(m.geom_type[g] == mujoco.mjtGeom.mjGEOM_BOX for g in step.collision_geoms(m)), \
-        "the adjoint is for the mjlab model: no box geoms"
+    adjoint_contact.check_model(m)
     lay, nw = debug_layout(m)
     lines = [f"#define ADJ_ROWS_SKIPPED {ADJ_ROWS_SKIPPED}u", f"#define ADJ_REPLAY_MISMATCH {ADJ_REPLAY_MISMATCH}u",
              f"#define DBG_NO_ROW {NO_ROW:.0e}f", f"#define DBG_WORDS {nw}  // -DDK_ADJ_DEBUG record",
@@ -201,7 +200,7 @@ static_assert(DK_ADJ_CLAMP_KV >= 0 && DK_ADJ_CLAMP_KV <= 2, "DK_ADJ_CLAMP_KV: 0,
 #define ADJ_SOFT_PARAM
 #define ADJ_SOFT_ARG(x)
 #endif
-static_assert(HAS_BOX == 0, "the adjoint has no box collisions");
+static_assert(HAS_PRIMITIVE_BOX == 0, "the primitive adjoint has no plane-box or capsule-box collisions");
 static_assert(DK_ADJ_STAGE >= 1 && DK_ADJ_STAGE <= 3, "DK_ADJ_STAGE: 1, 2 or 3");
 static_assert(NB <= (NR == 1 ? 31 : 64), "single-root reduction or two body tiles");
 #define CS_N 24  // per-contact words (A6, in registers of the contact's lane): W_v, W_a, W_lam (0-8), contact point
@@ -253,6 +252,10 @@ struct Adj {
   unsigned con[(MAXCON + 1) / 2];  // the record's contact table: pair | slot << 9 per 16 bits
   int hdr;  // the record's header: ncon | nefc << 8 | nlim << 16 | niter << 24
   int flags;  // union of the records' flags (tape.py), ADJ_ROWS_SKIPPED, ADJ_REPLAY_MISMATCH
+#if HAS_NATIVE_COLLISION
+  CMScratch cm_scratch;
+  const float* feature_rec;
+#endif
   // bodies, lane b = body b (body 0: the world, at rest). Forward quantities (A3) read up to A7:
   float Q[NB][4], X[NB][3], z[NB][3];  // pose (X_b: origin = hinge anchor), hinge axis z_b = R_b axis_b (b >= 2)
   float W[NB][3], AL[NB][3];  // channel 1 (fwd_body): angular velocity W of v, angular acceleration AL at a*
@@ -973,7 +976,24 @@ __device__ __forceinline__ float adj_contact_one(Adj& s, int c, int pair, int sl
                                                  float* dbg) {
   const int g1 = PG1(pair), g2 = PG2(pair), b1 = c_gbody[g1], b2 = c_gbody[g2], dim = PDIM(pair);
   float d, p[3], fr[9], nu;
-  const int br = adj_pair_geom(pair, slot, s.gx, s.gq, &d, p, fr, &nu, nullptr, nullptr);
+  int br = 0;
+#if HAS_NATIVE_COLLISION
+  bool native = c_gtype[g2] == 4 || (c_gtype[g1] == 3 && c_gtype[g2] == 3);
+  CMFeature feature;
+  if (native) {
+    feature = cm_feature_unpack(s.feature_rec + c * CM_FEATURE_WORDS);
+    CMContact contact;
+    int error = c_gtype[g2] == 4
+      ? convex_contact_replay(g1, g2, &s.gx[0][0], &s.gq[0][0], feature, &s.cm_scratch, &contact)
+      : box_box_contact_replay(g1, g2, &s.gx[0][0], &s.gq[0][0], feature, &s.cm_scratch, &contact);
+    if (error) { atomicOr(&s.flags, (int)ADJ_REPLAY_MISMATCH); return 0.f; }
+    d = contact.dist;
+    for (int k = 0; k < 3; k++) p[k] = contact.pos[k];
+    for (int k = 0; k < 9; k++) fr[k] = contact.frame[k];
+    nu = 1e30f;
+  } else
+#endif
+    br = adj_pair_geom(pair, slot, s.gx, s.gq, &d, p, fr, &nu, nullptr, nullptr);
   const float mu = PFOOT(pair) ? s.fric : PMU(pair);
   float ri[6];
   adj_row_impedance(PSOLREF(pair), PSOLIMP(pair), d, contact_invw(pair, mu), ri);
@@ -1009,7 +1029,15 @@ __device__ __forceinline__ float adj_contact_one(Adj& s, int c, int pair, int sl
   for (int t = 0; t < 12; t++) fg[t] = 0.f;
   if (zone) {  // the primitive's VJP (it replays again) and the geoms' pose cotangents on their bodies
     float d2, p2[3], fr2[9], nu2, gb[12];
-    adj_pair_geom(pair, slot, s.gx, s.gq, &d2, p2, fr2, &nu2, cot, gb);
+#if HAS_NATIVE_COLLISION
+    if (native) {
+      int error = c_gtype[g2] == 4
+        ? convex_contact_vjp(g1, g2, &s.gx[0][0], &s.gq[0][0], feature, cot[0], cot + 1, cot + 4, &s.cm_scratch, gb)
+        : box_box_contact_vjp(g1, g2, &s.gx[0][0], &s.gq[0][0], feature, cot[0], cot + 1, cot + 4, &s.cm_scratch, gb);
+      if (error) { atomicOr(&s.flags, (int)ADJ_REPLAY_MISMATCH); return 0.f; }
+    } else
+#endif
+      adj_pair_geom(pair, slot, s.gx, s.gq, &d2, p2, fr2, &nu2, cot, gb);
     if (b1) geom_to_body_vjp(s.gx[g1], s.X[b1], gb, gb + 3, fg, fg + 3);
     geom_to_body_vjp(s.gx[g2], s.X[b2], gb + 6, gb + 9, fg + 6, fg + 9);
   }
@@ -1100,10 +1128,31 @@ __device__ void adj_contacts_coupled(Adj& s, int lane, float* dbg) {
     for (int k = 0; k < CS_N; k++) cw[k] = 0.f;
     int cb = -1;
     bool bad = false;
+#if HAS_NATIVE_COLLISION
+    // Native replay reuses this world's single scratch buffer. The result of
+    // each serial lane-zero call returns to its contact's lane for reduction.
+    for (int j = 0; j < min(32, ncon - c0); j++) {
+      int pj = __shfl_sync(0xffffffffu, pair, j), sj = __shfl_sync(0xffffffffu, slot, j);
+      unsigned zj = __shfl_sync(0xffffffffu, zone, j);
+      bool uj = __shfl_sync(0xffffffffu, (int)use, j) != 0;
+      float words[CS_N] = {}, distance = -1.f;
+      if (lane == 0 && uj && (zj || dbg))
+        distance = adj_contact_one(s, c0 + j, pj, sj, zj, words, dbg);
+      for (int k = 0; k < CS_N; k++) {
+        float value = __shfl_sync(0xffffffffu, words[k], 0);
+        if (lane == j) cw[k] = value;
+      }
+      float value = __shfl_sync(0xffffffffu, distance, 0);
+      if (lane == j && uj && (zj || dbg)) bad = !(value < 0.f);
+      __syncwarp();
+    }
+    if (use && zone) cb = c_gbody[PG1(pair)] | c_gbody[PG2(pair)] << 8;
+#else
     if (use && (zone || dbg)) {
       bad = !(adj_contact_one(s, c, pair, slot, zone, cw, dbg) < 0.f);
       if (zone) cb = c_gbody[PG1(pair)] | c_gbody[PG2(pair)] << 8;
     }
+#endif
     unsigned skip = __ballot_sync(0xffffffffu, on && !use), mismatch = __ballot_sync(0xffffffffu, bad);
     if (lane == 0) s.flags |= (skip ? ADJ_ROWS_SKIPPED : 0) | (mismatch ? ADJ_REPLAY_MISMATCH : 0);
     for (int tile = 0; tile < (NB + 31) / 32; tile++) {
@@ -1157,7 +1206,7 @@ __device__ __noinline__ void adj_contacts(Adj& s, int lane, float* dbg_in) {
   LANE_BOUND(lane);
   float* const dbg = DBG ? dbg_in : nullptr;
   (void)dbg;  // no debug entries without -DDK_ADJ_DEBUG
-#if NR == 2
+#if NR == 2 || HAS_NATIVE_COLLISION
   adj_contacts_coupled<DBG>(s, lane, dbg);
 #else
   // ncon through votes (uniform_int, step.py), and UNIFORM for the per-contact branches: the batch loops and the
@@ -1421,6 +1470,9 @@ __device__ void adj_substep(Adj& s, const float* rec, int lane, float* dbg, cons
     unsigned hd = __float_as_uint(__ldcs(rec + OFF_HDR));
     s.hdr = (int)hd;
     s.flags |= (int)__float_as_uint(__ldcs(rec + OFF_FLAGS));
+#if HAS_NATIVE_COLLISION
+    s.feature_rec = rec + OFF_FEATURE;
+#endif
     if (DK_ADJ_STAGE < 2 && (hd & 0xFFFFu)) s.flags |= ADJ_ROWS_SKIPPED;  // contacts (ncon) or rows (nefc)
   }
   __syncwarp();
@@ -1621,8 +1673,10 @@ def cuda_source(m, max_contacts=None, com_body_id=None):
     """The device code of the forward and the adjoint as one compilation unit, with k_adjoint's launch helpers
     (adj_launch_smem; no __global__ forward kernel, no host main)."""
     maxd = source.constants(m, com_body_id)[1]
+    native = (convex_mesh.header(m, step.collision_geoms(m)) + convex_mesh.source(m, step.collision_geoms(m))
+              if step.native_collision(m) else "")
     return (source.header(m, maxd, 1) + step.EXTRA_HEADER + step.step_header(m, max_contacts)
-            + tape.header(m, max_contacts) + header(m) + source.DEVICE + step.STEP_DEVICE + step.STEP_KERNEL
+            + tape.header(m, max_contacts) + native + header(m) + source.DEVICE + step.STEP_DEVICE + step.STEP_KERNEL
             + adjoint_contact.source(m) + ADJ_DEVICE + ADJ_KERNEL)
 
 
@@ -1637,4 +1691,8 @@ def engine_constants(m, foot_pairs, com_body_id=None):
     sizes = {"nb": m.nbody, "nv": m.nv, "one": 1, "nv2": 2 * m.nv, "nr": len(source.free_roots(m))}
     lays = (source.const_layout(m) + [(s, k, n, 1) for s, k, n in step.const_layout(m)]
             + [("c_dofbody", "i", "nv", 1), ("c_ancmask", "q", "nb", 1)])
+    if step.native_collision(m):
+        native, native_layout = convex_mesh.constants(m, step.collision_geoms(m))
+        consts = np.concatenate([consts, native])
+        lays += [(s, k, n, 1) for s, k, n in native_layout]
     return consts, lays, sizes
