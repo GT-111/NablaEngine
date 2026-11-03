@@ -355,7 +355,7 @@ def tape_checks(args, m, mt, arr, run, main, K):
               slots_invalid=int((sl >= lim).sum()),
               slots=dict(zip(*(x.tolist() for x in np.unique(sl, return_counts=True)))),
               duplicate_pair_slot_records=int(dup),
-              nefc_vs_rows=float((rec["nefc"] == np.minimum(nrows, step.NEFC)).mean()),
+              nefc_vs_rows=float((rec["nefc"] == np.minimum(nrows, step.nefc(m))).mean()),
               ncon_last_vs_info=float((rec["ncon"][:, -1] == np.minimum(main["info"][:, 1], step.maxcon(m))).mean()),
               nefc_last_vs_info=float((rec["nefc"][:, -1] == main["info"][:, 2]).mean()))
     if fixtures.has_contacts(args.corpus):  # record 0's pairs (with the 1-substep run's distances) against MuJoCo Warp's

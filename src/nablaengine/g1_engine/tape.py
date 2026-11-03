@@ -30,12 +30,12 @@ def pair_bits(m):
 
 # (name, #define, length: callable of (nq, nv, ntri, maxcon) or an int); a None name pads to the next ALIGN boundary
 _FIELDS = (
-    ("hdr", "OFF_HDR", 1),  # ncon | nefc << 8 | nlim << 16 | niter << 24 (u8 each)
+    ("hdr", "OFF_HDR", 1),  # ncon | nefc << 16 (u16 each)
     ("flags", "OFF_FLAGS", 1),  # FLAG_*
     ("min_nu", "OFF_MIN_NU", 1),  # float: smallest centre / axis distance of a sphere or capsule self contact, else +inf
-    ("reserved", "OFF_RESERVED", 1),
+    ("counts", "OFF_COUNTS", 1),  # nlim | niter << 16 (u16 each)
     ("clamp", "OFF_CLAMP", lambda nq, nv, ntri, nc: -(-nv // 32)),  # dof bits: actuator force at its limit
-    ("zone", "OFF_ZONE", lambda nq, nv, ntri, nc: -(-step.NEFC // 32)),  # row bits: quadratic zone (row in the Hessian)
+    ("zone", "OFF_ZONE", None),  # model-derived row bits: quadratic zone (row in the Hessian)
     ("con", "OFF_CON", lambda nq, nv, ntri, nc: -(-nc // 2)),  # u16 per contact (row order): pair | slot << 9
     ("feature", "OFF_FEATURE", lambda nq, nv, ntri, nc: 12 * nc),  # raw native CMFeature words per contact
     ("qpos", "OFF_QPOS", lambda nq, nv, ntri, nc: nq),  # substep input
@@ -53,7 +53,7 @@ _FIELDS = (
 def _table(m, max_contacts=None):
     nc = max_contacts or step.maxcon(m)
     nv, ntri = m.nv, m.nv * (m.nv + 1) // 2
-    assert nv <= 64 and len(step.contact_pairs(m)) <= 2048 and nc <= 255 and step.NEFC <= 255, "tape field widths"
+    assert nv <= 64 and len(step.contact_pairs(m)) <= 2048 and nc <= 65535 and step.nefc(m, nc) <= 65535, "tape field widths"
     out, off = [], 0
     for name, define, n in _FIELDS:
         if name == "feature" and not step.native_collision(m):
@@ -61,7 +61,7 @@ def _table(m, max_contacts=None):
         if name is None:
             off = -(-off // n) * n
             continue
-        n = n(m.nq, nv, ntri, nc) if callable(n) else n
+        n = -(-step.nefc(m, nc) // 32) if name == "zone" else n(m.nq, nv, ntri, nc) if callable(n) else n
         out.append((name, define, off, n))
         off += n
     return out, off
@@ -109,7 +109,8 @@ def decode(arr, m, max_contacts=None):
     lay = layout(m, max_contacts)
     sl = lambda name: slice(lay[name][0], lay[name][0] + lay[name][1])  # noqa: E731
     hdr, flags = u[..., lay["hdr"][0]].astype(np.int64), u[..., lay["flags"][0]].astype(np.int64)
-    out = dict(ncon=hdr & 255, nefc=(hdr >> 8) & 255, nlim=(hdr >> 16) & 255, niter=hdr >> 24, flags=flags,
+    counts = u[..., lay["counts"][0]].astype(np.int64)
+    out = dict(ncon=hdr & 65535, nefc=hdr >> 16, nlim=counts & 65535, niter=counts >> 16, flags=flags,
                unsupported=flags & FLAG_UNSUPPORTED, refact=(flags & FLAG_REFACT) != 0,
                nonconv=(flags & FLAG_NONCONV) != 0, singular=(flags & FLAG_SINGULAR) != 0,
                verify_diff=(flags & FLAG_VERIFY_DIFF) != 0, min_nu=a[..., lay["min_nu"][0]])
@@ -119,7 +120,7 @@ def decode(arr, m, max_contacts=None):
         cw.shape[:-1] + (-1,))[..., :m.nv]
     zw = u[..., sl("zone")].astype(np.uint64)
     out["zone"] = ((zw[..., :, None] >> np.arange(32, dtype=np.uint64)) & np.uint64(1)).astype(bool).reshape(
-        zw.shape[:-1] + (-1,))[..., :step.NEFC]
+        zw.shape[:-1] + (-1,))[..., :step.nefc(m, max_contacts)]
     nc = max_contacts or step.maxcon(m)
     e = np.ascontiguousarray(u[..., sl("con")]).view(np.uint16)[..., :nc].astype(np.int64)  # little endian: low half first
     past = np.arange(nc) >= out["ncon"][..., None]

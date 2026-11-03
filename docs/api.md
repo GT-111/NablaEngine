@@ -152,8 +152,12 @@ iteration), `tape_records`, `refact_records`, `nonconv_records`, `singular_recor
 | `last_forward(nworld=None)` | outside jit | the last forward call's record for that batch size: `worlds`, `contacts` (summed over the worlds), `contacts_max`, `rows_max` |
 | `launch_info(device=0)` | outside jit | the adjoint kernel's launch per variant: shared memory and worlds per SM |
 
-**Capacity.** Each world holds at most 64 contacts and 192 constraint rows (a frictional contact takes 4 rows, a joint
-limit 1). A world beyond them, typically after deep interpenetration with the floor or between links (a fall), keeps
+**Capacity.** Each library compiles point and row capacities from its model. Point storage uses a positive model
+`nconmax`, or an automatic budget of 256 points, limited by the sum of the eligible pairs' maximum manifold sizes
+with a 32-point minimum allocation. Row storage covers every stored point (4 rows for a frictional contact, 1 for a
+frictionless contact), every frictionloss and soft equality row, and one limit row per limited hinge. A larger positive
+model `njmax` is preserved. Read the actual capacities from `init()`'s `maxcon` and `nefc` metadata.
+A world beyond its capacities, for example during deep interpenetration with the floor or between links, keeps
 the first ones and drops the rest, so it misses part of its support and friction forces; its step is then not the
 model's. Such worlds are flagged in `forward()`'s `info[:, 3]` (`OVERFLOW_CONTACTS = 4`, `OVERFLOW_ROWS = 16`) and
 counted per call and world in `fwd_contact_overflow_worlds` / `fwd_row_overflow_worlds` (both also in
@@ -172,8 +176,8 @@ phys.stats()          # nacon, naconmax, nefc_max, njmax of the last forward cal
 phys.diagnostics()    # read_diagnostics()
 ```
 
-A batched physics object with MuJoCo Warp's capacity names (`nconmax` 64 contacts and `njmax` 192 constraint rows per
-world). The model constants come from the fixtures, and `mjm` must then be the same model (`check_model`), unless
+A batched physics object with MuJoCo Warp's capacity names (`nconmax` contact points and `njmax` constraint rows per
+world), set from the compiled model capacities above. The model constants come from the fixtures, and `mjm` must then be the same model (`check_model`), unless
 `use_model=True`: then from `mjm`. Other keyword options of a MuJoCo Warp based physics object are accepted and
 ignored.
 

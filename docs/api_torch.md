@@ -122,7 +122,11 @@ gradients or cotangents, replay mismatches; `jax_ffi.DIAG`) to an int64 tensor o
 only. `diagnostics()` returns that tensor without reading it; `read_diagnostics()` copies it to the host (a
 synchronization) and by default resets it. The backward's `info` carries the same per-world bits as `jax_ffi.backward`.
 
-Contacts or constraint rows beyond a world's capacity (64 contacts, 192 rows) are dropped and flagged as in the JAX
+The artifact's `maxcon` and `nefc` record its model-derived point and row capacities. A positive model `nconmax`
+owns the point budget; automatic models use a bounded 256-point budget, limited by the pair graph with a 32-point
+minimum allocation. Rows cover every stored contact plus frictionloss, soft equalities and limits; a larger positive
+model `njmax` is preserved. Artifact version 4 records the widened tape counts; older artifacts must be rebuilt.
+Contacts or constraint rows beyond a world's compiled capacity are dropped and flagged as in the JAX
 interface (`docs/api.md`, Diagnostics, Capacity): `info[:, 3] & OVERFLOW_CONTACTS / OVERFLOW_ROWS` of `forward()` or
 `step(..., return_info=True)`, the
 counters `fwd_contact_overflow_worlds` / `fwd_row_overflow_worlds`, and with `set_overflow_warnings(True)` (or

@@ -390,9 +390,11 @@ def check(m, foot_pairs=None, com_body=COM_BODY, scope="engine"):
     kdof = step.max_support(m) if generated_pairs and gen else 0
     maxcon = step.maxcon(m)
     npset = len(step.pair_param_sets(m)[0])
-    add("H26a", len(cg) <= 255 and npset <= 255 and kdof <= 32 and maxcon <= 64 and len(generated_pairs) < 65536, "error",
-        "<= 255 collision geoms and parameter sets (the pair word), KDOF <= 32, MAXCON <= 64",
-        dict(ngeomc=len(cg), param_sets=npset, kdof=kdof, maxcon=maxcon))
+    rows = step.nefc(m) if gen else 0
+    add("H26a", len(cg) <= 255 and npset <= 255 and kdof <= 32 and maxcon <= 65535 and rows <= 65535
+        and len(generated_pairs) < 65536, "error",
+        "<= 255 collision geoms and parameter sets (the pair word), KDOF <= 32, 16-bit point and row counts",
+        dict(ngeomc=len(cg), param_sets=npset, kdof=kdof, maxcon=maxcon, nefc=rows))
     add("H26b", len(generated_pairs) <= 2048, "error", "at most 2048 generated contact pairs (up to 11 tape bits)",
         len(generated_pairs),
         ("adjoint",))
@@ -415,7 +417,7 @@ def check(m, foot_pairs=None, com_body=COM_BODY, scope="engine"):
         "a corpus", nv, ("forward", "adjoint"))
     add("U2", not gen or kdof == 16, "warn", "KDOF = 16 (the G1's): otherwise DK_JV_VEC's 128-bit con_jv loads are off and the "
         "scalar path, never run on a corpus, is used", kdof)
-    add("U3", maxcon == 64, "warn", "MAXCON 64 in the adjoint (npair > 64; the adjoint never ran with MAXCON 32)",
+    add("U3", maxcon <= 256, "warn", "point budgets above the automatic 256-point capacity need separate CUDA validation",
         maxcon, ("adjoint",))
     worst = 0
     dr = ([int(p) for p in np.asarray(foot_pairs).ravel()] if foot_pairs is not None

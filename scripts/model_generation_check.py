@@ -44,7 +44,46 @@ def hand_model(nhinge=12, fingers=5, *, passive=False, damping=0.0, frictionloss
         + ('<equality>' + ''.join(equalities) + '</equality>' if equalities else '') + '</mujoco>')
 
 
+def dense_contact_model(nconmax=320, njmax=1400):
+    geoms = '<geom type="sphere" size=".1"/>' * 17
+    bodies = []
+    for index, x in enumerate((0, .15)):
+        bodies.append(f'<body pos="{x} 0 0"><freejoint/>' + geoms
+                      + f'<body pos="0 0 .1"><joint name="j{index}" range="-1 1"/>'
+                      '<inertial mass=".1" pos=".02 0 0" diaginertia=".001 .001 .001"/></body></body>')
+    return mujoco.MjModel.from_xml_string(
+        f'<mujoco><size nconmax="{nconmax}" njmax="{njmax}"/>'
+        '<option timestep=".005" integrator="implicitfast" solver="Newton" cone="pyramidal"/>'
+        '<worldbody>' + ''.join(bodies) + '</worldbody><actuator>'
+        '<position joint="j0" kp="20" kv=".2"/><position joint="j1" kp="20" kv=".2"/></actuator></mujoco>')
+
+
 class GenerationCheck(unittest.TestCase):
+    def test_authored_contact_budget_retains_large_native_manifold_and_row_counts(self):
+        # Distinct geoms on two bodies produce 289 genuine cross-body contacts.
+        # This exercises point counts above 255 and row/zone words above 1024.
+        model = dense_contact_model()
+        data = mujoco.MjData(model)
+        mujoco.mj_fwdPosition(model, data)
+        self.assertEqual((data.ncon, data.nefc), (289, 1156))
+        capability.require(model, [], source.free_roots(model))
+        self.assertGreaterEqual(step.maxcon(model), data.ncon)
+        self.assertEqual(step.nefc(model), 1400)
+        record = np.zeros(tape.rec_words(model), np.float32)
+        words, layout = record.view(np.uint32), tape.layout(model)
+        words[layout["hdr"][0]] = data.ncon | data.nefc << 16
+        words[layout["counts"][0]] = 300 << 16
+        last = data.nefc - 1
+        words[layout["zone"][0] + (last >> 5)] = 1 << (last & 31)
+        decoded = tape.decode(record, model)
+        self.assertEqual((decoded["ncon"], decoded["nefc"], decoded["nlim"], decoded["niter"]), (289, 1156, 0, 300))
+        self.assertEqual(np.flatnonzero(decoded["zone"]).tolist(), [last])
+        # A smaller explicit point budget must remain visible as an overflow
+        # boundary, while its allocated rows still cover every retained point.
+        model = dense_contact_model(64, 64)
+        self.assertEqual(step.maxcon(model), 64)
+        self.assertEqual(step.nefc(model), 258)
+
     def test_reference_com_invalidates_compiled_sameframe_shortcut(self):
         from coupled_physics_check import set_reference_com
 

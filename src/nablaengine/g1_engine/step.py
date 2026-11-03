@@ -40,7 +40,6 @@ import warnings
 import mujoco
 import numpy as np
 
-NEFC = 192
 PROF_PHASES = ("smooth", "qacc_smooth", "collision", "contact_jac", "rows", "newton_init", "newton_grad",
                "newton_hessian", "newton_chol", "newton_linesearch", "newton_update", "integrate", "ls_jv_Mp",
                "count_ls_steps",
@@ -82,9 +81,12 @@ def contact_parameters(m):
     dim, friction, solref, solimp, margin, gap = [], [], [], [], [], []
     for p, (g1, g2) in enumerate(pairs):
         if p < m.npair:
-            dim.append(m.pair_dim[p]); friction.append(m.pair_friction[p])
-            solref.append(m.pair_solref[p]); solimp.append(m.pair_solimp[p])
-            margin.append(m.pair_margin[p]); gap.append(m.pair_gap[p])
+            dim.append(m.pair_dim[p])
+            friction.append(m.pair_friction[p])
+            solref.append(m.pair_solref[p])
+            solimp.append(m.pair_solimp[p])
+            margin.append(m.pair_margin[p])
+            gap.append(m.pair_gap[p])
             continue
         priority = m.geom_priority[[g1, g2]]
         if priority[0] != priority[1]:
@@ -98,25 +100,55 @@ def contact_parameters(m):
             sr = (mix * m.geom_solref[g1] + (1 - mix) * m.geom_solref[g2]
                   if np.all(m.geom_solref[[g1, g2]] > 0) else np.minimum(m.geom_solref[g1], m.geom_solref[g2]))
             si = mix * m.geom_solimp[g1] + (1 - mix) * m.geom_solimp[g2]
-        dim.append(cd); friction.append(fr[[0, 0, 1, 2, 2]])
-        solref.append(sr); solimp.append(si)
-        margin.append(max(m.geom_margin[g1], m.geom_margin[g2])); gap.append(max(m.geom_gap[g1], m.geom_gap[g2]))
+        dim.append(cd)
+        friction.append(fr[[0, 0, 1, 2, 2]])
+        solref.append(sr)
+        solimp.append(si)
+        margin.append(max(m.geom_margin[g1], m.geom_margin[g2]))
+        gap.append(max(m.geom_gap[g1], m.geom_gap[g2]))
     n = len(pairs)
     return dict(dim=np.asarray(dim, int), friction=np.asarray(friction, float).reshape(n, 5),
                 solref=np.asarray(solref, float).reshape(n, 2), solimp=np.asarray(solimp, float).reshape(n, 5),
                 margin=np.asarray(margin, float), gap=np.asarray(gap, float))
 
 
+def contact_multiplicity(m):
+    """Maximum emitted points of each generated pair under the model's CCD options."""
+    from nablaengine.model.capability import CONTACTS_PER_PAIR
+
+    multi = not (m.opt.disableflags & int(mujoco.mjtDisableBit.mjDSBL_MULTICCD))
+    counts = []
+    for a, b in contact_pairs(m):
+        types = tuple(sorted((GEOM_TYPE.get(int(m.geom_type[a]), -1), GEOM_TYPE.get(int(m.geom_type[b]), -1))))
+        counts.append(1 if 4 in types and not multi else CONTACTS_PER_PAIR.get(types, 1))
+    return np.asarray(counts, np.int64)
+
+
 def maxcon(m):
-    """Contact capacity per world: 32 for the Menagerie model (49 pairs, at most 11 contacts seen), 64 for the mjlab
-    model (502 pairs; up to 28 foot contacts alone). $DK_MAXCON overrides it (experiments); it
-    changes every build, the FFI library included, so it warns."""
-    default = 32 if len(contact_pairs(m)) <= 64 else 64
+    """Per-world point storage from the authored budget, bounded by the pair graph.
+
+    Automatic MuJoCo arenas have no point declaration (nconmax=-1). Use a
+    bounded 256-point buffer there; actual overflow remains an explicit error.
+    A warp is the minimum storage tile. $DK_MAXCON is an experimental override.
+    """
+    budget = int(m.nconmax) if m.nconmax > 0 else 256
+    default = max(32, min(budget, int(contact_multiplicity(m).sum())))
     if os.environ.get("DK_MAXCON"):
         warnings.warn(f"DK_MAXCON={os.environ['DK_MAXCON']} overrides the contact capacity (default {default}) of the "
                       "engine builds and the FFI library (an experiment switch)", RuntimeWarning, stacklevel=2)
         return int(os.environ["DK_MAXCON"])
     return default
+
+
+def nefc(m, max_contacts=None):
+    """Rows for every stored point plus every supported noncontact constraint."""
+    counts = contact_multiplicity(m)
+    dims = contact_parameters(m)["dim"]
+    ntri = int(counts[dims == 3].sum())
+    capacity = max_contacts or maxcon(m)
+    contact_rows = 4 * min(capacity, ntri) + min(max(0, capacity - ntri), int(counts[dims == 1].sum()))
+    noncontact = int((m.dof_frictionloss > 0).sum()) + int(m.neq) + int(np.count_nonzero(m.jnt_limited))
+    return max(1, int(m.njmax), noncontact + contact_rows)
 
 
 def max_support(m):
@@ -252,6 +284,7 @@ def dof_body_root6(m):
 
 def step_header(m, max_contacts=None):
     p, g, kdof = len(contact_pairs(m)), len(collision_geoms(m)), max_support(m)
+    nc, nr = max_contacts or maxcon(m), nefc(m, max_contacts)
     hs = hess_columns(kdof)
     hcol = [a | b << 8 | thr << 16 for _, _, tab in hs for row in tab for a, b, thr in row]
     return f"""
@@ -260,7 +293,10 @@ def step_header(m, max_contacts=None):
 #define NGEOMC {g}
 #define NPAIR_STORAGE {max(1, p)}
 #define NGEOMC_STORAGE {max(1, g)}
-#define MAXCON {max_contacts or maxcon(m)}
+#define MAXCON {nc}
+#define CON_TILES {(nc + 31) // 32}
+#define CON_COUNT_BITS {nc.bit_length()}
+#define ROW_COUNT_BITS {nr.bit_length()}
 #define KDOF {kdof}
 #define KDOF_STORAGE {max(1, kdof)}
 #define HSETS {len(hs)}  // Hessian assembly (hess_columns(KDOF)): sets of 3 passes, their first rows, pairs per lane
@@ -274,7 +310,7 @@ __device__ const unsigned c_hcol[{max(1, len(hcol))}] = {{{", ".join(map(str, hc
                                  and not m.geom_type[a] == m.geom_type[b] == mujoco.mjtGeom.mjGEOM_BOX
                                  for a, b in contact_pairs(m)))}
 #define FLOOR_G {floor_geom(m)}  // the geom table index of the only plane (-1: none or several)
-#define NEFC {NEFC}
+#define NEFC {nr}
 #define DOF_BODY_ROOT6 {int(dof_body_root6(m))}  // step.dof_body_root6 (support_mask in closed form)
 #define NFLOSS {int((m.dof_frictionloss > 0).sum())}  // dofs with a frictionloss row (the first rows)
 #define NEQ {m.neq}  // bilateral soft linear joint equalities, after frictionloss and before limits
@@ -323,7 +359,8 @@ struct Sim {
       };
     };
     struct {
-      unsigned char efc_kind[NEFC], efc_a[NEFC];
+      unsigned char efc_kind[NEFC];
+      unsigned short efc_a[NEFC];
       signed char efc_b[NEFC];
       float efc_D[NEFC], efc_aref[NEFC], efc_jar[NEFC], efc_jv[NEFC];  // efc_jv: J p in the line search, else forces
     };
@@ -1061,7 +1098,7 @@ __device__ __forceinline__ void con_force(const S& s, const float* f, int c, flo
 }
 template <class S>
 __device__ void rows_jtf(S& s, const float* f, float* out, int lane) {
-  int ncon = uniform_int(min(s.ncon, MAXCON), 7);
+  int ncon = uniform_int(min(s.ncon, MAXCON), CON_COUNT_BITS);
 #if DK_JTF_GATHER
   // per dof in registers (lane l: dofs l and l + 32): the dof rows, then the contacts in contact order (the sums of the
   // scatter below, bitwise). Lane i of a block of 32 contacts holds contact c0 + i's forces and support mask
@@ -1158,15 +1195,15 @@ __device__ __forceinline__ int row_zone(const S& s, int r, float x) {
 // 20.84 / 20.88 ms)
 
 // tape: the rows on their quadratic zone at the current jar (row_zone 1, the rows that put D into the Newton Hessian),
-// as bits; lane j returns rows 32 j .. 32 j + 31 (0 past nefc and on lanes j >= ceil(nefc / 32))
+// as bits; lane j returns word first + j (0 past nefc).
 template <class S>
-__device__ __noinline__ unsigned zone_word(const S& s, int lane) {
+__device__ __noinline__ unsigned zone_word(const S& s, int lane, int first) {
   unsigned z = 0u;
-  const int nefc = uniform_int(s.nefc, 8);
-  for (int r0 = 0; r0 < nefc; r0 += 32) {
+  const int nefc = uniform_int(s.nefc, ROW_COUNT_BITS);
+  for (int r0 = 32 * first; r0 < min(nefc, 32 * (first + 32)); r0 += 32) {
     int r = r0 + lane;
     unsigned b = __ballot_sync(0xffffffffu, r < nefc && row_zone(s, r, s.efc_jar[r]) == 1);
-    if (lane == r0 >> 5) z = b;
+    if (lane + first == r0 >> 5) z = b;
   }
   return z;
 }
@@ -1287,11 +1324,10 @@ __device__ __forceinline__ unsigned long long support_mask(unsigned long long x)
   return m;
 #endif
 }
-// the Newton Hessian into s.L (see below); world, grp0, grp1: the contacts against the world and their groups by body
+// the Newton Hessian into s.L (see below); world and group: tiled contact masks and groups by body
 // (substep_post)
 template <class S>
-__device__ __forceinline__ void hessian(S& s, int ncon, unsigned long long world, unsigned grp0, unsigned grp1,
-                                        int lane) {
+__device__ __forceinline__ void hessian(S& s, int ncon, const unsigned* world, const unsigned* group, int lane) {
   // H = M + J' D J on the quadratic rows (lower triangle into L), curvatures D from the rows' zones at jar. The pyramid
   // rows of a contact, u_k = n +- mu t1, n +- mu t2, add C_nn n n' + C_n1 (n t1' + t1 n') + C_11 t1 t1' + (same for t2)
   // = J' C J with C = [C_nn C_n1 C_n2; C_n1 C_11 0; C_n2 0 C_22] (only C_nn for condim 1) and J the frame rows
@@ -1306,7 +1342,7 @@ __device__ __forceinline__ void hessian(S& s, int ncon, unsigned long long world
       unsigned e = c_hcol[(3 * k + t) * 32 + lane];
       ha[k][t] = e & 255; hb[k] = (e >> 8) & 255; hthr[k][t] = e >> 16;
     }
-  unsigned long long act = 0ull;  // contacts with a quadratic row
+  unsigned act[CON_TILES] = {};  // contacts with a quadratic row, one mask per tile
   for (int c0 = 0; c0 < ncon; c0 += 32) {
     int c = c0 + lane;
     bool on = false;
@@ -1325,7 +1361,7 @@ __device__ __forceinline__ void hessian(S& s, int ncon, unsigned long long world
       s.con_C[c][3] = mu * (d2 - d3); s.con_C[c][4] = mu * mu * (d2 + d3);
       on = d0 + d1 + d2 + d3 != 0.f;  // C_nn is the sum of the curvatures
     }
-    act |= (unsigned long long)__ballot_sync(0xffffffffu, on) << c0;
+    act[c0 >> 5] = __ballot_sync(0xffffffffu, on);
   }
   SUBPROF(27);
 #pragma unroll
@@ -1377,51 +1413,49 @@ __device__ __forceinline__ void hessian(S& s, int ncon, unsigned long long world
   // contacts, a group (one body, one support) at a time, then each contact between two bodies. Per lane and set: the
   // pairs (a, b) of one column b, H_ab = J_a' G_b with G_b = C J_b once per contact, summed over the group before the
   // update of L
-  for (unsigned long long todo = act & world, rest = act & ~world; todo | rest;) {
-    bool w = todo != 0ull;
-    unsigned long long m64 = w ? todo : rest;
-    int c0 = (unsigned)m64 ? 0 : 32;  // contacts c0 + i, i in gm (32-bit masks: a cheap __ffs)
-    unsigned m = (unsigned)(m64 >> c0);
-    int c = __ffs(m) - 1;
-    unsigned gw = __ballot_sync(0xffffffffu, ((c0 ? grp1 : grp0) >> c) & 1u), gm = w ? m & gw : 1u << c;  // c's group
-    if (w) todo &= ~((unsigned long long)gm << c0);
-    else {
-      rest &= ~((unsigned long long)gm << c0);
-      __syncwarp();  // between two bodies: fenced
-    }
-    int nd = s.con_nd[c0 + c];
-    const unsigned char* dof = s.con_dof[c0 + c];
-    constexpr int hlo[HSETS_STORAGE] = HSET_LO;
+  for (int pass = 0; pass < 2; pass++)
+  for (int tile = 0; tile < CON_TILES; tile++) {
+    bool w = pass == 0;
+    unsigned todo = act[tile] & (w ? world[tile] : ~world[tile]);
+    for (; todo;) {
+      int c0 = 32 * tile, c = __ffs(todo) - 1;
+      unsigned gw = __ballot_sync(0xffffffffu, (group[tile] >> c) & 1u), gm = w ? todo & gw : 1u << c;
+      todo &= ~gm;
+      if (!w) __syncwarp();  // between two bodies: fenced
+      int nd = s.con_nd[c0 + c];
+      const unsigned char* dof = s.con_dof[c0 + c];
+      constexpr int hlo[HSETS_STORAGE] = HSET_LO;
 #pragma unroll
-    for (int k = 0; k < HSETS; k++) {
-      if (nd <= hlo[k]) break;  // no rows of this set in the support
-      int db = dof[hb[k]], he[3];
-      float hv[3], lv[3];
+      for (int k = 0; k < HSETS; k++) {
+        if (nd <= hlo[k]) break;  // no rows of this set in the support
+        int db = dof[hb[k]], he[3];
+        float hv[3], lv[3];
 #pragma unroll
-      for (int t = 0; t < 3; t++) {  // the entries of one support are distinct: loads first, stores after the sum
-        int da = dof[ha[k][t]];
-        he[t] = da * (da + 1) / 2 + db;
-        hv[t] = 0.f;
-        if (nd > hthr[k][t]) lv[t] = s.L[he[t]];
-      }
-      unsigned mm = gm;
-      int in = __ffs(mm) - 1;  // the next contact, found one iteration ahead
-      mm &= mm - 1u;
-      for (int i = in; i >= 0; i = in) {
-        in = __ffs(mm) - 1;
-        mm &= mm - 1u;
-        int cc = c0 + i, b = hb[k];
-        const float *C = s.con_C[cc], *Jn = s.con_J[cc][0], *Ja = s.con_J[cc][1], *Jb = s.con_J[cc][2];
-        float j0 = Jn[b], j1 = Ja[b], j2 = Jb[b];  // G_b (condim 1: C_nn only, the rest adds exact zeros)
-        float g0 = C[0] * j0 + C[1] * j1 + C[3] * j2, g1 = C[1] * j0 + C[2] * j1, g2 = C[3] * j0 + C[4] * j2;
-#pragma unroll
-        for (int t = 0; t < 3; t++) {
-          int a = ha[k][t];
-          hv[t] = fmaf(Jb[a], g2, fmaf(Ja[a], g1, fmaf(Jn[a], g0, hv[t])));
+        for (int t = 0; t < 3; t++) {  // the entries of one support are distinct: loads first, stores after the sum
+          int da = dof[ha[k][t]];
+          he[t] = da * (da + 1) / 2 + db;
+          hv[t] = 0.f;
+          if (nd > hthr[k][t]) lv[t] = s.L[he[t]];
         }
-      }
+        unsigned mm = gm;
+        int in = __ffs(mm) - 1;  // the next contact, found one iteration ahead
+        mm &= mm - 1u;
+        for (int i = in; i >= 0; i = in) {
+          in = __ffs(mm) - 1;
+          mm &= mm - 1u;
+          int cc = c0 + i, b = hb[k];
+          const float *C = s.con_C[cc], *Jn = s.con_J[cc][0], *Ja = s.con_J[cc][1], *Jb = s.con_J[cc][2];
+          float j0 = Jn[b], j1 = Ja[b], j2 = Jb[b];  // G_b (condim 1: C_nn only, the rest adds exact zeros)
+          float g0 = C[0] * j0 + C[1] * j1 + C[3] * j2, g1 = C[1] * j0 + C[2] * j1, g2 = C[3] * j0 + C[4] * j2;
 #pragma unroll
-      for (int t = 0; t < 3; t++) if (nd > hthr[k][t]) s.L[he[t]] = lv[t] + hv[t];
+          for (int t = 0; t < 3; t++) {
+            int a = ha[k][t];
+            hv[t] = fmaf(Jb[a], g2, fmaf(Ja[a], g1, fmaf(Jn[a], g0, hv[t])));
+          }
+        }
+#pragma unroll
+        for (int t = 0; t < 3; t++) if (nd > hthr[k][t]) s.L[he[t]] = lv[t] + hv[t];
+      }
     }
   }
 }
@@ -1721,26 +1755,30 @@ __device__ void substep_pre(S& s, const float* ctrl, int lane, float* rec, const
 #endif
   PROF(2);
   if (lane == 0 && s.ncon > MAXCON) s.unsupported |= 4;
-  int ncon = uniform_int(min(s.ncon, MAXCON), 7);
+  int ncon = uniform_int(min(s.ncon, MAXCON), CON_COUNT_BITS);
   {  // contact Jacobians: frame rows of J(body2, pos) - J(body1, pos) on the dofs on exactly one chain, packed in
      // ascending order. Lane l keeps the motion subspaces (w, v about O) of dofs l and l + 32, and the two bodies'
-     // ancestor masks of contacts l and l + 32 (shuffled to all lanes per contact)
-    static_assert(NV <= 64 && MAXCON <= 64, "two dofs and two contacts per lane");
+     // ancestor masks of each contact tile (shuffled to all lanes per contact)
+    static_assert(NV <= 64, "two dofs per lane");
     float dw[2][3], dv[2][3];
     int dbody[2];
-    unsigned long long am1[2], am2[2];
+    unsigned long long am1[CON_TILES], am2[CON_TILES];
 #pragma unroll
     for (int h = 0; h < 2; h++) {
-      int i = lane + 32 * h, c = lane + 32 * h;
+      int i = lane + 32 * h;
       dbody[h] = i < NV ? c_dofbody[i] : 0;
       if (i < NV) dof_motion(dbody[h], c_doflocal[i], s.Q[dbody[h]], s.X[dbody[h]], O, dw[h], dv[h]);
+    }
+#pragma unroll
+    for (int h = 0; h < CON_TILES; h++) {
+      int c = lane + 32 * h;
       int pr = c < ncon ? s.con_pair[c] : 0;
       am1[h] = c_ancmask[c_gbody[PG1(pr)]];
       am2[h] = c_ancmask[c_gbody[PG2(pr)]];
     }
     for (int c = 0; c < ncon; c++) {
-      unsigned long long m1 = __shfl_sync(0xffffffffu, c < 32 ? am1[0] : am1[1], c & 31);
-      unsigned long long m2 = __shfl_sync(0xffffffffu, c < 32 ? am2[0] : am2[1], c & 31);
+      unsigned long long m1 = __shfl_sync(0xffffffffu, am1[c >> 5], c & 31);
+      unsigned long long m2 = __shfl_sync(0xffffffffu, am2[c >> 5], c & 31);
       float pos[3], fr[9];
       for (int t = 0; t < 3; t++) pos[t] = s.con_pos[c][t];
       for (int t = 0; t < 9; t++) fr[t] = s.con_frame[c][t];
@@ -1766,7 +1804,7 @@ __device__ void substep_pre(S& s, const float* ctrl, int lane, float* rec, const
       if (lane == 0) s.con_nd[c] = base;
     }
 #pragma unroll
-    for (int h = 0; h < 2; h++)
+    for (int h = 0; h < CON_TILES; h++)
       if (lane + 32 * h < ncon) s.con_mask[lane + 32 * h] = support_mask(am1[h] ^ am2[h]);  // (the ballots' bits)
   }
   PROF(3);
@@ -1877,7 +1915,7 @@ __device__ void substep_pre(S& s, const float* ctrl, int lane, float* rec, const
 template <class S>
 __device__ void substep_post(S& s, int iterations, int lane, int* niter_out, float* rec) {
   const float h = c_misc[0];
-  int ncon = uniform_int(min(s.ncon, MAXCON), 7);
+  int ncon = uniform_int(min(s.ncon, MAXCON), CON_COUNT_BITS);
   PROF_START();
   // Newton solver from the warm start (or qacc_smooth when that is cheaper)
   const float scale = 1.f / (c_sopt[1] * NV), tol = c_sopt[2];
@@ -1902,17 +1940,15 @@ __device__ void substep_post(S& s, int iterations, int lane, int* niter_out, flo
   // other body, so the dofs two of them share are their common ancestors' dofs, at the same positions in both supports,
   // and an entry of L they share comes from the same support pair (a, b), which is always on the same lane: no
   // __syncwarp() between them. The world contacts on one body have the same support and are summed in registers before
-  // one update of L (grp0 / grp1: lane masks of the contacts 0-31 / 32-63 on the same body). A contact between two
+  // one update of L (group: lane masks of the contacts on the same body in each tile). A contact between two
   // bodies (support: the dofs on exactly one chain) is fenced on both sides.
-  static_assert(MAXCON <= 64 && KDOF <= 32, "contact bit masks; hess_columns fits 32 lanes");
-  unsigned long long world = 0ull;
-  unsigned grp0 = 0u, grp1 = 0u;
+  static_assert(KDOF <= 32, "hess_columns fits 32 lanes");
+  unsigned world[CON_TILES] = {}, group[CON_TILES] = {};
   for (int c0 = 0; c0 < ncon; c0 += 32) {
     int c = c0 + lane, pr = c < ncon ? s.con_pair[c] : 0, b1 = c_gbody[PG1(pr)], b2 = c_gbody[PG2(pr)];
     bool w = c < ncon && (b1 == 0 || b2 == 0);
-    world |= (unsigned long long)__ballot_sync(0xffffffffu, w) << c0;
-    unsigned g = __match_any_sync(0xffffffffu, w ? b1 + b2 : -1 - lane);
-    if (c0 == 0) grp0 = g; else grp1 = g;
+    world[c0 >> 5] = __ballot_sync(0xffffffffu, w);
+    group[c0 >> 5] = __match_any_sync(0xffffffffu, w ? b1 + b2 : -1 - lane);
   }
   // tape (rec): L_H must be the Hessian factor at the final zones. The last factorization was assembled at the jar
   // before the last step; when that step moved a row to another zone (chg, tested where jar is updated), or no step was
@@ -1930,7 +1966,7 @@ __device__ void substep_post(S& s, int iterations, int lane, int* niter_out, flo
     } else
 #endif
     {
-      hessian(s, ncon, world, grp0, grp1, lane);
+      hessian(s, ncon, world, group, lane);
       PROF(7);
       for (int i = lane; i < NV; i += 32) s.p[i] = -s.grad[i];
       __syncwarp();
@@ -1963,19 +1999,23 @@ __device__ void substep_post(S& s, int iterations, int lane, int* niter_out, flo
       rF[t] = row_floss(s, r);
     }
     float alpha = 0.f, lo = 0.f, hi = 1e30f, d0 = 0.f;
-    unsigned zprev = 0u;
+    constexpr int ZWORDS = (RT + 15) / 16;
+    unsigned zprev[ZWORDS] = {};
     bool newton = false;
     for (int k = 0; k <= 40; k++) {
       float fd = 0.f, fdd = 0.f;
-      unsigned z = 0u;
+      unsigned z[ZWORDS] = {};
 #pragma unroll
       for (int t = 0; t < RT; t++) {
         if (32 * t >= nefc) break;
         float ds, dd, jv = rj[t];
-        z |= (unsigned)row_piece(lane + 32 * t, rx[t] + alpha * jv, rD[t], rF[t], &ds, &dd) << (2 * t);
+        z[t >> 4] |= (unsigned)row_piece(lane + 32 * t, rx[t] + alpha * jv, rD[t], rF[t], &ds, &dd) << (2 * (t & 15));
         fd += ds * jv; fdd += dd * jv * jv;
       }
-      if (__all_sync(0xffffffffu, newton && z == zprev)) break;  // the last Newton step kept every row on its piece
+      bool same = newton;
+#pragma unroll
+      for (int w = 0; w < ZWORDS; w++) same &= z[w] == zprev[w];
+      if (__all_sync(0xffffffffu, same)) break;  // the last Newton step kept every row on its piece
       if (k == 40) break;
 #ifdef DK_PROFILE
       if (lane == 0) s.prof[13]++;
@@ -1988,7 +2028,8 @@ __device__ void substep_post(S& s, int iterations, int lane, int* niter_out, flo
       float nx = alpha - fd / fdd;
       newton = nx > lo && nx < hi;
       if (!newton) nx = hi < 1e29f ? 0.5f * (lo + hi) : 2.f * fmaxf(alpha, 1e-6f);
-      zprev = z;
+#pragma unroll
+      for (int w = 0; w < ZWORDS; w++) zprev[w] = z[w];
       alpha = nx;
     }
     // Rebuild the products from the updated float32 acceleration. Incremental
@@ -2045,8 +2086,10 @@ __device__ void substep_post(S& s, int iterations, int lane, int* niter_out, flo
   }
   if (niter_out && lane == 0) *niter_out = it;
   if (rec) {  // tape: the final zones and their Hessian factor, before the implicitfast solve overwrites L
-    unsigned z = zone_word(s, lane);
-    if (lane < (NEFC + 31) / 32) __stcs(rec + OFF_ZONE + lane, __uint_as_float(z));
+    for (int first = 0; first < (NEFC + 31) / 32; first += 32) {
+      unsigned z = zone_word(s, lane, first);
+      if (lane + first < (NEFC + 31) / 32) __stcs(rec + OFF_ZONE + first + lane, __uint_as_float(z));
+    }
     tape_put(rec + OFF_LH, s.L, NTRI, OFF_LQ - OFF_LH, lane);
   }
 #ifdef DK_TAPE_VERIFY
@@ -2077,12 +2120,12 @@ __device__ void substep_post(S& s, int iterations, int lane, int* niter_out, flo
 #ifdef DK_TAPE_VERIFY
       if (vdiff) fl |= TAPE_VERIFY_DIFF;
 #endif
-      unsigned hd = (unsigned)ncon | (unsigned)s.nefc << 8 | (unsigned)(s.nefc_dof - NFLOSS - NEQ) << 16
-                    | (unsigned)min(it, 255) << 24;
+      unsigned hd = (unsigned)ncon | (unsigned)s.nefc << 16;
+      unsigned counts = (unsigned)(s.nefc_dof - NFLOSS - NEQ) | (unsigned)min(it, 65535) << 16;
       __stcs(rec + OFF_HDR, __uint_as_float(hd));
       __stcs(rec + OFF_FLAGS, __uint_as_float(fl));
       __stcs(rec + OFF_MIN_NU, nu);
-      __stcs(rec + OFF_RESERVED, 0.f);
+      __stcs(rec + OFF_COUNTS, __uint_as_float(counts));
     }
   }
   for (int i = lane; i < NV; i += 32) s.qvel[i] += h * s.tmp[i];
@@ -2124,7 +2167,8 @@ struct SimNT {  // substep_post: Newton, implicitfast; capacity NC contacts, NR 
   union { float grad[NV], p[NV]; };  // grad is last read by p = -grad (in place)
   union { float Mp[NV], tmp[NV]; };  // Mp: line search to update; tmp: J'f (newton_grad), start's qacc, implicitfast
   float efc_D[NROW], efc_jar[NROW];
-  unsigned char efc_kind[NROW], efc_a[NROW];
+  unsigned char efc_kind[NROW];
+  unsigned short efc_a[NROW];
   signed char efc_b[NROW];
   int ncon, nefc, unsupported, min_nu_bits, nefc_dof;
   union {
@@ -2163,7 +2207,8 @@ struct Hand {
   float con_mu[MAXCON];
   int con_pair[MAXCON], con_dim[MAXCON], con_row[MAXCON], con_nrow[MAXCON], con_nd[MAXCON];
   int ncon, nefc, nefc_dof, unsupported, min_nu_bits;
-  unsigned char efc_kind[NEFC], efc_a[NEFC];
+  unsigned char efc_kind[NEFC];
+  unsigned short efc_a[NEFC];
   signed char efc_b[NEFC];
   alignas(16) unsigned char con_dof[MAXCON][KDOF_STORAGE];
   unsigned long long con_mask[MAXCON];
@@ -2194,7 +2239,8 @@ struct SimP {  // substep_pre: smooth dynamics, qacc_smooth, collision, contact 
   float (*con_J)[3][KDOF_STORAGE];
   unsigned char (*con_dof)[KDOF_STORAGE];
   unsigned long long* con_mask;
-  unsigned char *efc_kind, *efc_a;
+  unsigned char* efc_kind;
+  unsigned short* efc_a;
   signed char* efc_b;
   float *efc_D, *efc_aref;
 #ifdef DK_PROFILE

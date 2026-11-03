@@ -6,6 +6,7 @@ fake shapes, not CUDA numerical correctness. CUDA uses two real model artifacts.
 
 import argparse
 from contextlib import contextmanager
+import json
 from pathlib import Path
 import shutil
 import subprocess
@@ -48,6 +49,17 @@ def inputs(context, device="cpu", requires_grad=False):
 
 
 class ContextChecks(unittest.TestCase):
+    def test_old_tape_artifact_is_refused_before_loading_its_library(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            (path / "model.so").touch()
+            (path / "model.npy").touch()
+            artifact = path / "model.json"
+            artifact.write_text(json.dumps(dict(artifact_version=3, arch="sm_90",
+                library="model.so", consts="model.npy")))
+            self.assertEqual(F._stale(artifact, "sm_90"),
+                f"artifact version 3, this module reads {F.ARTIFACT_VERSION}")
+
     @unittest.skipUnless(shutil.which("c++"), "host loader source check requires a C++ compiler")
     def test_uint64_constant_loader_retains_high_body_bits(self):
         from nablaengine.g1_engine.host import loader
@@ -135,7 +147,7 @@ int main() {
 
     def test_optional_info_preserves_state_and_kinematic_vjps_in_eager_and_aot(self):
         def forward(q, v, w, u, fr, com, force, kp, iterations, substeps, tape, kin, cid):
-            info = torch.tensor((3, 4, 12, F.OVERFLOW_ROWS), dtype=torch.int32).expand(q.shape[0], -1).clone()
+            info = torch.tensor((3, 127, 576, F.OVERFLOW_ROWS), dtype=torch.int32).expand(q.shape[0], -1).clone()
             tp = q.new_zeros((q.shape[0], substeps * F._sizes(cid)[4]))
             result = [2*q, v+u.sum(-1, keepdim=True)+force, w.clone(), info, tp]
             return result + [2*q, *(q.new_zeros(shape) for shape in F._kin_shapes(q.shape[0], cid)[1:])] if kin else result
@@ -161,7 +173,7 @@ int main() {
                         if return_info:
                             self.assertEqual(output[3].dtype, torch.int32)
                             self.assertFalse(output[3].requires_grad)
-                            self.assertTrue(torch.equal(output[3], torch.tensor((3, 4, 12, F.OVERFLOW_ROWS)).expand(2, -1)))
+                            self.assertTrue(torch.equal(output[3], torch.tensor((3, 127, 576, F.OVERFLOW_ROWS)).expand(2, -1)))
                         loss = output[0].sum()+output[1].sum()
                         if kin:
                             loss = loss+output[3+int(return_info)].sum()

@@ -294,6 +294,11 @@ def main():
             elif name in ("coupled_mesh", "coupled_box_mesh", "coupled_box_box"):
                 model = native_contact_model(mujoco, name.removeprefix("coupled_"))
                 pairs, bodies = list(range(len(step.contact_pairs(model)))), tuple(source.free_roots(model))
+            elif name == "coupled_capacity":
+                from model_generation_check import dense_contact_model
+
+                model = dense_contact_model()
+                pairs, bodies = list(range(len(step.contact_pairs(model)))), tuple(source.free_roots(model))
             elif name in ("coupled_large", "coupled_equalities"):
                 eq = name == "coupled_equalities"
                 model = hand_model(12 if eq else 22, 5, roots=2, passive=eq, equality=eq,

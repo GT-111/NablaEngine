@@ -82,7 +82,6 @@ functions) and the contact VJPs (adjoint_contact.source); the caller adds its __
 (the adjoint check binary of nablaengine.checks).
 """
 
-import mujoco
 import numpy as np
 
 from nablaengine.g1_engine import adjoint_contact, convex_mesh, source, step, tape
@@ -250,7 +249,7 @@ struct Adj {
   unsigned clamp[(NV + 31) / 32];  // the record's actuator clamp mask (dof bits)
   unsigned zone[(NEFC + 31) / 32];  // the record's quadratic-zone bits of the constraint rows (forward row order)
   unsigned con[(MAXCON + 1) / 2];  // the record's contact table: pair | slot << 9 per 16 bits
-  int hdr;  // the record's header: ncon | nefc << 8 | nlim << 16 | niter << 24
+  int hdr, nlim;  // the record's ncon | nefc << 16 and separate limit count
   int flags;  // union of the records' flags (tape.py), ADJ_ROWS_SKIPPED, ADJ_REPLAY_MISMATCH
 #if HAS_NATIVE_COLLISION
   CMScratch cm_scratch;
@@ -956,7 +955,7 @@ __device__ __noinline__ void adj_limits(Adj& s, int lane, float* dbg_in) {
 #endif
     nl += __popc(bal);
   }
-  if (lane == 0 && nl != (int)(((unsigned)s.hdr >> 16) & 255u)) s.flags |= (int)ADJ_REPLAY_MISMATCH;
+  if (lane == 0 && nl != s.nlim) s.flags |= (int)ADJ_REPLAY_MISMATCH;
   __syncwarp();
   APROF_COUNT(APROF_COUNT_LIMIT_ROWS, nl);
   APROF(APROF_LIMITS);
@@ -1101,7 +1100,7 @@ __device__ __forceinline__ float adj_contact_one(Adj& s, int c, int pair, int sl
 // writes every contact's debug entries (also without a quadratic row) to dbg; production: <false> (see adj_limits)
 template <bool DBG>
 __device__ void adj_contacts_coupled(Adj& s, int lane, float* dbg) {
-  int ncon = uniform_int(s.hdr & 255, 8), nlim = ((unsigned)s.hdr >> 16) & 255;
+  int ncon = uniform_int(s.hdr & 65535, CON_COUNT_BITS), nlim = s.nlim;
   for (int g = lane; g < NGEOMC; g += 32) {
     int b = c_gbody[g];
     geom_pose(g, s.Q[b], s.X[b], s.gx[g], s.gq[g]);
@@ -1212,7 +1211,7 @@ __device__ __noinline__ void adj_contacts(Adj& s, int lane, float* dbg_in) {
   // ncon through votes (uniform_int, step.py), and UNIFORM for the per-contact branches: the batch loops and the
   // shuffles in them are then uniform for the compiler (no divergence checks; see step.py UNIFORM). Without the votes
   // the shuffles cost 5% of k_adjoint (RTX 3090, at 6 worlds per SM)
-  const int ncon = uniform_int(s.hdr & 255, 8), nlim = ((unsigned)s.hdr >> 16) & 255;
+  const int ncon = uniform_int(s.hdr & 65535, CON_COUNT_BITS), nlim = s.nlim;
   for (int g = lane; g < NGEOMC; g += 32) {  // geom_poses (step.py)
     const int b = c_gbody[g];
     geom_pose(g, s.Q[b], s.X[b], s.gx[g], s.gq[g]);
@@ -1390,7 +1389,7 @@ __device__ void adj_residual(Adj& s, const float* ctrl, float* dbg, int lane) {
 // adj_contacts (written by other lanes before the caller's __syncwarp): the limit row's sigma f, and s_i col_i . F_c
 // of every contact c whose support holds the dof (F_c: its force sum_e -D x_e u_e at its point)
 __device__ void adj_jtf(Adj& s, const float* dbg, int lane) {
-  const int ncon = s.hdr & 255;
+  const int ncon = s.hdr & 65535;
   for (int i = lane; i < NV; i += 32) {
     const int bi = c_dofbody[i];
     float acc = 0.f;
@@ -1464,16 +1463,17 @@ __device__ void adj_substep(Adj& s, const float* rec, int lane, float* dbg, cons
     s.v[i] = __ldcs(rec + OFF_QVEL + i); s.a[i] = a; s.aadv[i] = aadv; s.at[i] = a - aadv;
   }
   if (lane < (NV + 31) / 32) s.clamp[lane] = __float_as_uint(__ldcs(rec + OFF_CLAMP + lane));
-  if (lane < (NEFC + 31) / 32) s.zone[lane] = __float_as_uint(__ldcs(rec + OFF_ZONE + lane));
+  for (int w = lane; w < (NEFC + 31) / 32; w += 32) s.zone[w] = __float_as_uint(__ldcs(rec + OFF_ZONE + w));
   for (int i = lane; i < (MAXCON + 1) / 2; i += 32) s.con[i] = __float_as_uint(__ldcs(rec + OFF_CON + i));
   if (lane == 0) {
     unsigned hd = __float_as_uint(__ldcs(rec + OFF_HDR));
     s.hdr = (int)hd;
+    s.nlim = __float_as_uint(__ldcs(rec + OFF_COUNTS)) & 65535u;
     s.flags |= (int)__float_as_uint(__ldcs(rec + OFF_FLAGS));
 #if HAS_NATIVE_COLLISION
     s.feature_rec = rec + OFF_FEATURE;
 #endif
-    if (DK_ADJ_STAGE < 2 && (hd & 0xFFFFu)) s.flags |= ADJ_ROWS_SKIPPED;  // contacts (ncon) or rows (nefc)
+    if (DK_ADJ_STAGE < 2 && hd != 0) s.flags |= ADJ_ROWS_SKIPPED;  // contacts or rows
   }
   __syncwarp();
   APROF(APROF_RECORD);

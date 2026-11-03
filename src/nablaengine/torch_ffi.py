@@ -65,7 +65,7 @@ _OVERFLOW_WARN = [os.environ.get("DK_OVERFLOW_WARN", "0") not in ("", "0")]  # s
 NONFINITE_QPOS, NONFINITE_QVEL, NONFINITE_CTRL, NONFINITE_COT, NONFINITE_SHIFT = 1, 2, 4, 8, 16
 VARIANTS = tuple((kv, n) for kv in (0, 1, 2) for n in (0, 1, 2, 3))  # adjoint builds (clamp_kv, normal)
 FWD_UNIT = "dk_fwd"
-ARTIFACT_VERSION = 3
+ARTIFACT_VERSION = 4
 # the package files the library is generated from: an artifact records their hash, a different hash means stale
 SOURCES = ("cuda.py", "jax_ffi.py", "torch_ffi.py", "fixtures.py", "g1_engine/*.py", "model/*.py")
 
@@ -280,7 +280,7 @@ def build(arch, model_dir=None, model=None, foot_pairs=None, set_current=True, c
                 qpos0=np.asarray(m.qpos0).tolist(),
                 root_qpos_addresses=[int(m.jnt_qposadr[m.body_jntadr[r]]) for r in g1_source.free_roots(m)],
                 root_dof_addresses=[int(m.jnt_dofadr[m.body_jntadr[r]]) for r in g1_source.free_roots(m)],
-                maxcon=g1_step.maxcon(m),
+                maxcon=g1_step.maxcon(m), nefc=g1_step.nefc(m),
                 off_flags=int(g1_tape.layout(m)["flags"][0]), forward_unit=plan["forward_unit"],
                 variants=[list(v) for v in VARIANTS], kinematics_error=kin_error, timestep=float(m.opt.timestep),
                 foot_pairs=[int(p) for p in fp], arch_flags=plan["arch_flags"],
@@ -834,13 +834,13 @@ def read_diagnostics(device=None, reset=True, *, context=None):
 
 def warn_overflow(d, where="nablaengine"):
     """A RuntimeWarning when the counters d count worlds whose contacts or constraint rows exceeded the per-world
-    capacity (64 contacts, 192 rows): the ones beyond were dropped, so those worlds miss support and friction forces
+    compiled capacity: the ones beyond were dropped, so those worlds miss support and friction forces
     (as jax_ffi.warn_overflow). The worlds of a call: info[:, 3] & OVERFLOW_CONTACTS / OVERFLOW_ROWS of forward()."""
     import warnings
     nc, nr = d.get("fwd_contact_overflow_worlds", 0), d.get("fwd_row_overflow_worlds", 0)
     if nc or nr:
-        warnings.warn(f"{where}: {nc} world-steps exceeded the contact capacity (64 per world) and {nr} the constraint-"
-                      f"row capacity (192); their extra contacts / rows were dropped, so those worlds miss support and "
+        warnings.warn(f"{where}: {nc} world-steps exceeded the compiled contact capacity and {nr} the constraint-"
+                      f"row capacity; their extra contacts / rows were dropped, so those worlds miss support and "
                       f"friction forces (e.g. deep interpenetration). See docs/api_torch.md, Diagnostics.",
                       RuntimeWarning, stacklevel=3)
     return nc + nr

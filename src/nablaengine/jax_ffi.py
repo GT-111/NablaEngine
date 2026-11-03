@@ -186,7 +186,7 @@ DIAG = ("fwd_calls", "fwd_worlds", "fwd_unsupported_worlds", "fwd_iteration_limi
         "nonfinite_qpos_rows", "nonfinite_qvel_rows", "nonfinite_ctrl_rows", "nonfinite_cotangent_rows",
         "replay_mismatch_worlds", "fwd_contact_overflow_worlds", "fwd_row_overflow_worlds")
 # info[:, 3] bits of a forward (the step kernels' s.unsupported, over the call's substeps): a world had more contacts
-# than MAXCON (64) or more constraint rows than NEFC (192); the ones beyond are dropped (their forces are missing)
+# than compiled MAXCON or more constraint rows than NEFC; the ones beyond are dropped (their forces are missing)
 OVERFLOW_CONTACTS, OVERFLOW_ROWS = 4, 16
 _OVERFLOW_WARN = [os.environ.get("DK_OVERFLOW_WARN", "0") not in ("", "0")]  # set_overflow_warnings
 # the last forward call's record (k_last_fwd; EnginePhysics.stats): worlds, contacts summed over the worlds, contacts
@@ -1098,7 +1098,7 @@ def init(model_dir=None, model=None, foot_pairs=None, com_body_id=None):
         info = dict(path=str(path), key=key, arch=arch, built=built, version=nablaengine.__version__, commit=commit,
                     dirty=dirty, rec_words=rec, nq=m.nq, nv=m.nv, nu=m.nu,
                     nbody=m.nbody, nr=nr, com_width=3*nr, com_body_ids=com_ids, kinematics_error=kin_error,
-                    maxcon=g1_step.maxcon(m), nefc=g1_step.NEFC,
+                    maxcon=g1_step.maxcon(m), nefc=g1_step.nefc(m),
                     sizeof_sim=int(sz[0, 0]), sizeof_adj={_tag(v): int(r[1]) for v, r in zip(VARIANTS, sz)},
                     variants=[list(v) for v in VARIANTS], timestep=float(m.opt.timestep), torso_id=int(torso),
                     foot_pairs=[int(p) for p in fp], consts_sha256=chash,
@@ -1449,13 +1449,13 @@ def decode_diagnostics(arr):
 
 def warn_overflow(d, where="nablaengine"):
     """A RuntimeWarning when the counters d count worlds whose contacts or constraint rows exceeded the per-world
-    capacity (MAXCON = 64 contacts, NEFC = 192 rows): the ones beyond were dropped, so those worlds miss support and
+    compiled capacity: the ones beyond were dropped, so those worlds miss support and
     friction forces. The worlds of a call: info[:, 3] & OVERFLOW_CONTACTS / OVERFLOW_ROWS of forward()."""
     import warnings
     nc, nr = d.get("fwd_contact_overflow_worlds", 0), d.get("fwd_row_overflow_worlds", 0)
     if nc or nr:
-        warnings.warn(f"{where}: {nc} world-steps exceeded the contact capacity (64 per world) and {nr} the constraint-"
-                      f"row capacity (192); their extra contacts / rows were dropped, so those worlds miss support and "
+        warnings.warn(f"{where}: {nc} world-steps exceeded the compiled contact capacity and {nr} the constraint-"
+                      f"row capacity; their extra contacts / rows were dropped, so those worlds miss support and "
                       f"friction forces (e.g. deep interpenetration). See docs/api.md, Diagnostics.", RuntimeWarning,
                       stacklevel=3)
     return nc + nr
