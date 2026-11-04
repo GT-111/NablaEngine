@@ -33,6 +33,12 @@ import numpy as np
 def _tables(m, geoms):
     meshes = sorted({int(m.geom_dataid[g]) for g in geoms if m.geom_type[g] == mujoco.mjtGeom.mjGEOM_MESH})
     mesh_index = {mesh: i for i, mesh in enumerate(meshes)}
+    bounds = np.asarray(m.geom_size[geoms], np.float32).copy()
+    for i, g in enumerate(geoms):
+        if m.geom_type[g] == mujoco.mjtGeom.mjGEOM_MESH:
+            mesh = int(m.geom_dataid[g])
+            va, vn = int(m.mesh_vertadr[mesh]), int(m.mesh_vertnum[mesh])
+            bounds[i] = np.max(np.abs(np.asarray(m.mesh_vert[va:va + vn], np.float32)), axis=0)
     info, vert, graph, extrema, mapadr, mapnum, polymap = [], [], [], [], [], [], []
     polyadr, polynum, polyvert, normal = [], [], [], []
     for mesh in meshes:
@@ -62,6 +68,7 @@ def _tables(m, geoms):
         ("cm_mesh", "i", [mesh_index.get(int(m.geom_dataid[g]), -1)
                             if m.geom_type[g] == mujoco.mjtGeom.mjGEOM_MESH else -1 for g in geoms]),
         ("cm_size", "f", m.geom_size[geoms]),
+        ("cm_bound", "f", bounds),
         ("cm_info", "i", info), ("cm_vert", "f", vert), ("cm_graph", "i", graph),
         ("cm_extrema", "i", extrema), ("cm_mapadr", "i", mapadr), ("cm_mapnum", "i", mapnum),
         ("cm_polymap", "i", polymap), ("cm_polyadr", "i", polyadr), ("cm_polynum", "i", polynum),
@@ -275,6 +282,46 @@ CM_DEVICE void quatmat(const float* q, float* r) {
   r[8]=vadd(vsub(vsub(q00,q11),q22),q33);
   r[1]=vmul(2.f,vsub(q12,q03)); r[2]=vmul(2.f,vadd(q13,q02)); r[3]=vmul(2.f,vadd(q12,q03));
   r[5]=vmul(2.f,vsub(q23,q01)); r[6]=vmul(2.f,vsub(q13,q02)); r[7]=vmul(2.f,vadd(q23,q01));
+}
+// Bounds enclose the actual packed vertices under the same float rotation as
+// native narrowphase. Directed rounding retains touching pairs, including the
+// rounding of a transformed vertex's world translation.
+CM_DEVICE float add_up(float a,float b) {
+#ifdef __CUDA_ARCH__
+  return __fadd_ru(a,b);
+#else
+  double exact=double(a)+double(b); float result=float(exact);
+  return double(result)<exact ? nextafterf(result,HUGE_VALF) : result;
+#endif
+}
+CM_DEVICE float mul_up(float a,float b) {
+#ifdef __CUDA_ARCH__
+  return __fmul_ru(a,b);
+#else
+  double exact=double(a)*double(b); float result=float(exact);
+  return double(result)<exact ? nextafterf(result,HUGE_VALF) : result;
+#endif
+}
+CM_DEVICE float sub_down(float a,float b) {
+#ifdef __CUDA_ARCH__
+  return __fsub_rd(a,b);
+#else
+  double exact=double(a)-double(b); float result=float(exact);
+  return double(result)>exact ? nextafterf(result,-HUGE_VALF) : result;
+#endif
+}
+CM_DEVICE void world_aabb(int g,const float* x,const float* q,float* bounds) {
+  float r[9]; quatmat(q,r);
+  for(int k=0;k<3;k++) {
+    float extent=mul_up(fabsf(r[3*k]),cm_bound[3*g]);
+    extent=add_up(extent,mul_up(fabsf(r[3*k+1]),cm_bound[3*g+1]));
+    extent=add_up(extent,mul_up(fabsf(r[3*k+2]),cm_bound[3*g+2]));
+    bounds[k]=sub_down(x[k],extent);
+    bounds[k+3]=add_up(x[k],extent);
+  }
+}
+CM_DEVICE bool aabb_overlap(const float* a,const float* b) {
+  return a[0]<=b[3] && b[0]<=a[3] && a[1]<=b[4] && b[1]<=a[4] && a[2]<=b[5] && b[2]<=a[5];
 }
 template<class T>
 CM_DEVICE void init(Obj<T>* o, int g, const float* gx, const float* gq, int seed = -1) {

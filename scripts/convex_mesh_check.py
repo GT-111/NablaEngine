@@ -90,12 +90,18 @@ class NativeGeometry:
     def __init__(self, m, geoms=None):
         self.directory = tempfile.TemporaryDirectory(prefix="nabla-convex-cpu-")
         geoms = list(range(m.ngeom)) if geoms is None else list(geoms)
+        self.ngeom = len(geoms)
         packed, layout = convex_mesh.constants(m, geoms)
         load = []
         for name, kind, size in layout:
             load.append(f"for(int i=0;i<{size};i++) {name}[i]=({ 'int' if kind == 'i' else 'float' })*p++;")
         wrapper = r'''
 extern "C" void cm_load(const float* p) { LOAD }
+extern "C" void cm_bounds(int g,const float* x,const float* q,float* out) {
+  cm::world_aabb(g,x,q,out);
+  cm::quatmat(q,out+6);
+}
+extern "C" int cm_bounds_overlap(const float* a,const float* b) { return cm::aabb_overlap(a,b); }
 extern "C" int cm_support_gap() {
   const float vertices[6]={1.f,1.f,0.f,1.f,1.00000011920928955078125f,0.f};
   const int graph[10]={2,4,0,2,0,1,1,-1,0,-1}, extrema[27]={};
@@ -184,6 +190,8 @@ extern "C" int cm_linearize(int g1,int g2,const float* x,const float* q,const in
         self.library = ctypes.CDLL(str(path / "geometry.so"))
         fp, ip = ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_int32)
         self.library.cm_load.argtypes = [fp]
+        self.library.cm_bounds.argtypes = [ctypes.c_int, fp, fp, fp]
+        self.library.cm_bounds_overlap.argtypes = [fp, fp]
         self.library.cm_forward.argtypes = [ctypes.c_int, ctypes.c_int, fp, fp, fp, ip, ip]
         self.library.cm_reverse.argtypes = [ctypes.c_int, ctypes.c_int, fp, fp, ip, fp, fp]
         self.library.cm_replay.argtypes = [ctypes.c_int, ctypes.c_int, fp, fp, ip, fp]
@@ -197,6 +205,17 @@ extern "C" int cm_linearize(int g1,int g2,const float* x,const float* q,const in
     @staticmethod
     def _int(a):
         return a.ctypes.data_as(ctypes.POINTER(ctypes.c_int32))
+
+    def bounds(self, x, q):
+        x, q = (np.ascontiguousarray(a, np.float32) for a in (x, q))
+        out = np.empty((self.ngeom, 15), np.float32)
+        for g in range(self.ngeom):
+            self.library.cm_bounds(g, self._float(x[g]), self._float(q[g]), self._float(out[g]))
+        return out[:, :6].copy(), out[:, 6:].reshape(-1, 3, 3).copy()
+
+    def bounds_overlap(self, bounds, pair=(0, 1)):
+        bounds = np.ascontiguousarray(bounds, np.float32)
+        return bool(self.library.cm_bounds_overlap(self._float(bounds[pair[0]]), self._float(bounds[pair[1]])))
 
     def forward(self, x, q, pair=(0, 1)):
         x, q = np.ascontiguousarray(x, np.float32), np.ascontiguousarray(q, np.float32)
@@ -275,6 +294,9 @@ class ConvexMeshCheck(unittest.TestCase):
     def assert_oracle(self, model, qpos=None):
         data, x, q = poses(model, qpos)
         actual, _ = self.engines[id(model)].forward(x, q)
+        if np.any(actual[:, 0] < 0):
+            bounds, _ = self.engines[id(model)].bounds(x, q)
+            self.assertTrue(self.engines[id(model)].bounds_overlap(bounds))
         expected = np.asarray([[c.dist, *c.pos, *c.frame] for c in data.contact]).reshape(-1, 13)
         for row, contact in zip(expected, data.contact):
             if contact.geom[0] != 0:
@@ -303,6 +325,50 @@ class ConvexMeshCheck(unittest.TestCase):
         # Adjacent float32 hull vertices can have distinct support values whose
         # dot products round equal in float32, selecting a different EPA face.
         self.assertEqual(self.engines[id(self.mesh)].library.cm_support_gap(), 3)
+
+    def test_world_bounds_contain_packed_hulls_and_box_corners(self):
+        rng = np.random.default_rng(93)
+        for model in (self.mesh, self.box, self.prism, self.pyramid, self.multiple, self.boxes):
+            engine = self.engines[id(model)]
+            for scale in (0., .2, 1000.):
+                x = (scale * rng.normal(size=(model.ngeom, 3))).astype(np.float32)
+                q = rng.normal(size=(model.ngeom, 4))
+                q = (q / np.linalg.norm(q, axis=1, keepdims=True)).astype(np.float32)
+                bounds, rotation = engine.bounds(x, q)
+                for g in range(model.ngeom):
+                    if model.geom_type[g] == mujoco.mjtGeom.mjGEOM_MESH:
+                        mesh = model.geom_dataid[g]
+                        va, vn = model.mesh_vertadr[mesh], model.mesh_vertnum[mesh]
+                        vertices = np.asarray(model.mesh_vert[va:va + vn], np.float32)
+                    else:
+                        signs = np.array([[a, b, c] for a in (-1, 1) for b in (-1, 1) for c in (-1, 1)])
+                        vertices = signs * np.asarray(model.geom_size[g], np.float32)
+                    transformed = vertices.astype(np.float64) @ rotation[g].astype(np.float64).T + x[g]
+                    self.assertTrue(np.all(transformed >= bounds[g, :3]))
+                    self.assertTrue(np.all(transformed <= bounds[g, 3:]))
+
+    def test_world_bounds_retain_touching_and_reject_separated_sphere_survivor(self):
+        for model in (self.mesh, self.box, self.boxes):
+            engine = self.engines[id(model)]
+            q = np.array([[1, 0, 0, 0], [1, 0, 0, 0]], np.float32)
+            x = np.zeros((2, 3), np.float32)
+            bounds, _ = engine.bounds(x, q)
+            distance = float(bounds[0, 3]) - float(bounds[1, 0])
+            x[1, 0] = distance
+            # Unequal halfsizes need not have a representable touching sum.
+            # In that case use the adjacent float on the penetrating side.
+            if float(x[1, 0]) > distance:
+                x[1, 0] = np.nextafter(x[1, 0], -np.inf, dtype=np.float32)
+            touching, _ = engine.bounds(x, q)
+            self.assertTrue(engine.bounds_overlap(touching))
+            x[1, 0] = np.nextafter(x[1, 0], -np.inf, dtype=np.float32)
+            penetrating, _ = engine.bounds(x, q)
+            self.assertTrue(engine.bounds_overlap(penetrating))
+            x[1, 0] += np.float32(.005)
+            separated, _ = engine.bounds(x, q)
+            self.assertLess(float(np.linalg.norm(x[1] - x[0])), float(model.geom_rbound.sum()))
+            self.assertFalse(engine.bounds_overlap(separated))
+            self.assertFalse(np.any(engine.forward(x, q)[0][:, 0] < 0))
 
     def test_touching_separated_rotated_and_deep_penetration(self):
         for offset, angle in ((2 * float(np.float32(.1)), 0), (0.23, .13), (.085, .21), (.174, .18)):
