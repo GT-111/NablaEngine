@@ -39,8 +39,9 @@ implementations while torch.compile traces (opaque nodes); eager calls run the s
 Diagnostics (set_diagnostics switches them): per device, the counters of jax_ffi.DIAG (forward calls and worlds, worlds at the iteration limit,
 unsupported worlds, tape flags; backward calls and rows, rows with non-finite gradients or cotangents, replay
 mismatches) are added up on the device by every call, in an int64 tensor that is never read implicitly:
-diagnostics(device) returns it, read_diagnostics() reads it into a dict (a synchronization). The backward's info
-(B,) carries the adjoint's flags | NONFINITE_* << NONFINITE_SHIFT as jax_ffi.backward's.
+diagnostics(device) returns it, read_diagnostics() reads it into a dict (a synchronization). nonfinite_rows includes
+applied-force gradients; the per-kind counters and info bits retain jax_ffi's state/control/cotangent categories.
+The backward's info (B,) carries the adjoint's flags | NONFINITE_* << NONFINITE_SHIFT as jax_ffi.backward's.
 """
 import ctypes
 import hashlib
@@ -171,7 +172,7 @@ __global__ void k_tdiag_fwd(unsigned long long* d, int nw, int nsub, int iterati
   }
 }
 __global__ void k_tdiag_bwd(unsigned long long* d, int nw, const float* gq, const float* gv, const float* gu,
-                            const float* cq, const float* cv, int* info) {
+                            const float* cq, const float* cv, const float* gf, int* info) {
   unsigned rows = 0, rq = 0, rv = 0, ru = 0, rc = 0, rm = 0;
   for (int w = blockIdx.x * blockDim.x + threadIdx.x; w < nw; w += gridDim.x * blockDim.x) {
     unsigned b = (all_finite(gq + (size_t)w * NQ, NQ) ? 0u : (unsigned)NONFINITE_QPOS)
@@ -181,7 +182,8 @@ __global__ void k_tdiag_bwd(unsigned long long* d, int nw, const float* gq, cons
                                                                                                 : (unsigned)NONFINITE_COT);
     int f = info[w];
     info[w] = f | (int)(b << NONFINITE_SHIFT);
-    rows += (b & 7u) != 0; rq += (b & NONFINITE_QPOS) != 0; rv += (b & NONFINITE_QVEL) != 0;
+    rows += (b & 7u) != 0 || (gf && !all_finite(gf + (size_t)w * NV, NV));
+    rq += (b & NONFINITE_QPOS) != 0; rv += (b & NONFINITE_QVEL) != 0;
     ru += (b & NONFINITE_CTRL) != 0; rc += (b & NONFINITE_COT) != 0; rm += (f & ADJ_REPLAY_MISMATCH) != 0;
   }
   diag_add(d, D_NONFINITE_ROWS, rows); diag_add(d, D_NONFINITE_QPOS_ROWS, rq); diag_add(d, D_NONFINITE_QVEL_ROWS, rv);
@@ -199,8 +201,8 @@ extern "C" int dk_torch_diag_fwd(cudaStream_t st, unsigned long long* d, int nw,
   return (int)cudaGetLastError();
 }
 extern "C" int dk_torch_diag_bwd(cudaStream_t st, unsigned long long* d, int nw, const float* gq, const float* gv,
-                                 const float* gu, const float* cq, const float* cv, int* info) {
-  k_tdiag_bwd<<<diag_grid(nw), 256, 0, st>>>(d, nw, gq, gv, gu, cq, cv, info);
+                                 const float* gu, const float* cq, const float* cv, const float* gf, int* info) {
+  k_tdiag_bwd<<<diag_grid(nw), 256, 0, st>>>(d, nw, gq, gv, gu, cq, cv, gf, info);
   return (int)cudaGetLastError();
 }
 """
@@ -467,7 +469,7 @@ def _bind(lib, info):
     for name in ("dk_torch_diag_fwd", "dk_torch_diag_bwd"):
         fns[name] = getattr(lib, name)
     fns["dk_torch_diag_fwd"].argtypes = [vp, vp, i32, i32, i32, vp, vp]
-    fns["dk_torch_diag_bwd"].argtypes = [vp, vp, i32] + [vp] * 6
+    fns["dk_torch_diag_bwd"].argtypes = [vp, vp, i32] + [vp] * 7
     return fns
 
 
@@ -592,11 +594,10 @@ def _forward_impl(qpos, qvel, warm, ctrl, friction, com, qfrc_applied, kp_scale,
     if B == 0:
         return [q1, v1, w1, info, tp] + kin
     fns = context._state["fns"]
-    con = torch.empty((B, context.info["maxcon"] * 8), **kw)  # the last substep's contacts (unused, as jax_ffi)
     work = torch.empty((max(int(fns["work_bytes"](B)), 1),), dtype=torch.uint8, device=qpos.device)
     st = torch.cuda.current_stream(dev).cuda_stream
     _rc(fns["forward"](st, B, *map(_ptr, (qpos, qvel, warm, ctrl, friction, com)), iterations, substeps, _ptr(q1),
-                       _ptr(v1), _ptr(w1), _ptr(info), _ptr(con), _ptr(tp) if tape else None, _ptr(work),
+                       _ptr(v1), _ptr(w1), _ptr(info), None, _ptr(tp) if tape else None, _ptr(work),
                        _ptr(qfrc_applied), _ptr(kp_scale)),
         "the forward launch")
     if kinematics:
@@ -659,7 +660,7 @@ def _backward_impl(tape, friction, com, g_qpos, g_qvel, ctrl, kin_state, kin_cot
                           _ptr(qfrc_applied), _ptr(kp_scale), _ptr(gf)),
         "the adjoint launch")
     if context._diagnostics_on:
-        _diag_backward(context, dev, st, gq, gv, gu, cq, cv, info)
+        _diag_backward(context, dev, st, gq, gv, gu, cq, cv, gf if qfrc_applied is not None else None, info)
     return [gq, gv, gu, info, gf]
 
 
@@ -797,10 +798,10 @@ def _diag_forward(context, dev, st, info, tape, iterations, substeps):
                                             _ptr(tape)), "the forward diagnostics launch")
 
 
-def _diag_backward(context, dev, st, gq, gv, gu, cq, cv, info):
+def _diag_backward(context, dev, st, gq, gv, gu, cq, cv, gf, info):
     """The backward's counters added on the device and the non-finite bits into info (one kernel, dk_torch_diag_bwd:
     as jax_ffi's k_diag_bwd)."""
-    _rc(context._state["fns"]["dk_torch_diag_bwd"](st, _ptr(context._diag[dev]), info.shape[0], *map(_ptr, (gq, gv, gu, cq, cv)),
+    _rc(context._state["fns"]["dk_torch_diag_bwd"](st, _ptr(context._diag[dev]), info.shape[0], *map(_ptr, (gq, gv, gu, cq, cv, gf)),
                                             _ptr(info)), "the backward diagnostics launch")
 
 

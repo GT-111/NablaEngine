@@ -13,6 +13,7 @@ import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
+from types import SimpleNamespace
 
 import torch
 
@@ -49,6 +50,131 @@ def inputs(context, device="cpu", requires_grad=False):
 
 
 class ContextChecks(unittest.TestCase):
+    def test_forward_skips_contact_output_and_backward_routes_force_diagnostics(self):
+        from unittest.mock import Mock
+
+        with contexts() as owners, patch.object(F, "_ready", return_value=0), \
+                patch.object(F, "_check"), \
+                patch.object(torch.cuda, "current_stream", return_value=SimpleNamespace(cuda_stream=17)):
+            owner = owners[0]
+            owner.info["maxcon"] = 256
+            native_forward, native_adjoint = Mock(return_value=0), Mock(return_value=0)
+            owner._state["fns"] = dict(forward=native_forward, work_bytes=lambda _: 1,
+                                        adjoint={(0, 3): native_adjoint})
+            q, v, w, u, fr, com, force, kp = inputs(owner)
+            owner._diagnostics_on = False
+            result = F._forward_impl(q, v, w, u, fr, com, force, kp, 10, 4, True, False, owner.context_id)
+            self.assertIsNone(native_forward.call_args.args[14])  # optional contact presentation output
+            self.assertEqual(len(result), 5)
+            self.assertEqual(result[4].shape, (2, 4 * owner.info["rec_words"]))
+            owner._diagnostics_on = True
+            for applied in (None, force):
+                with patch.object(F, "_diag_backward") as diag:
+                    grads = F._backward_impl(result[4], fr, com, q, v, None, [], [], 4, 0, 3, 0.,
+                                             applied, kp, owner.context_id)
+                self.assertIs(diag.call_args.args[8], None if applied is None else grads[4])
+
+    @unittest.skipUnless(shutil.which("c++"), "contact output check requires a C++ compiler")
+    def test_contact_output_is_optional_in_both_forward_kernels(self):
+        from nablaengine.g1_engine.host import KERNEL
+
+        # Execute both actual presentation writers; internal collision/row work is outside these fragments.
+        fused = KERNEL.split("__global__ void k_substep(", 1)[1].split("// The split forward:", 1)[0]
+        fused = fused[fused.index("  if (ocon)"):].rsplit("\n}", 1)[0]
+        split = KERNEL.split("__device__ __forceinline__ void pre_world(", 1)[1].split("template <class S>", 1)[0]
+        split = split[split.index("  if (ocon &&"):].split("#ifdef DK_PROFILE", 1)[0]
+        source = r'''#include <algorithm>
+#include <cassert>
+#include <cstddef>
+using std::min;
+constexpr int MAXCON = 2;
+struct Contacts {
+  int ncon = 1, con_pair[2] = {7, 8};
+  float con_dist[2] = {-.5f, .75f}, con_pos[2][3] = {{1, 2, 3}, {4, 5, 6}};
+  float con_frame[2][3] = {{7, 8, 9}, {10, 11, 12}};
+};
+void fused(const Contacts& s, int lane, int w, float* ocon) {
+''' + fused + r'''
+}
+void split(const Contacts& s, int lane, int w, float* ocon, int k, int nsub) {
+  int ncon = min(s.ncon, MAXCON);
+''' + split + r'''
+}
+int main() {
+  Contacts s;
+  const float expected[16] = {7, -.5f, 1, 2, 3, 7, 8, 9, -1, 0, 0, 0, 0, 0, 0, 0};
+  for (bool use_split : {false, true}) {
+    float out[32]; std::fill(out, out + 32, -99.f);
+    for (int lane = 0; lane < 32; ++lane) {
+      if (use_split) {
+        split(s, lane, 1, nullptr, 3, 4);
+        split(s, lane, 1, out, 2, 4);
+      } else fused(s, lane, 1, nullptr);
+    }
+    for (float value : out) assert(value == -99.f);
+    for (int lane = 0; lane < 32; ++lane) {
+      if (use_split) split(s, lane, 1, out, 3, 4);
+      else fused(s, lane, 1, out);
+    }
+    assert(std::equal(out + 16, out + 32, expected));
+    for (int i = 0; i < 16; ++i) assert(out[i] == -99.f);
+  }
+}
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            (path/"contacts.cc").write_text(source)
+            subprocess.run(("c++", "-std=c++17", str(path/"contacts.cc"), "-o", str(path/"contacts")), check=True)
+            subprocess.run((str(path/"contacts"),), check=True)
+
+    @unittest.skipUnless(shutil.which("c++"), "diagnostic scan check requires a C++ compiler")
+    def test_nonfinite_force_gradient_counts_once_without_changing_legacy_bits(self):
+        from nablaengine.g1_engine.adjoint import ADJ_REPLAY_MISMATCH
+
+        finite = F.TORCH_UNIT.split("__device__ __forceinline__ bool all_finite", 1)[1].split("__global__", 1)[0]
+        backward = F.TORCH_UNIT.split("__global__ void k_tdiag_bwd", 1)[1].split("unsigned diag_grid", 1)[0]
+        defines = [(f"D_{name.upper()}", i) for i, name in enumerate(F.DIAG)]
+        defines += [(name, getattr(F, name)) for name in
+                    ("NONFINITE_QPOS", "NONFINITE_QVEL", "NONFINITE_CTRL", "NONFINITE_COT", "NONFINITE_SHIFT")]
+        defines += [("ADJ_REPLAY_MISMATCH", ADJ_REPLAY_MISMATCH)]
+        source = "\n".join(f"#define {name} {value}" for name, value in defines) + r'''
+#include <algorithm>
+#include <cassert>
+#include <cmath>
+#include <cstddef>
+#include <limits>
+using std::isfinite;
+constexpr int NQ = 2, NV = 3, NU = 1;
+struct { int x; } blockIdx{0}, threadIdx{0}, blockDim{1}, gridDim{1};
+void diag_add(unsigned long long* d, int k, unsigned value) { d[k] += value; }
+void atomicAdd(unsigned long long* d, unsigned long long value) { *d += value; }
+bool all_finite''' + finite + "void k_tdiag_bwd" + backward + r'''
+int main() {
+  float gq[6]{}, gv[9]{}, gu[3]{}, cq[6]{}, cv[9]{}, gf[9]{}, finite_force[9]{};
+  gf[2] = std::numeric_limits<float>::quiet_NaN();
+  gf[5] = std::numeric_limits<float>::infinity();
+  gf[8] = gu[2] = std::numeric_limits<float>::quiet_NaN();
+  const float* forces[] = {gf, finite_force, nullptr};
+  for (const float* force : forces) {
+    unsigned long long d[18]{};
+    int info[3] = {ADJ_REPLAY_MISMATCH, 0, 0};
+    k_tdiag_bwd(d, 3, gq, gv, gu, cq, cv, force, info);
+    assert(d[D_NONFINITE_ROWS] == (force == gf ? 3 : 1));
+    assert(d[D_NONFINITE_CTRL_ROWS] == 1);
+    assert(d[D_NONFINITE_QPOS_ROWS] == 0 && d[D_NONFINITE_QVEL_ROWS] == 0);
+    assert(d[D_NONFINITE_COTANGENT_ROWS] == 0 && d[D_REPLAY_MISMATCH_WORLDS] == 1);
+    assert(d[D_BWD_CALLS] == 1 && d[D_BWD_ROWS] == 3);
+    assert(info[0] == ADJ_REPLAY_MISMATCH && info[1] == 0);
+    assert(info[2] == (NONFINITE_CTRL << NONFINITE_SHIFT));
+  }
+}
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            (path/"diagnostics.cc").write_text(source)
+            subprocess.run(("c++", "-std=c++17", str(path/"diagnostics.cc"), "-o", str(path/"diagnostics")), check=True)
+            subprocess.run((str(path/"diagnostics"),), check=True)
+
     def test_old_tape_artifact_is_refused_before_loading_its_library(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
