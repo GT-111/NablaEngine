@@ -144,7 +144,7 @@ class GenerationCheck(unittest.TestCase):
                      "static_assert(row_tiles(SimNfull{}) == (NEFC + 31) / 32);\n"
                      "static_assert(sizeof(Hand) > 0);\n"
                      "#if HAS_NATIVE_COLLISION\n"
-                     "static_assert(Sim::CM_WORKERS == 1 && SimP::CM_WORKERS == 4);\n"
+                     "static_assert(Sim::CM_WORKERS == 1 && SimP::CM_WORKERS == 32);\n"
                      "static_assert(sizeof(Hand::cm_storage) / sizeof(CMScratch) == SimP::CM_WORKERS);\n"
                      "static_assert(sizeof(Hand::cm_manifolds) / sizeof(CMManifold) == SimP::CM_WORKERS);\n"
                      "#endif\n")
@@ -169,7 +169,7 @@ class GenerationCheck(unittest.TestCase):
 #include <mutex>
 #include <thread>
 #include <vector>
-constexpr int NPAIR=13;
+constexpr int NPAIR=67;
 int MAXCON;
 int c_gtype[2*NPAIR];
 #define PG1(pair) (2*(pair))
@@ -230,17 +230,17 @@ int main() {
     c_gtype[2*pair]=pair%4==3 ? 1 : (pair%4==1 || pair%4==2 ? 3 : 4);
     c_gtype[2*pair+1]=pair%4==3 ? 2 : (pair%4==2 ? 3 : 4);
   }
-  for(int capacity: {5,128})for(int ncand: {0,1,3,4,5,13}) {
+  for(int capacity: {5,2+8*NPAIR})for(int ncand: {0,1,3,4,5,13,31,32,33,63,64,65,67}) {
     MAXCON=capacity;
     State<1> serial;workers=1;
     Barrier one(1);barrier=&one;run(serial,0,ncand);
-    State<4> parallel;workers=4;
-    Barrier four(4);barrier=&four;
+    State<32> parallel;workers=32;
+    Barrier warp(32);barrier=&warp;
     std::vector<std::thread> lanes;
-    for(int lane=0;lane<4;lane++)lanes.emplace_back([&,lane]{run(parallel,lane,ncand);});
+    for(int lane=0;lane<32;lane++)lanes.emplace_back([&,lane]{run(parallel,lane,ncand);});
     for(auto& lane:lanes)lane.join();
     if(serial.ncon!=parallel.ncon || serial.unsupported!=parallel.unsupported || serial.stored!=parallel.stored)return 1;
-    if(ncand==13 && parallel.unsupported!=(capacity==5 ? 36 : 32))return 2;
+    if(ncand==NPAIR && parallel.unsupported!=(capacity==5 ? 36 : 32))return 2;
     for(size_t i=1;i<parallel.stored.size();i++) {
       auto a=parallel.stored[i-1],b=parallel.stored[i];
       if(a.pair>b.pair || (a.pair==b.pair && a.slot>=b.slot))return 3;

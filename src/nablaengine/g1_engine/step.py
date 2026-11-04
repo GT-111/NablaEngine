@@ -2233,7 +2233,7 @@ typedef SimNT<MAXCON, NEFC> SimNfull;  // the worlds beyond it (Hand::big)
 
 struct Hand {
 #if HAS_NATIVE_COLLISION
-  static constexpr int CM_WORKERS = 4;
+  static constexpr int CM_WORKERS = 32;
   CMScratch cm_storage[CM_WORKERS];
   CMManifold cm_manifolds[CM_WORKERS];
 #endif
