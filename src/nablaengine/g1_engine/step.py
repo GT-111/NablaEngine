@@ -371,6 +371,9 @@ struct Sim {
   alignas(16) float cbuf[72];  // CHOL_SOLVE's scratch (chol_solve_bcast)
   float com[COM_WIDTH], fric;
   float gx[NGEOMC_STORAGE][3], gq[NGEOMC_STORAGE][4];  // world poses of the collision geoms
+#if HAS_NATIVE_COLLISION
+  float gaabb[NGEOMC_STORAGE][6];  // conservative native mesh/box bounds, once per geom
+#endif
   int ncon, nefc, unsupported;
   int min_nu_bits;  // tape: smallest centre / axis distance (before the radii) of a sphere or capsule self contact, as
                     // float bits (non-negative: the integer order is the float order, so atomicMin works); +inf if none
@@ -554,6 +557,9 @@ __device__ __forceinline__ void geom_poses(S& s, int lane) {
   for (int g = lane; g < NGEOMC; g += 32) {
     int b = c_gbody[g];
     geom_pose(g, s.Q[b], s.X[b], s.gx[g], s.gq[g]);
+#if HAS_NATIVE_COLLISION
+    if (c_gtype[g] >= 3) cm::world_aabb(g, s.gx[g], s.gq[g], s.gaabb[g]);
+#endif
   }
 }
 
@@ -1722,6 +1728,12 @@ __device__ void substep_pre(S& s, const float* ctrl, int lane, float* rec, const
         } else {
           float rb = RADD(c_grbound[g1], c_grbound[g2]);
           keep = dot3(dif, dif) <= RFMA(RMUL(rb, rb), 1.f + 1e-5f, 1e-12f);
+#if HAS_NATIVE_COLLISION
+          // Elongated mesh/box bounds are much tighter than their spheres.
+          // Reject only strict separation; native touching contacts are retained.
+          if (keep && (c_gtype[g2] == 4 || (c_gtype[g1] == 3 && c_gtype[g2] == 3)))
+            keep = cm::aabb_overlap(s.gaabb[g1], s.gaabb[g2]);
+#endif
         }
       }
       unsigned bal = __ballot_sync(0xffffffffu, keep);
@@ -2235,7 +2247,13 @@ struct SimP {  // substep_pre: smooth dynamics, qacc_smooth, collision, contact 
   union {  // the smooth phase's body quantities, then qacc_smooth's factor, then the collision's geoms and candidates
     struct { float AL[NB][3], A[NB][3], F[NB][3], N[NB][3], J[NB][10]; };
     struct { float L[NTRI]; alignas(16) float cbuf[72]; };  // CHOL_SOLVE's scratch
-    struct { float gx[NGEOMC_STORAGE][3], gq[NGEOMC_STORAGE][4], con_dot[MAXCON][3]; unsigned short cand[NPAIR_STORAGE]; };
+    struct {
+      float gx[NGEOMC_STORAGE][3], gq[NGEOMC_STORAGE][4];
+#if HAS_NATIVE_COLLISION
+      float gaabb[NGEOMC_STORAGE][6];
+#endif
+      float con_dot[MAXCON][3]; unsigned short cand[NPAIR_STORAGE];
+    };
   };
   float* M;  // in Hand (the stores of the CRB, the loads of qacc_smooth's factorization)
   float qpos[NQ], qvel[NV], zero[NV], qsm[NV], qacc0[NV];
