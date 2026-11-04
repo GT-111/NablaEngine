@@ -226,20 +226,22 @@ extern "C" int @PFX@_upload(const float* p, cudaStream_t st) {
 }
 // ctrl, clamp_soft: the soft clamp's (DK_ADJ_CLAMP_KV=2: the step's ctrl, required, and delta); the other units ignore
 // them (their k_adjoint gets nullptr as before and has no delta argument)
+extern "C" long long @PFX@_adj_work_bytes(int nw) { return (long long)adj_work_bytes(nw); }
 extern "C" int @PFX@_adjoint(cudaStream_t st, int nw, int nsub, const float* tape, const float* fric, const float* com,
                            const float* gq_out, const float* gv_out, float* gq_in, float* gv_in, float* gctrl,
                            int* info, const float* ctrl, float clamp_soft, const float* qfrc,
-                           const float* kp_scale, float* gqfrc) {
+                           const float* kp_scale, float* gqfrc, void* work) {
   int dev = -1;
   cudaError_t e = cudaGetDevice(&dev);
   if (e != cudaSuccess) return (int)e;
   if (dev < 0 || dev >= @MAX_DEVICES@ || g_adj_smem[dev] == 0)  // ensure_ready() uploads before the first launch
     return (int)cudaErrorInvalidConfiguration;
   if (DK_ADJ_CLAMP_KV == 2 && !ctrl) return (int)cudaErrorInvalidValue;
+  if (adj_work_bytes(nw) && !work) return (int)cudaErrorInvalidValue;
   (void)clamp_soft;
   k_adjoint<<<nw, 32, g_adj_smem[dev], st>>>(nw, nsub, tape, fric, com, gq_out, gv_out, gq_in, gv_in, gctrl, info,
                                              nullptr, DK_ADJ_CLAMP_KV == 2 ? ctrl : nullptr ADJ_SOFT_ARG(clamp_soft),
-                                             qfrc, kp_scale, gqfrc);
+                                             qfrc, kp_scale, gqfrc, work);
   return (int)cudaGetLastError();
 }
 // the launch on device dev (after its upload): o[0] the dynamic shared memory, o[1] the resident worlds per SM
@@ -311,7 +313,8 @@ namespace ffi = xla::ffi;
 @DEFINES@
 typedef int (*UploadFn)(const float*, cudaStream_t);
 typedef int (*AdjointFn)(cudaStream_t, int, int, const float*, const float*, const float*, const float*, const float*,
-                         float*, float*, float*, int*, const float*, float, const float*, const float*, float*);
+                         float*, float*, float*, int*, const float*, float, const float*, const float*, float*, void*);
+typedef long long (*WorkBytesFn)(int);
 typedef int (*ForwardFn)(cudaStream_t, int, const float*, const float*, const float*, const float*, const float*,
                          const float*, int, int, float*, float*, float*, int*, float*, float*, void*, const float*,
                          const float*);
@@ -609,14 +612,14 @@ struct KinBwd {
 };
 
 // ctrl: the control step's (B, nu) for clamp_kv 2 (dk_step_bwd_soft), null for 0 / 1 (dk_step_bwd); clamp_soft: 2's
-// delta; kin (with scratch): null, or the kinematics outputs' VJP inputs (the combined cotangents in scratch memory)
-static ffi::Error bwd_impl(cudaStream_t st, ffi::Buffer<ffi::F32> tape, ffi::Buffer<ffi::F32> fric,
+// delta; kin: null, or the kinematics outputs' VJP inputs (the combined cotangents in scratch memory)
+static ffi::Error bwd_impl(cudaStream_t st, ffi::ScratchAllocator& scratch, ffi::Buffer<ffi::F32> tape,
+                           ffi::Buffer<ffi::F32> fric,
                            ffi::Buffer<ffi::F32> com, const ffi::Buffer<ffi::F32>* ctrl, ffi::Buffer<ffi::F32> gq_out,
                            ffi::Buffer<ffi::F32> gv_out, int32_t substeps, int32_t clamp_kv, int32_t normal,
                            float clamp_soft, ffi::Result<ffi::Buffer<ffi::F32>> gq,
                            ffi::Result<ffi::Buffer<ffi::F32>> gv, ffi::Result<ffi::Buffer<ffi::F32>> gu,
-                           ffi::Result<ffi::Buffer<ffi::S32>> info, const KinBwd* kin = nullptr,
-                           ffi::ScratchAllocator* scratch = nullptr) {
+                           ffi::Result<ffi::Buffer<ffi::S32>> info, const KinBwd* kin = nullptr) {
   auto d = tape.dimensions();
   if (substeps < 1 || d.size() != 2 || d[1] != (int64_t)substeps * REC_WORDS)
     return bad("tape must be (B, substeps * REC_WORDS) float32");
@@ -639,9 +642,15 @@ static ffi::Error bwd_impl(cudaStream_t st, ffi::Buffer<ffi::F32> tape, ffi::Buf
   if (B == 0) return ffi::Error::Success();
   ffi::Error r = ensure_ready(st);
   if (r.failure()) return r;
+  void* work = nullptr;
+  if (const long long wb = kAdjWorkBytes[clamp_kv][normal]((int)B)) {
+    std::optional<void*> a = scratch.Allocate((size_t)wb, 16);
+    if (!a) return ffi::Error::Internal("nablaengine.jax_ffi: no scratch memory for the adjoint's work buffer");
+    work = *a;
+  }
   const float *cq = gq_out.typed_data(), *cv = gv_out.typed_data();  // the cotangents of (qpos', qvel')
   if (kin) {  // + the kinematics outputs' pulled back onto (qpos', qvel'), in scratch memory (freed in stream order)
-    std::optional<void*> a = scratch->Allocate((size_t)B * (NQ + NV) * sizeof(float), 16);
+    std::optional<void*> a = scratch.Allocate((size_t)B * (NQ + NV) * sizeof(float), 16);
     if (!a) return ffi::Error::Internal("nablaengine.jax_ffi: no scratch memory for the combined cotangents");
     float* sq = static_cast<float*>(*a);
     float* sv = sq + (size_t)B * NQ;
@@ -654,29 +663,33 @@ static ffi::Error bwd_impl(cudaStream_t st, ffi::Buffer<ffi::F32> tape, ffi::Buf
   }
   int rc = adj(st, (int)B, substeps, tape.typed_data(), fric.typed_data(), com.typed_data(), cq, cv, gq->typed_data(),
                gv->typed_data(), gu->typed_data(), info->typed_data(), ctrl ? ctrl->typed_data() : nullptr,
-               clamp_soft, nullptr, nullptr, nullptr);
+               clamp_soft, nullptr, nullptr, nullptr, work);
   if (rc) return cuda_error((cudaError_t)rc, "k_adjoint launch");
   k_diag_bwd<<<diag_grid(B), 256, 0, st>>>((int)B, gq->typed_data(), gv->typed_data(), gu->typed_data(), cq, cv,
                                             info->typed_data());
   return cuda_error(cudaGetLastError(), "k_diag_bwd launch");
 }
 
-static ffi::Error step_bwd_impl(cudaStream_t st, ffi::Buffer<ffi::F32> tape, ffi::Buffer<ffi::F32> fric,
+static ffi::Error step_bwd_impl(cudaStream_t st, ffi::ScratchAllocator scratch, ffi::Buffer<ffi::F32> tape,
+                                ffi::Buffer<ffi::F32> fric,
                                 ffi::Buffer<ffi::F32> com, ffi::Buffer<ffi::F32> gq_out, ffi::Buffer<ffi::F32> gv_out,
                                 int32_t substeps, int32_t clamp_kv, int32_t normal,
                                 ffi::Result<ffi::Buffer<ffi::F32>> gq, ffi::Result<ffi::Buffer<ffi::F32>> gv,
                                 ffi::Result<ffi::Buffer<ffi::F32>> gu, ffi::Result<ffi::Buffer<ffi::S32>> info) {
-  return bwd_impl(st, tape, fric, com, nullptr, gq_out, gv_out, substeps, clamp_kv, normal, 0.f, gq, gv, gu, info);
+  return bwd_impl(st, scratch, tape, fric, com, nullptr, gq_out, gv_out, substeps, clamp_kv, normal, 0.f,
+                  gq, gv, gu, info);
 }
 
 // clamp_kv 2: the soft clamp's backward, with the step's ctrl (B, nu) and delta (attribute clamp_soft, float32)
-static ffi::Error step_bwd_soft_impl(cudaStream_t st, ffi::Buffer<ffi::F32> tape, ffi::Buffer<ffi::F32> fric,
+static ffi::Error step_bwd_soft_impl(cudaStream_t st, ffi::ScratchAllocator scratch, ffi::Buffer<ffi::F32> tape,
+                                     ffi::Buffer<ffi::F32> fric,
                                      ffi::Buffer<ffi::F32> com, ffi::Buffer<ffi::F32> ctrl,
                                      ffi::Buffer<ffi::F32> gq_out, ffi::Buffer<ffi::F32> gv_out, int32_t substeps,
                                      int32_t normal, float clamp_soft, ffi::Result<ffi::Buffer<ffi::F32>> gq,
                                      ffi::Result<ffi::Buffer<ffi::F32>> gv, ffi::Result<ffi::Buffer<ffi::F32>> gu,
                                      ffi::Result<ffi::Buffer<ffi::S32>> info) {
-  return bwd_impl(st, tape, fric, com, &ctrl, gq_out, gv_out, substeps, 2, normal, clamp_soft, gq, gv, gu, info);
+  return bwd_impl(st, scratch, tape, fric, com, &ctrl, gq_out, gv_out, substeps, 2, normal, clamp_soft,
+                  gq, gv, gu, info);
 }
 
 // dk_step_bwd / dk_step_bwd_soft of a step with kinematics outputs: + the output state q1, v1 and the cotangents
@@ -686,8 +699,8 @@ static ffi::Error step_bwd_kin_impl(cudaStream_t st, ffi::ScratchAllocator scrat
                                     BufF gcv, BufF gsc, int32_t substeps, int32_t clamp_kv, int32_t normal, RetF gq,
                                     RetF gv, RetF gu, ffi::Result<ffi::Buffer<ffi::S32>> info) {
   const KinBwd k{&q1, &v1, &gqn, &gxp, &gxq, &gcv, &gsc};
-  return bwd_impl(st, tape, fric, com, nullptr, gq_out, gv_out, substeps, clamp_kv, normal, 0.f, gq, gv, gu, info, &k,
-                  &scratch);
+  return bwd_impl(st, scratch, tape, fric, com, nullptr, gq_out, gv_out, substeps, clamp_kv, normal, 0.f,
+                  gq, gv, gu, info, &k);
 }
 static ffi::Error step_bwd_soft_kin_impl(cudaStream_t st, ffi::ScratchAllocator scratch, BufF tape, BufF fric,
                                          BufF com, BufF ctrl, BufF q1, BufF v1, BufF gq_out, BufF gv_out, BufF gqn,
@@ -695,8 +708,8 @@ static ffi::Error step_bwd_soft_kin_impl(cudaStream_t st, ffi::ScratchAllocator 
                                          float clamp_soft, RetF gq, RetF gv, RetF gu,
                                          ffi::Result<ffi::Buffer<ffi::S32>> info) {
   const KinBwd k{&q1, &v1, &gqn, &gxp, &gxq, &gcv, &gsc};
-  return bwd_impl(st, tape, fric, com, &ctrl, gq_out, gv_out, substeps, 2, normal, clamp_soft, gq, gv, gu, info, &k,
-                  &scratch);
+  return bwd_impl(st, scratch, tape, fric, com, &ctrl, gq_out, gv_out, substeps, 2, normal, clamp_soft,
+                  gq, gv, gu, info, &k);
 }
 
 // jax_ffi.kinematics: the kinematics outputs of a state (qpos, qvel, com), and their VJP (the cotangents of the
@@ -759,14 +772,14 @@ static ffi::Error last_impl(cudaStream_t st, ffi::RemainingArgs, ffi::Result<ffi
 XLA_FFI_DEFINE_HANDLER_SYMBOL(DkStep, step_impl, FWD_BIND(ffi::Ffi::Bind()));
 XLA_FFI_DEFINE_HANDLER_SYMBOL(DkStepFwd, step_fwd_impl, FWD_BIND(ffi::Ffi::Bind()).Ret<ffi::Buffer<ffi::F32>>());
 XLA_FFI_DEFINE_HANDLER_SYMBOL(DkStepBwd, step_bwd_impl,
-                              ffi::Ffi::Bind().Ctx<ffi::PlatformStream<cudaStream_t>>()
+                              ffi::Ffi::Bind().Ctx<ffi::PlatformStream<cudaStream_t>>().Ctx<ffi::ScratchAllocator>()
                                   .Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>()
                                   .Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>()
                                   .Attr<int32_t>("substeps").Attr<int32_t>("clamp_kv").Attr<int32_t>("normal")
                                   .Ret<ffi::Buffer<ffi::F32>>().Ret<ffi::Buffer<ffi::F32>>().Ret<ffi::Buffer<ffi::F32>>()
                                   .Ret<ffi::Buffer<ffi::S32>>());
 XLA_FFI_DEFINE_HANDLER_SYMBOL(DkStepBwdSoft, step_bwd_soft_impl,
-                              ffi::Ffi::Bind().Ctx<ffi::PlatformStream<cudaStream_t>>()
+                              ffi::Ffi::Bind().Ctx<ffi::PlatformStream<cudaStream_t>>().Ctx<ffi::ScratchAllocator>()
                                   .Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>()
                                   .Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>()
                                   .Attr<int32_t>("substeps").Attr<int32_t>("normal").Attr<float>("clamp_soft")
@@ -880,7 +893,8 @@ def library_sources(m, foot_pairs, forward_unit=False, target=None, com_body_id=
         decls.append(f'extern "C" int {t}_upload(const float*, cudaStream_t);')
         decls.append(f'extern "C" int {t}_adjoint(cudaStream_t, int, int, const float*, const float*, const float*, '
                      f'const float*, const float*, float*, float*, float*, int*, const float*, float, '
-                     f'const float*, const float*, float*);')
+                     f'const float*, const float*, float*, void*);')
+        decls.append(f'extern "C" long long {t}_adj_work_bytes(int);')
         decls.append(f'extern "C" void {t}_sizes(long long*);')
         decls.append(f'extern "C" int {t}_launch(int, long long*);')
     decls.append(f'extern "C" int {fp}_forward(cudaStream_t, int, const float*, const float*, '
@@ -908,6 +922,10 @@ def library_sources(m, foot_pairs, forward_unit=False, target=None, com_body_id=
                  + "};")
     adj = [[f"{_tag((kv, n))}_adjoint" if (kv, n) in VARIANTS else "nullptr" for n in range(4)] for kv in range(3)]
     decls.append("static const AdjointFn kAdjoint[3][4] = {" + ", ".join("{" + ", ".join(r) + "}" for r in adj) + "};")
+    work = [[f"{_tag((kv, n))}_adj_work_bytes" if (kv, n) in VARIANTS else "nullptr"
+             for n in range(4)] for kv in range(3)]
+    decls.append("static const WorkBytesFn kAdjWorkBytes[3][4] = {"
+                 + ", ".join("{" + ", ".join(r) + "}" for r in work) + "};")
     decls.append(f"static const ForwardFn kForward = {fp}_forward;")
     decls.append(f"static long long (*const kWorkBytes)(int) = {fp}_work_bytes;")
     units["dk_ffi.cu"] = FFI_UNIT.replace("@DEFINES@", "\n".join(defs)).replace("@DECLS@", "\n".join(decls))

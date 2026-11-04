@@ -131,6 +131,9 @@ class GenerationCheck(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("c++"), "state layout check requires a C++ compiler")
     def test_state_layout_compiles_with_root_count_macro(self):
+        from coupled_physics_check import native_contact_model
+        from nablaengine.g1_engine import convex_mesh
+
         sim = step.STEP_DEVICE.split("struct Sim {", 1)[1].split("// a condition that", 1)[0]
         split = step.STEP_KERNEL.split("// The split forward (host.py:", 1)[1]
         row_tiles = next(line for line in step.STEP_KERNEL.splitlines() if "constexpr int RT =" in line)
@@ -139,13 +142,119 @@ class GenerationCheck(unittest.TestCase):
                      "static_assert(row_tiles(Sim{}) == (NEFC + 31) / 32);\n"
                      "static_assert(row_tiles(SimN{}) == (SPLIT_NEFC + 31) / 32);\n"
                      "static_assert(row_tiles(SimNfull{}) == (NEFC + 31) / 32);\n"
-                     "static_assert(sizeof(Hand) > 0);\n")
-        for model in (hand_model(22, roots=2), dense_contact_model()):
+                     "static_assert(sizeof(Hand) > 0);\n"
+                     "#if HAS_NATIVE_COLLISION\n"
+                     "static_assert(Sim::CM_WORKERS == 1 && SimP::CM_WORKERS == 4);\n"
+                     "static_assert(sizeof(Hand::cm_storage) / sizeof(CMScratch) == SimP::CM_WORKERS);\n"
+                     "static_assert(sizeof(Hand::cm_manifolds) / sizeof(CMManifold) == SimP::CM_WORKERS);\n"
+                     "#endif\n")
+        for model in (hand_model(22, roots=2), dense_contact_model(),
+                      native_contact_model(mujoco, "mesh"), native_contact_model(mujoco, "box_box")):
             header = source.header(model, maxd=8, wpb=1).replace("#include <cuda_runtime.h>", "")
-            code = ("#define __device__\n" + header + step.step_header(model) + "struct Sim {" + sim
+            native = convex_mesh.header(model, step.collision_geoms(model)) if step.native_collision(model) else ""
+            code = ("#define __device__\n" + header + step.step_header(model) + native + "struct Sim {" + sim
                     + "// The split forward (host.py:" + split + instances)
             result = subprocess.run(["c++", "-std=c++17", "-fsyntax-only", "-x", "c++", "-"],
                                     input=code, text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipUnless(shutil.which("c++"), "native candidate batching check requires a C++ compiler")
+    def test_native_candidate_batch_preserves_serial_order_flags_and_partial_tiles(self):
+        batch = step.STEP_KERNEL.split(
+            "    // Each world owns a bounded candidate batch; emit in the original pair/slot order.\n", 1
+        )[1].split("\n#endif\n  }\n#endif", 1)[0]
+        harness = r'''
+#include <condition_variable>
+#include <cstdlib>
+#include <mutex>
+#include <thread>
+#include <vector>
+constexpr int NPAIR=13;
+int MAXCON;
+int c_gtype[2*NPAIR];
+#define PG1(pair) (2*(pair))
+#define PG2(pair) (2*(pair)+1)
+struct Barrier {
+  std::mutex mutex; std::condition_variable changed;
+  int size, left, generation=0;
+  explicit Barrier(int n):size(n),left(n){}
+  void wait() {
+    std::unique_lock<std::mutex> lock(mutex); int seen=generation;
+    if(--left==0){left=size;generation++;changed.notify_all();}
+    else changed.wait(lock,[&]{return generation!=seen;});
+  }
+};
+Barrier* barrier;
+void __syncwarp(){barrier->wait();}
+struct CMScratch { int lane; };
+struct CMFeature { int value; };
+struct CMContact { float dist,pos[3],frame[9]; CMFeature feature; };
+struct CMManifold { int count,status; CMContact contact[8]; };
+struct Stored {
+  int pair,slot,feature; float dist;
+  bool operator==(const Stored& other) const {
+    return pair==other.pair && slot==other.slot && feature==other.feature && dist==other.dist;
+  }
+};
+template<int W> struct State {
+  static constexpr int CM_WORKERS=W;
+  CMScratch cm_scratch[W]; CMManifold cm_manifolds[W];
+  int cand[NPAIR],ncon=2,unsupported=0;
+  float gx[2*NPAIR][3]={},gq[2*NPAIR][4]={};
+  std::vector<Stored> stored;
+  State(){for(int i=0;i<W;i++)cm_scratch[i].lane=i;for(int i=0;i<NPAIR;i++)cand[i]=i;}
+};
+int workers;
+void convex_manifold(int g1,int g2,const float*,const float*,CMScratch* scratch,CMManifold* result) {
+  int pair=g1/2;
+  if(scratch->lane!=pair%workers)std::abort();
+  result->status=pair==5 ? 16 : 0; result->count=pair%4==2 ? 8 : 1+pair%8;
+  for(int slot=0;slot<result->count;slot++) {
+    result->contact[slot]={};
+    result->contact[slot].dist=slot%3==1 ? .1f : -.01f*(pair+1);
+    result->contact[slot].feature.value=100*pair+slot;
+  }
+}
+void box_box_manifold(int a,int b,const float* x,const float* q,CMScratch* s,CMManifold* m) {
+  convex_manifold(a,b,x,q,s,m);
+}
+template<class S> void add_contact(S& s,int pair,int slot,float dist,const float*,const float*,const CMFeature* f) {
+  int c=s.ncon++;if(c<MAXCON)s.stored.push_back({pair,slot,f->value,dist});
+}
+template<class S> void run(S& s,int lane,int ncand) {
+''' + batch + r'''
+  if(lane==0 && s.ncon>MAXCON)s.unsupported|=4;
+}
+int main() {
+  for(int pair=0;pair<NPAIR;pair++) {
+    c_gtype[2*pair]=pair%4==3 ? 1 : (pair%4==1 || pair%4==2 ? 3 : 4);
+    c_gtype[2*pair+1]=pair%4==3 ? 2 : (pair%4==2 ? 3 : 4);
+  }
+  for(int capacity: {5,128})for(int ncand: {0,1,3,4,5,13}) {
+    MAXCON=capacity;
+    State<1> serial;workers=1;
+    Barrier one(1);barrier=&one;run(serial,0,ncand);
+    State<4> parallel;workers=4;
+    Barrier four(4);barrier=&four;
+    std::vector<std::thread> lanes;
+    for(int lane=0;lane<4;lane++)lanes.emplace_back([&,lane]{run(parallel,lane,ncand);});
+    for(auto& lane:lanes)lane.join();
+    if(serial.ncon!=parallel.ncon || serial.unsupported!=parallel.unsupported || serial.stored!=parallel.stored)return 1;
+    if(ncand==13 && parallel.unsupported!=(capacity==5 ? 36 : 32))return 2;
+    for(size_t i=1;i<parallel.stored.size();i++) {
+      auto a=parallel.stored[i-1],b=parallel.stored[i];
+      if(a.pair>b.pair || (a.pair==b.pair && a.slot>=b.slot))return 3;
+    }
+  }
+}
+'''
+        with tempfile.TemporaryDirectory(prefix="nabla-native-candidate-cpu-") as directory:
+            path = Path(directory)
+            (path / "candidates.cc").write_text(harness)
+            compiled = subprocess.run(["c++", "-std=c++17", "-O2", "-pthread", str(path / "candidates.cc"),
+                                       "-o", str(path / "candidates")], text=True, capture_output=True)
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
+            result = subprocess.run([str(path / "candidates")], text=True, capture_output=True, timeout=10)
             self.assertEqual(result.returncode, 0, result.stderr)
 
     @unittest.skipUnless(shutil.which("c++"), "root-axis reuse check requires a C++ compiler")
@@ -306,7 +415,7 @@ int main() {
 #define PG2(p) (2*(p)+1)
 thread_local int test_lane;
 std::barrier warp(32);
-int exchange[32],c_gtype[68],c_gbody[68],pairs[64],slots[64],prepared[34];
+int exchange[32],c_gtype[68],c_gbody[68],pairs[64],slots[64],prepared[34][12],seed_scratch[12];
 unsigned zones[64];bool enabled[64],bad_out[64];float features[64],words_out[64][CS_N];
 int bodies_out[64],fail_pair,distance_error;std::atomic<int> failures{0},called[64];
 void __syncwarp() { warp.arrive_and_wait(); }
@@ -323,22 +432,25 @@ void atomicOr(int* value,int bits) { *value|=bits; }
 struct CMFeature { int contact; };
 CMFeature cm_feature_unpack(const float* value) { return {int(*value)}; }
 struct Adj {
-  int cm_cached_pair=-1,flags=0,cm_scratch=0,cm_linearization=-1;
+  int cm_cached_pair=-1,flags=0,*cm_scratch=seed_scratch;
+  struct { int seed[12]; } cm_linearization;
   float gx[1][3]{},gq[1][4]{};const float* feature_rec=features;
 };
-int linearize(int g1,int,const float*,const float*,CMFeature feature,int*,int* result) {
+int linearize(int g1,int,const float*,const float*,CMFeature feature,int seed,int* scratch,
+              decltype(Adj::cm_linearization)* result) {
   int pair=g1/2;
-  if(test_lane!=0 || pairs[feature.contact]!=pair)failures++;
-  prepared[pair]++;
-  if(pair==fail_pair)return 16;
-  *result=pair;return 0;
+  if(test_lane!=seed || pairs[feature.contact]!=pair || scratch!=seed_scratch+seed)failures++;
+  prepared[pair][seed]++;
+  if(pair==fail_pair && seed==7)return 16;
+  result->seed[seed]=pair;return 0;
 }
-#define convex_manifold_linearize linearize
-#define box_box_manifold_linearize linearize
+#define convex_manifold_linearize_seed linearize
+#define box_box_manifold_linearize_seed linearize
 float adj_contact_one(Adj& s,int c,int pair,int slot,unsigned zone,float* words,float*) {
   bool native=c_gtype[PG2(pair)]==4 || (c_gtype[PG1(pair)]==3 && c_gtype[PG2(pair)]==3);
-  if((native && (s.cm_cached_pair!=pair || s.cm_linearization!=pair)) ||
-     pair!=pairs[c] || slot!=slots[c] || zone!=zones[c])failures++;
+  if(native)for(int seed=0;seed<12;seed++)
+    if(s.cm_cached_pair!=pair || s.cm_linearization.seed[seed]!=pair)failures++;
+  if(pair!=pairs[c] || slot!=slots[c] || zone!=zones[c])failures++;
   called[c]++;
   for(int k=0;k<CS_N;k++)words[k]=float(1+100*c+k);
   return c==distance_error ? 0.f : -1.f;
@@ -367,7 +479,7 @@ int main() {
   }
   for(bool debug:{false,true})for(int error_case=0;error_case<3;error_case++) {
     fail_pair=error_case==1?32:-1;distance_error=error_case==2?7:-1;Adj state;
-    for(auto& count:called)count=0;for(int& count:prepared)count=0;
+    for(auto& count:called)count=0;for(auto& counts:prepared)for(int& count:counts)count=0;
     std::thread lanes[32];
     for(int lane=0;lane<32;lane++)lanes[lane]=std::thread(run_lane,std::ref(state),lane,debug);
     for(auto& lane:lanes)lane.join();
@@ -377,7 +489,8 @@ int main() {
          bodies_out[c]!=(enabled[c] && zones[c] ? 1|(2<<8):-1))failures++;
       for(int k=0;k<CS_N;k++)if(words_out[c][k]!=(active && !failed?float(1+100*c+k):0.f))failures++;
     }
-    for(int p=0;p<34;p++)if(prepared[p]!=(p>=30 && (p!=33 || debug)))failures++;
+    for(int p=0;p<34;p++)for(int seed=0;seed<12;seed++)
+      if(prepared[p][seed]!=(p>=30 && (p!=33 || debug)))failures++;
     int expected=ADJ_ROWS_SKIPPED | (error_case ? ADJ_REPLAY_MISMATCH:0);
     if(state.flags!=expected)failures++;
   }

@@ -182,6 +182,10 @@ CM_DEVICE int convex_manifold_linearize(int, int, const float*, const float*, co
                                         CMReplayScratch*, CMLinearization*);
 CM_DEVICE int box_box_manifold_linearize(int, int, const float*, const float*, const CMFeature&,
                                          CMReplayScratch*, CMLinearization*);
+CM_DEVICE int convex_manifold_linearize_seed(int, int, const float*, const float*, const CMFeature&, int,
+                                             CMReplayScratch*, CMLinearization*);
+CM_DEVICE int box_box_manifold_linearize_seed(int, int, const float*, const float*, const CMFeature&, int,
+                                              CMReplayScratch*, CMLinearization*);
 CM_DEVICE void contact_linearization_vjp(const CMLinearization&, int, float, const float*, const float*, float*);
 """
 
@@ -3818,44 +3822,60 @@ CM_DEVICE void cm_linearization_store(CMLinearization* result,int slot,int seed,
   for(int k=0;k<9;k++)derivative[4+k]=frame[k].d;
 }
 
-CM_DEVICE int convex_manifold_linearize(int g1,int g2,const float* gx,const float* gq,
-                                        const CMFeature& feature,CMReplayScratch* scratch,CMLinearization* result) {
+CM_DEVICE int convex_manifold_linearize_seed(int g1,int g2,const float* gx,const float* gq,
+                                             const CMFeature& feature,int seed,CMReplayScratch* scratch,
+                                             CMLinearization* result) {
   if(feature.nsupp1!=3 || feature.nsupp2!=3 || feature.slot<0 || feature.slot>=feature.count ||
      feature.count>CM_REPLAY_SLOTS)return 16;
   bool flip=cm_type[g1]>cm_type[g2] || (cm_type[g1]==cm_type[g2] && g1>g2);
   if(flip){int tmp=g1;g1=g2;g2=tmp;}
-  for(int seed=0;seed<12;seed++) {
-    cm::Replay replay;
-    int canonical_seed=flip ? (seed<6 ? seed+6 : seed-6) : seed;
-    int error=cm::replay(g1,g2,gx,gq,feature,canonical_seed,scratch,&replay);
-    if(error || replay.count!=feature.count)return 16;
-    cm::Dual frame[9];cmgeom::frame<cm::Dual>(replay.normal,frame);
-    if(flip)for(int k=0;k<3;k++){frame[k]=-frame[k];frame[6+k]=-frame[6+k];}
-    for(int slot=0;slot<replay.count;slot++) {
-      cm::Dual d,p[3];
-      cm::contact_geometry(replay,slot,&d,p);
-      cm_linearization_store(result,slot,seed,d,p,frame);
-    }
+  cm::Replay replay;
+  int canonical_seed=flip ? (seed<6 ? seed+6 : seed-6) : seed;
+  int error=cm::replay(g1,g2,gx,gq,feature,canonical_seed,scratch,&replay);
+  if(error || replay.count!=feature.count)return 16;
+  cm::Dual frame[9];cmgeom::frame<cm::Dual>(replay.normal,frame);
+  if(flip)for(int k=0;k<3;k++){frame[k]=-frame[k];frame[6+k]=-frame[6+k];}
+  for(int slot=0;slot<replay.count;slot++) {
+    cm::Dual d,p[3];
+    cm::contact_geometry(replay,slot,&d,p);
+    cm_linearization_store(result,slot,seed,d,p,frame);
   }
   return 0;
 }
 
-CM_DEVICE int box_box_manifold_linearize(int g1,int g2,const float* gx,const float* gq,
-                                         const CMFeature& feature,CMReplayScratch* scratch,CMLinearization* result) {
+CM_DEVICE int box_box_manifold_linearize_seed(int g1,int g2,const float* gx,const float* gq,
+                                              const CMFeature& feature,int seed,CMReplayScratch* scratch,
+                                              CMLinearization* result) {
   if(!cmbb::valid_feature(feature) || feature.count>CM_REPLAY_SLOTS)return 16;
   bool flip=g1>g2;
   if(flip){int tmp=g1;g1=g2;g2=tmp;}
+  int canonical_seed=flip ? (seed<6 ? seed+6 : seed-6) : seed;
+  CMFeature active;
+  int count=cmbb::evaluate(g1,g2,gx,gq,&feature,canonical_seed,scratch,&active);
+  if(count!=feature.count)return 16;
+  const cmbb::Contact* contacts=((cmbb::Scratch*)scratch->bytes)->contact;
+  cmbb::T frame[9];cmgeom::frame<cmbb::T>(contacts[0].normal,frame);
+  if(flip)for(int k=0;k<3;k++){frame[k]=-frame[k];frame[6+k]=-frame[6+k];}
+  for(int slot=0;slot<count;slot++) {
+    cm_linearization_store(result,slot,seed,contacts[slot].dist,contacts[slot].pos,frame);
+  }
+  return 0;
+}
+
+// Portable serial entry points retain the same seed/slot order for CPU comparisons.
+CM_DEVICE int convex_manifold_linearize(int g1,int g2,const float* gx,const float* gq,
+                                        const CMFeature& feature,CMReplayScratch* scratch,CMLinearization* result) {
   for(int seed=0;seed<12;seed++) {
-    int canonical_seed=flip ? (seed<6 ? seed+6 : seed-6) : seed;
-    CMFeature active;
-    int count=cmbb::evaluate(g1,g2,gx,gq,&feature,canonical_seed,scratch,&active);
-    if(count!=feature.count)return 16;
-    const cmbb::Contact* contacts=((cmbb::Scratch*)scratch->bytes)->contact;
-    cmbb::T frame[9];cmgeom::frame<cmbb::T>(contacts[0].normal,frame);
-    if(flip)for(int k=0;k<3;k++){frame[k]=-frame[k];frame[6+k]=-frame[6+k];}
-    for(int slot=0;slot<count;slot++) {
-      cm_linearization_store(result,slot,seed,contacts[slot].dist,contacts[slot].pos,frame);
-    }
+    int error=convex_manifold_linearize_seed(g1,g2,gx,gq,feature,seed,scratch,result);
+    if(error)return error;
+  }
+  return 0;
+}
+CM_DEVICE int box_box_manifold_linearize(int g1,int g2,const float* gx,const float* gq,
+                                         const CMFeature& feature,CMReplayScratch* scratch,CMLinearization* result) {
+  for(int seed=0;seed<12;seed++) {
+    int error=box_box_manifold_linearize_seed(g1,g2,gx,gq,feature,seed,scratch,result);
+    if(error)return error;
   }
   return 0;
 }

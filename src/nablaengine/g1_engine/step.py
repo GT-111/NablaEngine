@@ -391,8 +391,11 @@ struct Sim {
   int con_nd[MAXCON];
   unsigned long long con_mask[MAXCON];  // the support as dof bits (bit i: dof i; con_dof[c][k] is the k-th set bit)
 #if HAS_NATIVE_COLLISION
+  static constexpr int CM_WORKERS = 1;
   CMScratch cm_storage;
   CMScratch* cm_scratch;
+  CMManifold cm_manifold;
+  CMManifold* cm_manifolds;
   float* feature_rec;
 #endif
 #ifdef DK_PROFILE
@@ -1788,20 +1791,30 @@ __device__ void substep_pre(S& s, const float* ctrl, int lane, float* rec, const
     }
 #if HAS_NATIVE_COLLISION
     __syncwarp();
-    // A world reuses one scratch buffer for its native candidates. No scratch
-    // allocation scales with the number of eligible pairs.
-    for (int i = 0; i < ncand; i++) {
-      int pair = s.cand[i], g1 = PG1(pair), g2 = PG2(pair);
-      int t1 = c_gtype[g1], t2 = c_gtype[g2];
-      if (lane == 0 && (t2 == 4 || (t1 == 3 && t2 == 3))) {
-        CMManifold manifold;
-        if (t2 == 4) convex_manifold(g1, g2, &s.gx[0][0], &s.gq[0][0], s.cm_scratch, &manifold);
-        else box_box_manifold(g1, g2, &s.gx[0][0], &s.gq[0][0], s.cm_scratch, &manifold);
-        if (manifold.status) s.unsupported |= 32;
-        else for (int j = 0; j < manifold.count; j++) {
-          const CMContact& contact = manifold.contact[j];
-          if (contact.dist < 0.f)
-            add_contact(s, pair, j, contact.dist, contact.pos, contact.frame, &contact.feature);
+    // Each world owns a bounded candidate batch; emit in the original pair/slot order.
+    for (int i0 = 0; i0 < ncand; i0 += S::CM_WORKERS) {
+      int i = i0 + lane;
+      if (lane < S::CM_WORKERS && i < ncand) {
+        int pair = s.cand[i], g1 = PG1(pair), g2 = PG2(pair);
+        int t1 = c_gtype[g1], t2 = c_gtype[g2];
+        if (t2 == 4)
+          convex_manifold(g1, g2, &s.gx[0][0], &s.gq[0][0], s.cm_scratch + lane, s.cm_manifolds + lane);
+        else if (t1 == 3 && t2 == 3)
+          box_box_manifold(g1, g2, &s.gx[0][0], &s.gq[0][0], s.cm_scratch + lane, s.cm_manifolds + lane);
+      }
+      __syncwarp();
+      if (lane == 0) {
+        for (int j = 0; j < S::CM_WORKERS && i0 + j < ncand; j++) {
+          int pair = s.cand[i0 + j], g1 = PG1(pair), g2 = PG2(pair);
+          int t1 = c_gtype[g1], t2 = c_gtype[g2];
+          if (t2 != 4 && !(t1 == 3 && t2 == 3)) continue;
+          const CMManifold& manifold = s.cm_manifolds[j];
+          if (manifold.status) s.unsupported |= 32;
+          else for (int slot = 0; slot < manifold.count; slot++) {
+            const CMContact& contact = manifold.contact[slot];
+            if (contact.dist < 0.f)
+              add_contact(s, pair, slot, contact.dist, contact.pos, contact.frame, &contact.feature);
+          }
         }
       }
       __syncwarp();
@@ -2256,7 +2269,9 @@ typedef SimNT<MAXCON, NEFC> SimNfull;  // the worlds beyond it (Hand::big)
 
 struct Hand {
 #if HAS_NATIVE_COLLISION
-  CMScratch cm_storage;
+  static constexpr int CM_WORKERS = 4;
+  CMScratch cm_storage[CM_WORKERS];
+  CMManifold cm_manifolds[CM_WORKERS];
 #endif
   float M[NTRI], qsm[NV], qacc0[NV];
   float efc_D[NEFC], efc_aref[NEFC];
@@ -2275,7 +2290,9 @@ struct Hand {
 
 struct SimP {  // substep_pre: smooth dynamics, qacc_smooth, collision, contact Jacobians (into Hand), rows (into Hand)
 #if HAS_NATIVE_COLLISION
+  static constexpr int CM_WORKERS = Hand::CM_WORKERS;
   CMScratch* cm_scratch;
+  CMManifold* cm_manifolds;
   float* feature_rec;
 #endif
   float Q[NB][4], X[NB][3];

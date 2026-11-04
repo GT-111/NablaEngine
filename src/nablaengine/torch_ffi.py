@@ -448,12 +448,15 @@ def _bind(lib, info):
     fns["work_bytes"].argtypes, fns["work_bytes"].restype = [i32], ctypes.c_longlong
     fns["kin"].argtypes = [vp, i32] + [vp] * 8
     fns["kin_vjp"].argtypes = [vp, i32] + [vp] * 12
-    fns["adjoint"] = {}
+    fns["adjoint"], fns["adj_work_bytes"] = {}, {}
     for v in VARIANTS:
         t = _tag(v)
         f = getattr(lib, f"{t}_adjoint")
-        f.argtypes = [vp, i32, i32] + [vp] * 9 + [vp, f32] + [vp] * 3
+        f.argtypes = [vp, i32, i32] + [vp] * 9 + [vp, f32] + [vp] * 4
         fns["adjoint"][v] = f
+        work_bytes = getattr(lib, f"{t}_adj_work_bytes")
+        work_bytes.argtypes, work_bytes.restype = [i32], ctypes.c_longlong
+        fns["adj_work_bytes"][v] = work_bytes
         sz = np.zeros(9, np.int64)  # as jax_ffi.init's check of dk_sizes
         getattr(lib, f"{t}_sizes").argtypes = [vp]
         getattr(lib, f"{t}_sizes")(sz.ctypes.data)
@@ -644,6 +647,8 @@ def _backward_impl(tape, friction, com, g_qpos, g_qvel, ctrl, kin_state, kin_cot
         return [gq, gv, gu, info, gf]
     fns = context._state["fns"]
     st = torch.cuda.current_stream(dev).cuda_stream
+    work_bytes = int(fns["adj_work_bytes"][v](B))
+    work = torch.empty((work_bytes,), dtype=torch.uint8, device=tape.device) if work_bytes else None
     cq, cv = g_qpos, g_qvel
     if kin_state:  # the kinematics outputs' cotangents pulled back onto (qpos', qvel'), added to theirs last
         q1, v1 = kin_state
@@ -657,7 +662,7 @@ def _backward_impl(tape, friction, com, g_qpos, g_qvel, ctrl, kin_state, kin_cot
                            _ptr(cq), _ptr(cv)), "the kinematics VJP launch")
     _rc(fns["adjoint"][v](st, B, substeps, _ptr(tape), _ptr(friction), _ptr(com), _ptr(cq), _ptr(cv), _ptr(gq),
                           _ptr(gv), _ptr(gu), _ptr(info), _ptr(ctrl), ctypes.c_float(clamp_soft),
-                          _ptr(qfrc_applied), _ptr(kp_scale), _ptr(gf)),
+                          _ptr(qfrc_applied), _ptr(kp_scale), _ptr(gf), _ptr(work)),
         "the adjoint launch")
     if context._diagnostics_on:
         _diag_backward(context, dev, st, gq, gv, gu, cq, cv, gf if qfrc_applied is not None else None, info)

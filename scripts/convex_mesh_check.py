@@ -96,6 +96,8 @@ class NativeGeometry:
         for name, kind, size in layout:
             load.append(f"for(int i=0;i<{size};i++) {name}[i]=({ 'int' if kind == 'i' else 'float' })*p++;")
         wrapper = r'''
+#include <cstring>
+#include <thread>
 extern "C" void cm_load(const float* p) { LOAD }
 extern "C" void cm_bounds(int g,const float* x,const float* q,float* out) {
   cm::world_aabb(g,x,q,out);
@@ -163,21 +165,32 @@ extern "C" int cm_replay(int g1,int g2,const float* x,const float* q,const int* 
 }
 extern "C" int cm_linearize(int g1,int g2,const float* x,const float* q,const int* feature,
                              const float* cotangent,float* value,float* gradient) {
-  struct { uint64_t before; CMReplayScratch scratch; uint64_t after; } guard;
-  guard.before=0x18273645; guard.after=0x54637281;
+  struct { uint64_t before; CMReplayScratch scratch; uint64_t after; } guard[12];
+  for(auto& item:guard){item.before=0x18273645;item.after=0x54637281;}
   struct { uint64_t before; CMLinearization data; uint64_t after; } cache;
-  cache.before=0x18273645; cache.after=0x54637281;
+  cache.before=0x18273645; cache.after=0x54637281; cache.data=CMLinearization{};
   CMFeature f; const unsigned char* p=(const unsigned char*)feature; unsigned char* b=(unsigned char*)&f;
   for(int i=0;i<(int)sizeof(f);i++) b[i]=p[i];
-  int error=f.reserved==1 ? box_box_manifold_linearize(g1,g2,x,q,f,&guard.scratch,&cache.data)
-                        : convex_manifold_linearize(g1,g2,x,q,f,&guard.scratch,&cache.data);
+  std::thread lanes[12];int errors[12]={};
+  for(int seed=0;seed<12;seed++)lanes[seed]=std::thread([&,seed]() {
+    errors[seed]=f.reserved==1
+      ? box_box_manifold_linearize_seed(g1,g2,x,q,f,seed,&guard[seed].scratch,&cache.data)
+      : convex_manifold_linearize_seed(g1,g2,x,q,f,seed,&guard[seed].scratch,&cache.data);
+  });
+  for(auto& lane:lanes)lane.join();
+  int error=0;for(int code:errors)error|=code;
+  for(auto& item:guard)if(item.before!=0x18273645 || item.after!=0x54637281)error|=32;
   if(error)return error;
+  CMLinearization serial={};
+  error=f.reserved==1 ? box_box_manifold_linearize(g1,g2,x,q,f,&guard[0].scratch,&serial)
+                     : convex_manifold_linearize(g1,g2,x,q,f,&guard[0].scratch,&serial);
+  if(std::memcmp(&serial,&cache.data,sizeof(serial)))error|=64;
   for(int slot=0;slot<f.count;slot++) {
     for(int k=0;k<13;k++)value[13*slot+k]=cache.data.value[slot][k];
     contact_linearization_vjp(cache.data,slot,cotangent[13*slot],cotangent+13*slot+1,
                               cotangent+13*slot+4,gradient+12*slot);
   }
-  if(guard.before!=0x18273645 || guard.after!=0x54637281 ||
+  if(guard[0].before!=0x18273645 || guard[0].after!=0x54637281 ||
      cache.before!=0x18273645 || cache.after!=0x54637281)error|=32;
   return error;
 }
@@ -185,7 +198,7 @@ extern "C" int cm_linearize(int g1,int g2,const float* x,const float* q,const in
         path = pathlib.Path(self.directory.name)
         (path / "geometry.cc").write_text("#define DKC\n" + convex_mesh.header(m, geoms)
                                           + convex_mesh.source() + wrapper)
-        subprocess.run(["c++", "-shared", "-fPIC", "-std=c++17", "-O2", "-ffp-contract=off",
+        subprocess.run(["c++", "-shared", "-fPIC", "-std=c++17", "-O2", "-ffp-contract=off", "-pthread",
                         str(path / "geometry.cc"), "-o", str(path / "geometry.so")], check=True,
                        capture_output=True, text=True)
         self.library = ctypes.CDLL(str(path / "geometry.so"))

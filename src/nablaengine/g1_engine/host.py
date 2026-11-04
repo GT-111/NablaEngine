@@ -40,6 +40,7 @@ __global__ void k_substep(int nw, const float* qpos, const float* qvel, const fl
     s.fric = fric[w]; s.unsupported = 0;
 #if HAS_NATIVE_COLLISION
     s.cm_scratch = &s.cm_storage;
+    s.cm_manifolds = &s.cm_manifold;
 #endif
   }
 #ifdef DK_PROFILE
@@ -153,7 +154,8 @@ __device__ __forceinline__ void pre_world(SimP& s, Hand& g, int w, int lane, con
     s.con_J = g.con_J; s.con_dof = g.con_dof; s.con_mask = g.con_mask;
     s.efc_kind = g.efc_kind; s.efc_a = g.efc_a; s.efc_b = g.efc_b; s.efc_D = g.efc_D; s.efc_aref = g.efc_aref;
 #if HAS_NATIVE_COLLISION
-    s.cm_scratch = &g.cm_storage;
+    s.cm_scratch = g.cm_storage;
+    s.cm_manifolds = g.cm_manifolds;
 #endif
   }
 #ifdef DK_PROFILE

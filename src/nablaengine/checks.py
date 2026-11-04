@@ -121,6 +121,8 @@ LOAD_CONSTS
   float *gq, *gv, *gu, *dbg = nullptr; int* ai;
   cudaMalloc(&gq, (size_t)nw * NQ * 4); cudaMalloc(&gv, (size_t)nw * NV * 4); cudaMalloc(&gu, (size_t)nw * (NU) * 4);
   cudaMalloc(&ai, (size_t)nw * 4);
+  void* adj_work = nullptr;
+  if (const size_t bytes = adj_work_bytes(nw)) cudaMalloc(&adj_work, bytes);
   size_t ndbg = (size_t)nw * nsub * DBG_WORDS;
   if (dbg_on) cudaMalloc(&dbg, ndbg * 4);
   float *cq = nullptr, *cv = nullptr;
@@ -136,7 +138,7 @@ LOAD_CONSTS
     if (c == 0) { cudaMemcpyToSymbol(g_aprof, prof_zero, sizeof(unsigned long long) * NAPROF); nprof_a = 0; }
 #endif
     k_adjoint<<<nw, 32, smem_a>>>(nw, nsub, tp, d_fric, d_com, cq, cv, gq, gv, gu, ai, dbg, ADJ_CTRL(dbg)
-                                  ADJ_SOFT_ARG(clamp_soft));
+                                  ADJ_SOFT_ARG(clamp_soft), nullptr, nullptr, nullptr, adj_work);
     nprof_a++;
     cudaDeviceSynchronize();
 #ifdef DK_PROFILE
@@ -167,7 +169,7 @@ LOAD_CONSTS
     cudaEventElapsedTime(&ms_f, e0, e1);
     auto adj = [&]() {
       k_adjoint<<<nw, 32, smem_a>>>(nw, nsub, tp, d_fric, d_com, cq, cv, gq, gv, gu, ai, nullptr, ADJ_CTRL(false)
-                                    ADJ_SOFT_ARG(clamp_soft));
+                                    ADJ_SOFT_ARG(clamp_soft), nullptr, nullptr, nullptr, adj_work);
       nprof_a++;
     };
     for (int i = 0; i < 3; i++) adj();

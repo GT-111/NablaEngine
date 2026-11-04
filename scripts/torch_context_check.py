@@ -60,7 +60,7 @@ class ContextChecks(unittest.TestCase):
             owner.info["maxcon"] = 256
             native_forward, native_adjoint = Mock(return_value=0), Mock(return_value=0)
             owner._state["fns"] = dict(forward=native_forward, work_bytes=lambda _: 1,
-                                        adjoint={(0, 3): native_adjoint})
+                                        adjoint={(0, 3): native_adjoint}, adj_work_bytes={(0, 3): lambda _: 0})
             q, v, w, u, fr, com, force, kp = inputs(owner)
             owner._diagnostics_on = False
             result = F._forward_impl(q, v, w, u, fr, com, force, kp, 10, 4, True, False, owner.context_id)
@@ -73,6 +73,78 @@ class ContextChecks(unittest.TestCase):
                     grads = F._backward_impl(result[4], fr, com, q, v, None, [], [], 4, 0, 3, 0.,
                                              applied, kp, owner.context_id)
                 self.assertIs(diag.call_args.args[8], None if applied is None else grads[4])
+
+    def test_backward_workspace_uses_variant_bytes_and_is_not_retained(self):
+        import weakref
+        from unittest.mock import Mock
+
+        with contexts() as owners, patch.object(F, "_ready", return_value=0), patch.object(F, "_check"), \
+                patch.object(torch.cuda, "current_stream", return_value=SimpleNamespace(cuda_stream=17)):
+            for owner, variant, size in ((owners[0], (0, 3), 0), (owners[1], (2, 0), 2 * 12 * 2816)):
+                owner._diagnostics_on = False
+                q, v, _w, u, fr, com, force, kp = inputs(owner)
+                tape = q.new_empty((2, 4 * owner.info["rec_words"]))
+                allocations, empty = [], torch.empty
+
+                def allocate(*args, **kwargs):
+                    result = empty(*args, **kwargs)
+                    if kwargs.get("dtype") == torch.uint8:
+                        allocations.append(weakref.ref(result))
+                    return result
+
+                def launch(*args):
+                    self.assertEqual(len(args), 18)
+                    if size:
+                        work = allocations[-1]()
+                        self.assertEqual(work.shape, (size,))
+                        self.assertEqual(args[-1].value, work.data_ptr())
+                    else:
+                        self.assertIsNone(args[-1])
+                    return 0
+
+                native, work_bytes = Mock(side_effect=launch), Mock(return_value=size)
+                owner._state["fns"] = dict(adjoint={variant: native}, adj_work_bytes={variant: work_bytes})
+                ctrl = u if variant[0] == 2 else None
+                with patch.object(torch, "empty", side_effect=allocate):
+                    grads = F._backward_impl(tape, fr, com, q, v, ctrl, [], [], 4, *variant, 0.,
+                                             force, kp, owner.context_id)
+                work_bytes.assert_called_once_with(2)
+                self.assertEqual(len(grads), 5)
+                self.assertEqual(len(allocations), int(size > 0))
+                self.assertTrue(all(value() is None for value in allocations))
+                native.reset_mock()
+                work_bytes.reset_mock()
+                F._backward_impl(tape[:0], fr[:0], com[:0], q[:0], v[:0], None if ctrl is None else ctrl[:0],
+                                 [], [], 4, *variant, 0., force[:0], kp[:0], owner.context_id)
+                native.assert_not_called()
+                work_bytes.assert_not_called()
+
+    @unittest.skipUnless(shutil.which("c++"), "adjoint workspace check requires a C++ compiler")
+    def test_adjoint_workspace_export_sizes_native_and_primitive_models(self):
+        from nablaengine import jax_ffi
+        from nablaengine.g1_engine import adjoint
+
+        helper = "static inline size_t adj_work_bytes(int nw)" + adjoint.ADJ_KERNEL.split(
+            "static inline size_t adj_work_bytes(int nw)", 1)[1].split("\n}", 1)[0] + "\n}\n"
+        export = next(line for line in jax_ffi.VARIANT_UNIT.splitlines() if "_adj_work_bytes(int nw)" in line)
+        source = ("#include <cassert>\n#include <cstddef>\n#include <initializer_list>\n#include <type_traits>\n"
+                  "struct alignas(8) CMReplayScratch { unsigned char bytes[2816]; };\n" + helper
+                  + export.replace("@PFX@", "workspace") + r'''
+static_assert(std::is_same_v<decltype(&workspace_adj_work_bytes), long long (*)(int)>);
+int main() {
+  for (int worlds : {0, 2, 410}) {
+    long long expected = HAS_NATIVE_COLLISION ? (long long)worlds * 12 * sizeof(CMReplayScratch) : 0;
+    assert(workspace_adj_work_bytes(worlds) == expected);
+  }
+}
+''')
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            (path/"workspace.cc").write_text(source)
+            for native in (0, 1):
+                subprocess.run(("c++", "-std=c++17", f"-DHAS_NATIVE_COLLISION={native}", str(path/"workspace.cc"),
+                                "-o", str(path/"workspace")), check=True)
+                subprocess.run((str(path/"workspace"),), check=True)
 
     @unittest.skipUnless(shutil.which("c++"), "contact output check requires a C++ compiler")
     def test_contact_output_is_optional_in_both_forward_kernels(self):

@@ -252,7 +252,7 @@ struct Adj {
   int hdr, nlim;  // the record's ncon | nefc << 16 and separate limit count
   int flags;  // union of the records' flags (tape.py), ADJ_ROWS_SKIPPED, ADJ_REPLAY_MISMATCH
 #if HAS_NATIVE_COLLISION
-  CMReplayScratch cm_scratch;
+  CMReplayScratch* cm_scratch;  // this world's twelve seeds in the backward work buffer
   CMLinearization cm_linearization;
   int cm_cached_pair;  // only valid within the current adj_contacts pass
   const float* feature_rec;
@@ -1155,24 +1155,28 @@ __device__ void adj_contacts_coupled(Adj& s, int lane, float* dbg) {
     bool native = on && (c_gtype[PG2(pair)] == 4 || (c_gtype[PG1(pair)] == 3 && c_gtype[PG2(pair)] == 3));
     if (active && !native)
       bad = !(adj_contact_one(s, c, pair, slot, zone, cw, dbg) < 0.f);
-    // One pair owns the shared scratch; its slots then consume immutable results.
+    // Each seed owns scratch; slots consume the completed shared linearization.
     unsigned pending = __ballot_sync(0xffffffffu, active && native);
     while (pending) {
       int leader = __ffs(pending) - 1, pj = __shfl_sync(0xffffffffu, pair, leader);
       unsigned same = __ballot_sync(0xffffffffu, active && native && pair == pj);
       int error = 0;
-      if (lane == 0 && s.cm_cached_pair != pj) {
-        int g1 = PG1(pj), g2 = PG2(pj);
-        CMFeature feature = cm_feature_unpack(s.feature_rec + (c0 + leader) * CM_FEATURE_WORDS);
-        error = c_gtype[g2] == 4
-          ? convex_manifold_linearize(g1, g2, &s.gx[0][0], &s.gq[0][0], feature,
-                                      &s.cm_scratch, &s.cm_linearization)
-          : box_box_manifold_linearize(g1, g2, &s.gx[0][0], &s.gq[0][0], feature,
-                                       &s.cm_scratch, &s.cm_linearization);
-        if (error) atomicOr(&s.flags, (int)ADJ_REPLAY_MISMATCH);
-        else s.cm_cached_pair = pj;
+      if (s.cm_cached_pair != pj) {
+        if (lane < 12) {
+          int g1 = PG1(pj), g2 = PG2(pj);
+          CMFeature feature = cm_feature_unpack(s.feature_rec + (c0 + leader) * CM_FEATURE_WORDS);
+          error = c_gtype[g2] == 4
+            ? convex_manifold_linearize_seed(g1, g2, &s.gx[0][0], &s.gq[0][0], feature, lane,
+                                             s.cm_scratch + lane, &s.cm_linearization)
+            : box_box_manifold_linearize_seed(g1, g2, &s.gx[0][0], &s.gq[0][0], feature, lane,
+                                              s.cm_scratch + lane, &s.cm_linearization);
+        }
+        error = __ballot_sync(0xffffffffu, error != 0) ? 16 : 0;
+        if (lane == 0) {
+          if (error) atomicOr(&s.flags, (int)ADJ_REPLAY_MISMATCH);
+          else s.cm_cached_pair = pj;
+        }
       }
-      error = __shfl_sync(0xffffffffu, error, 0);
       __syncwarp();
       if ((same >> lane) & 1u) {
         if (error) bad = true;
@@ -1605,7 +1609,7 @@ __device__ unsigned long long g_aprof[NAPROF];
 __global__ void k_adjoint(int nw, int nsub, const float* tape, const float* fric, const float* com, const float* gq_out,
                           const float* gv_out, float* gq_in, float* gv_in, float* gctrl, int* info, float* dbg,
                           const float* ctrl ADJ_SOFT_PARAM, const float* qfrc = nullptr,
-                          const float* kp_scale = nullptr, float* gqfrc = nullptr) {
+                          const float* kp_scale = nullptr, float* gqfrc = nullptr, void* work = nullptr) {
   extern __shared__ __align__(16) unsigned char dk_smem[];  // dynamic, as the forward
   Adj& s = *reinterpret_cast<Adj*>(dk_smem);
   const int lane = threadIdx.x & 31, w = blockIdx.x;  // (& 31: see host.py k_substep)
@@ -1615,6 +1619,9 @@ __global__ void k_adjoint(int nw, int nsub, const float* tape, const float* fric
 #endif
   APROF_START();
   adj_init(s, lane);
+#if HAS_NATIVE_COLLISION
+  if (lane == 0) s.cm_scratch = static_cast<CMReplayScratch*>(work) + (size_t)w * 12;
+#endif
   float largest_cot = 0.f;
   for (int i = lane; i < NQ; i += 32) {
     s.qbar[i] = gq_out[(size_t)w * NQ + i];
@@ -1673,6 +1680,14 @@ __global__ void k_adjoint(int nw, int nsub, const float* tape, const float* fric
 #ifdef DK_PROFILE
   APROF(APROF_IO);
   if (lane < NAPROF) atomicAdd(&g_aprof[lane], (unsigned long long)s.aprof[lane]);
+#endif
+}
+
+static inline size_t adj_work_bytes(int nw) {
+#if HAS_NATIVE_COLLISION
+  return (size_t)nw * 12 * sizeof(CMReplayScratch);
+#else
+  return 0;
 #endif
 }
 
