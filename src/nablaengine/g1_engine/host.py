@@ -57,12 +57,13 @@ __global__ void k_substep(int nw, const float* qpos, const float* qvel, const fl
   if (lane < NPROF) atomicAdd(&g_prof[lane], (unsigned long long)s.prof[lane]);
 #endif
   if (lane == 0) { info[w * 4] = nit; info[w * 4 + 1] = s.ncon; info[w * 4 + 2] = s.nefc; info[w * 4 + 3] = s.unsupported; }
-  for (int c = lane; c < MAXCON; c += 32) {  // contacts of the last substep's collision: pair, dist, pos, normal
-    float* o = ocon + ((size_t)w * MAXCON + c) * 8;
-    bool v = c < min(s.ncon, MAXCON);
-    o[0] = v ? (float)s.con_pair[c] : -1.f; o[1] = v ? s.con_dist[c] : 0.f;
-    for (int k = 0; k < 3; k++) { o[2 + k] = v ? s.con_pos[c][k] : 0.f; o[5 + k] = v ? s.con_frame[c][k] : 0.f; }
-  }
+  if (ocon)  // Optional last-substep contact export; the solver and tape use s directly.
+    for (int c = lane; c < MAXCON; c += 32) {
+      float* o = ocon + ((size_t)w * MAXCON + c) * 8;
+      bool v = c < min(s.ncon, MAXCON);
+      o[0] = v ? (float)s.con_pair[c] : -1.f; o[1] = v ? s.con_dist[c] : 0.f;
+      for (int k = 0; k < 3; k++) { o[2 + k] = v ? s.con_pos[c][k] : 0.f; o[5 + k] = v ? s.con_frame[c][k] : 0.f; }
+    }
 }
 
 // The split forward: every substep as two halves, substep_pre on struct SimP and substep_post on struct SimN (step.py),
@@ -170,7 +171,7 @@ __device__ __forceinline__ void pre_world(SimP& s, Hand& g, int w, int lane, con
     g.ncon = s.ncon; g.nefc = s.nefc; g.nefc_dof = s.nefc_dof; g.unsupported = s.unsupported;
     g.min_nu_bits = s.min_nu_bits;
   }
-  if (k == nsub - 1)  // contacts of the last substep's collision: pair, dist, pos, normal
+  if (ocon && k == nsub - 1)  // optional last-substep contact export
     for (int c = lane; c < MAXCON; c += 32) {
       float* o = ocon + ((size_t)w * MAXCON + c) * 8;
       bool v = c < ncon;

@@ -66,7 +66,8 @@ _OVERFLOW_WARN = [os.environ.get("DK_OVERFLOW_WARN", "0") not in ("", "0")]  # s
 NONFINITE_QPOS, NONFINITE_QVEL, NONFINITE_CTRL, NONFINITE_COT, NONFINITE_SHIFT = 1, 2, 4, 8, 16
 VARIANTS = tuple((kv, n) for kv in (0, 1, 2) for n in (0, 1, 2, 3))  # adjoint builds (clamp_kv, normal)
 FWD_UNIT = "dk_fwd"
-ARTIFACT_VERSION = 4
+# Forward now passes a null optional contact export; older libraries require a buffer.
+ARTIFACT_VERSION = 5
 # the package files the library is generated from: an artifact records their hash, a different hash means stale
 SOURCES = ("cuda.py", "jax_ffi.py", "torch_ffi.py", "fixtures.py", "g1_engine/*.py", "model/*.py")
 
@@ -593,11 +594,10 @@ def _forward_impl(qpos, qvel, warm, ctrl, friction, com, qfrc_applied, kp_scale,
     if B == 0:
         return [q1, v1, w1, info, tp] + kin
     fns = context._state["fns"]
-    con = torch.empty((B, context.info["maxcon"] * 8), **kw)  # the last substep's contacts (unused, as jax_ffi)
     work = torch.empty((max(int(fns["work_bytes"](B)), 1),), dtype=torch.uint8, device=qpos.device)
     st = torch.cuda.current_stream(dev).cuda_stream
     _rc(fns["forward"](st, B, *map(_ptr, (qpos, qvel, warm, ctrl, friction, com)), iterations, substeps, _ptr(q1),
-                       _ptr(v1), _ptr(w1), _ptr(info), _ptr(con), _ptr(tp) if tape else None, _ptr(work),
+                       _ptr(v1), _ptr(w1), _ptr(info), None, _ptr(tp) if tape else None, _ptr(work),
                        _ptr(qfrc_applied), _ptr(kp_scale)),
         "the forward launch")
     if kinematics:
