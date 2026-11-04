@@ -92,18 +92,23 @@ def _align8(n):
     return (n + 7) // 8 * 8
 
 
+def replay_scratch_bytes(m):
+    """Feature selection and clipping reuse storage; neither needs EPA's stack."""
+    polygon, degree = max(16, m.npolygonmax), max(3, m.nmeshdegmax)
+    normals = 2 * _align8(4 * degree) + 3 * _align8(8 * 3 * degree)
+    clipping = 2 * _align8(8 * 3 * polygon) + _align8(8 * 16 * polygon)
+    return max(normals, clipping)
+
+
 def scratch_bytes(m):
     """One candidate's global/shared scratch, including the analytic replay."""
     iterations = int(m.opt.ccd_iterations)
-    polygon, degree = max(16, m.npolygonmax), max(3, m.nmeshdegmax)
     edges = 24 + max(0, iterations - 35)
     # Native double-precision Vertex is 80B, Face is 56B; pointers are 8B.
     epa = sum(map(_align8, (80 * (5 + iterations), 56 * 6 * iterations,
                            8 * 6 * iterations, 4 * edges, 4 * edges)))
-    # Replay uses one dual (value, derivative) per scalar, with the native layout.
-    multiccd = 2 * _align8(4 * degree) + 3 * _align8(8 * 3 * degree)
-    multiccd += 2 * _align8(8 * 3 * polygon) + _align8(8 * 16 * polygon)
-    return max(epa, multiccd) + _align8(4 * 4 * 6 * iterations)
+    epa += _align8(4 * 4 * 6 * iterations)
+    return max(epa, replay_scratch_bytes(m))
 
 
 def header(m, geoms):
@@ -137,6 +142,7 @@ def header(m, geoms):
 #define CM_DEGREE_MAX {max(3, m.nmeshdegmax)}
 #define CM_MULTI {int(not (int(m.opt.disableflags) & int(mujoco.mjtDisableBit.mjDSBL_MULTICCD)))}
 #define CM_SCRATCH_BYTES {scratch_bytes(m)}
+#define CM_REPLAY_SCRATCH_BYTES {replay_scratch_bytes(m)}
 #define CM_FEATURE_WORDS 12
 #define CM_REPLAY_SLOTS {8 if sum(m.geom_type[g] == mujoco.mjtGeom.mjGEOM_BOX for g in geoms) >= 2 else 4}
 {definitions}
@@ -158,7 +164,10 @@ struct CMManifold {{ int count, status; CMContact contact[8]; }};
 struct CMLinearization {{
   float value[CM_REPLAY_SLOTS][13], jacobian[CM_REPLAY_SLOTS][12][13];
 }};
-struct alignas(8) CMScratch {{ unsigned char bytes[CM_SCRATCH_BYTES]; }};
+struct alignas(8) CMReplayScratch {{ unsigned char bytes[CM_REPLAY_SCRATCH_BYTES]; }};
+struct alignas(8) CMScratch {{
+  union {{ unsigned char bytes[CM_SCRATCH_BYTES]; CMReplayScratch replay; }};
+}};
 CM_DEVICE void convex_manifold(int, int, const float*, const float*, CMScratch*, CMManifold*);
 CM_DEVICE int convex_contact_replay(int, int, const float*, const float*, const CMFeature&,
                                     CMScratch*, CMContact*);
@@ -170,9 +179,9 @@ CM_DEVICE int box_box_contact_replay(int, int, const float*, const float*, const
 CM_DEVICE int box_box_contact_vjp(int, int, const float*, const float*, const CMFeature&,
                                   float, const float*, const float*, CMScratch*, float*);
 CM_DEVICE int convex_manifold_linearize(int, int, const float*, const float*, const CMFeature&,
-                                        CMScratch*, CMLinearization*);
+                                        CMReplayScratch*, CMLinearization*);
 CM_DEVICE int box_box_manifold_linearize(int, int, const float*, const float*, const CMFeature&,
-                                         CMScratch*, CMLinearization*);
+                                         CMReplayScratch*, CMLinearization*);
 CM_DEVICE void contact_linearization_vjp(const CMLinearization&, int, float, const float*, const float*, float*);
 """
 
@@ -1117,10 +1126,7 @@ template<class T> CM_DEVICE int mjc_multicontact(Obj<T>* obj1, Obj<T>* obj2, T* 
   int* idx2 = (int*)ptr;           ptr += align8(sizeof(int) * nmeshdegmax);
   T* n1 = (T*)ptr;       ptr += align8(sizeof(T) * 3 * nmeshdegmax);
   T* n2 = (T*)ptr;       ptr += align8(sizeof(T) * 3 * nmeshdegmax);
-  T* endverts = (T*)ptr; ptr += align8(sizeof(T) * 3 * nmeshdegmax);
-  T* face1 = (T*)ptr;    ptr += align8(sizeof(T) * 3 * npolygonmax);
-  T* face2 = (T*)ptr;    ptr += align8(sizeof(T) * 3 * npolygonmax);
-  T* polygon = (T*)ptr;  // buffer for polygonClip
+  T* endverts = (T*)ptr;
 
   // get dimensions of features of geoms 1 and 2
   int nface1 = simplexDim<T>(triface1i, triface1);
@@ -1174,31 +1180,41 @@ template<class T> CM_DEVICE int mjc_multicontact(Obj<T>* obj1, Obj<T>* obj2, T* 
   }
   int i = res[0], j = res[1];
 
+  // Retain only the selected feature before clipping reuses the normal buffers.
+  int face1_index = edgecon1 ? 0 : idx1[edgecon2 ? j : i];
+  int face2_index = edgecon2 ? 0 : idx2[j];
+  T normal1[3], normal2[3], endvert[3];
+  if (!edgecon1) copy3<T>(normal1, n1 + 3*(edgecon2 ? j : i));
+  if (!edgecon2) copy3<T>(normal2, n2 + 3*j);
+  if (edgecon1 || edgecon2) copy3<T>(endvert, endverts + 3*i);
+  ptr = buffer;
+  T* face1 = (T*)ptr;    ptr += align8(sizeof(T) * 3 * npolygonmax);
+  T* face2 = (T*)ptr;    ptr += align8(sizeof(T) * 3 * npolygonmax);
+  T* polygon = (T*)ptr;
+
   // recover geom1 matching edge or face
   if (edgecon1) {
     copy3<T>(face1, triface1);
-    copy3<T>(face1 + 3, endverts + 3*i);
+    copy3<T>(face1 + 3, endvert);
     nface1 = 2;
   } else {
     if (obj1->geom_type == mjGEOM_BOX) {
-      int ind = (edgecon2 ? idx1[j] : idx1[i]);
-      nface1 = boxFace<T>(face1, obj1, ind);
+      nface1 = boxFace<T>(face1, obj1, face1_index);
     } else if (obj1->geom_type == mjGEOM_MESH) {
-      int ind = (edgecon2 ? idx1[j] : idx1[i]);
-      nface1 = meshFace<T>(face1, obj1, ind);
+      nface1 = meshFace<T>(face1, obj1, face1_index);
     }
   }
 
   // recover geom2 matching edge or face
   if (edgecon2) {
     copy3<T>(face2, triface2);
-    copy3<T>(face2 + 3, endverts + 3*i);
+    copy3<T>(face2 + 3, endvert);
     nface2 = 2;
   } else {
     if (obj2->geom_type == mjGEOM_BOX) {
-      nface2 = boxFace<T>(face2, obj2, idx2[j]);
+      nface2 = boxFace<T>(face2, obj2, face2_index);
     } else if (obj2->geom_type == mjGEOM_MESH) {
-      nface2 = meshFace<T>(face2, obj2, idx2[j]);
+      nface2 = meshFace<T>(face2, obj2, face2_index);
     }
   }
 
@@ -1213,21 +1229,21 @@ template<class T> CM_DEVICE int mjc_multicontact(Obj<T>* obj1, Obj<T>* obj2, T* 
   int nx;
   if (edgecon1) {
     // face1 is an edge; clip face1 against face2
-    scl3<T>(wit_dir, n2 + 3*j, -1.0);
+    scl3<T>(wit_dir, normal2, -1.0);
     copy3<T>(normal, wit_dir);
-    nx = polygonClip<T>(x2, x1, dist, nconmax, face2, nface2, face1, nface1, n2 + 3*j, wit_dir,
+    nx = polygonClip<T>(x2, x1, dist, nconmax, face2, nface2, face1, nface1, normal2, wit_dir,
                      polygon, npolygonmax, margin);
   } else if (edgecon2) {
     // face2 is an edge; clip face2 against face1
-    scl3<T>(wit_dir, n1 + 3*j, -1.0);
-    copy3<T>(normal, n1 + 3*j);
-    nx = polygonClip<T>(x1, x2, dist, nconmax, face1, nface1, face2, nface2, n1 + 3*j, wit_dir,
+    scl3<T>(wit_dir, normal1, -1.0);
+    copy3<T>(normal, normal1);
+    nx = polygonClip<T>(x1, x2, dist, nconmax, face1, nface1, face2, nface2, normal1, wit_dir,
                      polygon, npolygonmax, margin);
   } else {
     // face-face collision
-    copy3<T>(wit_dir, n2 + 3*j);
-    scl3<T>(normal, n2 + 3*j, -1.0);
-    nx = polygonClip<T>(x1, x2, dist, nconmax, face1, nface1, face2, nface2, n1 + 3*i, wit_dir,
+    copy3<T>(wit_dir, normal2);
+    scl3<T>(normal, normal2, -1.0);
+    nx = polygonClip<T>(x1, x2, dist, nconmax, face1, nface1, face2, nface2, normal1, wit_dir,
                      polygon, npolygonmax, margin);
   }
 
@@ -3058,7 +3074,7 @@ CM_DEVICE void vertex(Obj<Dual>* o,int index,Dual* result) {
 // The active support IDs are discrete. The selected face, all witnesses, clipping
 // intersections, normals and tangent frame below retain their state derivatives.
 CM_DEVICE int replay(int g1,int g2,const float* gx,const float* gq,const CMFeature& feature,
-                     int seed,CMScratch* scratch,Replay* output) {
+                     int seed,CMReplayScratch* scratch,Replay* output) {
   Obj<Dual> a,b;
   init<Dual>(&a,g1,gx,gq,seed<6 ? seed : -1);
   init<Dual>(&b,g2,gx,gq,seed>=6 ? seed-6 : -1);
@@ -3086,16 +3102,10 @@ CM_DEVICE int replay(int g1,int g2,const float* gx,const float* gq,const CMFeatu
   }
   return 0;
 }
-CM_DEVICE void contact_geometry(const Replay& result,int slot,Dual* dist,Dual* pos,Dual* frame) {
+CM_DEVICE void contact_geometry(const Replay& result,int slot,Dual* dist,Dual* pos) {
   *dist=result.dist[slot];
-  Dual normal[3];
-  for(int k=0;k<3;k++) {
+  for(int k=0;k<3;k++)
     pos[k]=(result.x1[3*slot+k]+result.x2[3*slot+k])*Dual(0.5f);
-    // The same selected face direction avoids subtracting nearly coincident
-    // world witnesses, which corrupts shallow-contact normals and their VJP.
-    normal[k]=result.normal[k];
-  }
-  cmgeom::frame<Dual>(normal,frame);
 }
 } // namespace cm
 
@@ -3142,13 +3152,15 @@ CM_DEVICE void convex_manifold(int g1,int g2,const float* gx,const float* gq,
   for(int i=0;i<3;i++){feature.support1[i]=a.suppind[i]; feature.support2[i]=b.suppind[i];}
   feature.nsupp1=feature.nsupp2=3; feature.outward_sign=status.final_sign;
   cm::Replay replay;
-  int error=cm::replay(g1,g2,gx,gq,feature,-1,scratch,&replay);
+  int error=cm::replay(g1,g2,gx,gq,feature,-1,&scratch->replay,&replay);
   if(error){manifold->status|=error;return;}
   feature.count=replay.count;
   manifold->count=replay.count;
+  // Every slot shares the selected face direction, including shallow contacts.
+  cm::Dual frame[9];cmgeom::frame<cm::Dual>(replay.normal,frame);
   for(int slot=0;slot<replay.count;slot++) {
-    cm::Dual d,p[3],frame[9];
-    cm::contact_geometry(replay,slot,&d,p,frame);
+    cm::Dual d,p[3];
+    cm::contact_geometry(replay,slot,&d,p);
     CMContact* c=manifold->contact+slot;
     c->dist=d.v;
     for(int k=0;k<3;k++) c->pos[k]=p[k].v;
@@ -3169,7 +3181,7 @@ struct Scratch {
   T polygon[2][12][3],accepted[12][3],clip_distance[12];
   Contact contact[8];
 };
-static_assert(sizeof(Scratch)<=CM_SCRATCH_BYTES,"box geometry fits caller scratch");
+static_assert(sizeof(Scratch)<=CM_REPLAY_SCRATCH_BYTES,"box geometry fits replay scratch");
 constexpr float SEPEPS=1e-6f, PAREPS=1e-7f, SGNEPS=1e-5f, DUPEPS=1e-10f, EDGEBIAS=1e-6f;
 constexpr int MAXVERT=12;
 CM_DEVICE void copy3(T* out,const T* in){for(int i=0;i<3;i++)out[i]=in[i];}
@@ -3663,7 +3675,7 @@ CM_DEVICE int geometry(const T* pos1,const T* mat1,const T* size1,
 
 namespace cmbb {
 CM_DEVICE int evaluate(int g1,int g2,const float* gx,const float* gq,const CMFeature* saved,
-                       int seed,CMScratch* scratch,CMFeature* active) {
+                       int seed,CMReplayScratch* scratch,CMFeature* active) {
   cm::Obj<T> a,b;
   cm::init<T>(&a,g1,gx,gq,seed<6 ? seed : -1);
   cm::init<T>(&b,g2,gx,gq,seed>=6 ? seed-6 : -1);
@@ -3671,9 +3683,7 @@ CM_DEVICE int evaluate(int g1,int g2,const float* gx,const float* gq,const CMFea
   active->reserved=1;
   return geometry(a.pos,a.mat,a.size,b.pos,b.mat,b.size,saved,active,(Scratch*)scratch->bytes);
 }
-CM_DEVICE void output(const Contact& c,bool flip,const CMFeature& feature,CMContact* out) {
-  T frame[9];
-  cmgeom::frame<T>(c.normal,frame);
+CM_DEVICE void output(const Contact& c,const T* frame,bool flip,const CMFeature& feature,CMContact* out) {
   out->dist=c.dist.v;
   for(int k=0;k<3;k++)out->pos[k]=c.pos[k].v;
   for(int k=0;k<9;k++)out->frame[k]=frame[k].v;
@@ -3693,14 +3703,16 @@ CM_DEVICE void box_box_manifold(int g1,int g2,const float* gx,const float* gq,
   bool flip=g1>g2;
   if(flip){int tmp=g1;g1=g2;g2=tmp;}
   CMFeature feature;
-  int count=cmbb::evaluate(g1,g2,gx,gq,nullptr,-1,scratch,&feature);
+  int count=cmbb::evaluate(g1,g2,gx,gq,nullptr,-1,&scratch->replay,&feature);
   if(count<0){manifold->status=-count;return;}
   feature.count=count;
   manifold->count=count;
   const cmbb::Contact* contacts=((cmbb::Scratch*)scratch->bytes)->contact;
+  cmbb::T frame[9];
+  if(count)cmgeom::frame<cmbb::T>(contacts[0].normal,frame);
   for(int slot=0;slot<count;slot++){
     feature.slot=slot;
-    cmbb::output(contacts[slot],flip,feature,manifold->contact+slot);
+    cmbb::output(contacts[slot],frame,flip,feature,manifold->contact+slot);
   }
 }
 
@@ -3710,10 +3722,11 @@ CM_DEVICE int box_box_contact_replay(int g1,int g2,const float* gx,const float* 
   bool flip=g1>g2;
   if(flip){int tmp=g1;g1=g2;g2=tmp;}
   CMFeature active;
-  int count=cmbb::evaluate(g1,g2,gx,gq,&feature,-1,scratch,&active);
+  int count=cmbb::evaluate(g1,g2,gx,gq,&feature,-1,&scratch->replay,&active);
   if(count!=feature.count)return 16;
   const cmbb::Contact* contacts=((cmbb::Scratch*)scratch->bytes)->contact;
-  cmbb::output(contacts[feature.slot],flip,feature,output);
+  cmbb::T frame[9];cmgeom::frame<cmbb::T>(contacts[feature.slot].normal,frame);
+  cmbb::output(contacts[feature.slot],frame,flip,feature,output);
   return 0;
 }
 
@@ -3727,7 +3740,7 @@ CM_DEVICE int box_box_contact_vjp(int g1,int g2,const float* gx,const float* gq,
   for(int seed=0;seed<12;seed++) {
     int canonical_seed=flip ? (seed<6 ? seed+6 : seed-6) : seed;
     CMFeature active;
-    int count=cmbb::evaluate(g1,g2,gx,gq,&feature,canonical_seed,scratch,&active);
+    int count=cmbb::evaluate(g1,g2,gx,gq,&feature,canonical_seed,&scratch->replay,&active);
     if(count!=feature.count)return 16;
     const cmbb::Contact& c=((cmbb::Scratch*)scratch->bytes)->contact[feature.slot];
     cmbb::T frame[9];cmgeom::frame<cmbb::T>(c.normal,frame);
@@ -3751,10 +3764,11 @@ CM_DEVICE int convex_contact_replay(int g1,int g2,const float* gx,const float* g
   bool flip=cm_type[g1]>cm_type[g2] || (cm_type[g1]==cm_type[g2] && g1>g2);
   if(flip){int tmp=g1;g1=g2;g2=tmp;}
   cm::Replay replay;
-  int error=cm::replay(g1,g2,gx,gq,feature,-1,scratch,&replay);
+  int error=cm::replay(g1,g2,gx,gq,feature,-1,&scratch->replay,&replay);
   if(error || replay.count!=feature.count) return 16;
   cm::Dual d,p[3],frame[9];
-  cm::contact_geometry(replay,feature.slot,&d,p,frame);
+  cm::contact_geometry(replay,feature.slot,&d,p);
+  cmgeom::frame<cm::Dual>(replay.normal,frame);
   output->dist=d.v;
   for(int k=0;k<3;k++) output->pos[k]=p[k].v;
   for(int k=0;k<9;k++) output->frame[k]=frame[k].v;
@@ -3773,10 +3787,11 @@ CM_DEVICE int convex_contact_vjp(int g1,int g2,const float* gx,const float* gq,
   for(int seed=0;seed<12;seed++) {
     cm::Replay replay;
     int canonical_seed=flip ? (seed<6 ? seed+6 : seed-6) : seed;
-    int error=cm::replay(g1,g2,gx,gq,feature,canonical_seed,scratch,&replay);
+    int error=cm::replay(g1,g2,gx,gq,feature,canonical_seed,&scratch->replay,&replay);
     if(error || replay.count!=feature.count) return 16;
     cm::Dual d,p[3],frame[9];
-    cm::contact_geometry(replay,feature.slot,&d,p,frame);
+    cm::contact_geometry(replay,feature.slot,&d,p);
+    cmgeom::frame<cm::Dual>(replay.normal,frame);
     if(flip) for(int k=0;k<3;k++){frame[k]=-frame[k];frame[6+k]=-frame[6+k];}
     float g=dbar*d.d;
     for(int k=0;k<3;k++) g+=pbar[k]*p[k].d;
@@ -3804,7 +3819,7 @@ CM_DEVICE void cm_linearization_store(CMLinearization* result,int slot,int seed,
 }
 
 CM_DEVICE int convex_manifold_linearize(int g1,int g2,const float* gx,const float* gq,
-                                        const CMFeature& feature,CMScratch* scratch,CMLinearization* result) {
+                                        const CMFeature& feature,CMReplayScratch* scratch,CMLinearization* result) {
   if(feature.nsupp1!=3 || feature.nsupp2!=3 || feature.slot<0 || feature.slot>=feature.count ||
      feature.count>CM_REPLAY_SLOTS)return 16;
   bool flip=cm_type[g1]>cm_type[g2] || (cm_type[g1]==cm_type[g2] && g1>g2);
@@ -3814,10 +3829,11 @@ CM_DEVICE int convex_manifold_linearize(int g1,int g2,const float* gx,const floa
     int canonical_seed=flip ? (seed<6 ? seed+6 : seed-6) : seed;
     int error=cm::replay(g1,g2,gx,gq,feature,canonical_seed,scratch,&replay);
     if(error || replay.count!=feature.count)return 16;
+    cm::Dual frame[9];cmgeom::frame<cm::Dual>(replay.normal,frame);
+    if(flip)for(int k=0;k<3;k++){frame[k]=-frame[k];frame[6+k]=-frame[6+k];}
     for(int slot=0;slot<replay.count;slot++) {
-      cm::Dual d,p[3],frame[9];
-      cm::contact_geometry(replay,slot,&d,p,frame);
-      if(flip)for(int k=0;k<3;k++){frame[k]=-frame[k];frame[6+k]=-frame[6+k];}
+      cm::Dual d,p[3];
+      cm::contact_geometry(replay,slot,&d,p);
       cm_linearization_store(result,slot,seed,d,p,frame);
     }
   }
@@ -3825,7 +3841,7 @@ CM_DEVICE int convex_manifold_linearize(int g1,int g2,const float* gx,const floa
 }
 
 CM_DEVICE int box_box_manifold_linearize(int g1,int g2,const float* gx,const float* gq,
-                                         const CMFeature& feature,CMScratch* scratch,CMLinearization* result) {
+                                         const CMFeature& feature,CMReplayScratch* scratch,CMLinearization* result) {
   if(!cmbb::valid_feature(feature) || feature.count>CM_REPLAY_SLOTS)return 16;
   bool flip=g1>g2;
   if(flip){int tmp=g1;g1=g2;g2=tmp;}
@@ -3835,9 +3851,9 @@ CM_DEVICE int box_box_manifold_linearize(int g1,int g2,const float* gx,const flo
     int count=cmbb::evaluate(g1,g2,gx,gq,&feature,canonical_seed,scratch,&active);
     if(count!=feature.count)return 16;
     const cmbb::Contact* contacts=((cmbb::Scratch*)scratch->bytes)->contact;
+    cmbb::T frame[9];cmgeom::frame<cmbb::T>(contacts[0].normal,frame);
+    if(flip)for(int k=0;k<3;k++){frame[k]=-frame[k];frame[6+k]=-frame[6+k];}
     for(int slot=0;slot<count;slot++) {
-      cmbb::T frame[9];cmgeom::frame<cmbb::T>(contacts[slot].normal,frame);
-      if(flip)for(int k=0;k<3;k++){frame[k]=-frame[k];frame[6+k]=-frame[6+k];}
       cm_linearization_store(result,slot,seed,contacts[slot].dist,contacts[slot].pos,frame);
     }
   }

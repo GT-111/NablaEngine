@@ -163,7 +163,8 @@ extern "C" int cm_replay(int g1,int g2,const float* x,const float* q,const int* 
 }
 extern "C" int cm_linearize(int g1,int g2,const float* x,const float* q,const int* feature,
                              const float* cotangent,float* value,float* gradient) {
-  GuardedScratch guard; guard.before=0x18273645; guard.after=0x54637281;
+  struct { uint64_t before; CMReplayScratch scratch; uint64_t after; } guard;
+  guard.before=0x18273645; guard.after=0x54637281;
   struct { uint64_t before; CMLinearization data; uint64_t after; } cache;
   cache.before=0x18273645; cache.after=0x54637281;
   CMFeature f; const unsigned char* p=(const unsigned char*)feature; unsigned char* b=(unsigned char*)&f;
@@ -472,16 +473,22 @@ class ConvexMeshCheck(unittest.TestCase):
 
     def test_manifold_linearization_reuses_all_slots_without_changing_geometry_or_vjp(self):
         rng = np.random.default_rng(421)
-        for model in (self.mesh, self.box, self.single, self.prism, self.pyramid,
-                      self.multiple, self.boxes, self.octagon, self.octagon_no_multi):
+        cases = [(model, None) for model in (self.mesh, self.box, self.single, self.prism, self.pyramid,
+                                            self.multiple, self.boxes, self.octagon, self.octagon_no_multi)]
+        axis = np.array([.3, .5, .8]) / np.linalg.norm([.3, .5, .8])
+        for angle in (.1, .25):
+            qpos = self.mesh.qpos0.copy()
+            qpos[10], qpos[11:14] = np.cos(angle / 2), axis * np.sin(angle / 2)
+            cases.append((self.mesh, qpos))
+        for model, qpos in cases:
             engine = self.engines[id(model)]
-            _, x, q = poses(model)
+            _, x, q = poses(model, qpos)
             for pair in ((0, 1), (1, 0)):
                 with self.subTest(model=model, pair=pair):
                     contacts, features = engine.forward(x, q, pair=pair)
                     self.assertGreater(len(contacts), 0)
                     bar = rng.normal(size=contacts.shape).astype(np.float32)
-                    bar[::2] = 0.  # inactive slots retain their exact zero VJP
+                    bar[1::2] = 0.  # inactive slots retain their exact zero VJP
                     values, gradients = engine.linearize(x, q, features[-1], bar, pair=pair)
                     np.testing.assert_array_equal(values.view(np.uint32), contacts.view(np.uint32))
                     for slot, feature in enumerate(features):

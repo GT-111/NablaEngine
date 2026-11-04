@@ -131,15 +131,22 @@ class GenerationCheck(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("c++"), "state layout check requires a C++ compiler")
     def test_state_layout_compiles_with_root_count_macro(self):
-        model = hand_model(22, roots=2)
-        header = source.header(model, maxd=8, wpb=1).replace("#include <cuda_runtime.h>", "")
         sim = step.STEP_DEVICE.split("struct Sim {", 1)[1].split("// a condition that", 1)[0]
         split = step.STEP_KERNEL.split("// The split forward (host.py:", 1)[1]
-        code = ("#define __device__\n" + header + step.step_header(model) + "struct Sim {" + sim
-                + "// The split forward (host.py:" + split + "\nstatic_assert(sizeof(Hand) > 0);\n")
-        result = subprocess.run(["c++", "-std=c++17", "-fsyntax-only", "-x", "c++", "-"],
-                                input=code, text=True, capture_output=True)
-        self.assertEqual(result.returncode, 0, result.stderr)
+        row_tiles = next(line for line in step.STEP_KERNEL.splitlines() if "constexpr int RT =" in line)
+        instances = ("\ntemplate<class S> constexpr int row_tiles(const S& s) {\n" + row_tiles
+                     + "\nreturn RT;\n}\n"
+                     "static_assert(row_tiles(Sim{}) == (NEFC + 31) / 32);\n"
+                     "static_assert(row_tiles(SimN{}) == (SPLIT_NEFC + 31) / 32);\n"
+                     "static_assert(row_tiles(SimNfull{}) == (NEFC + 31) / 32);\n"
+                     "static_assert(sizeof(Hand) > 0);\n")
+        for model in (hand_model(22, roots=2), dense_contact_model()):
+            header = source.header(model, maxd=8, wpb=1).replace("#include <cuda_runtime.h>", "")
+            code = ("#define __device__\n" + header + step.step_header(model) + "struct Sim {" + sim
+                    + "// The split forward (host.py:" + split + instances)
+            result = subprocess.run(["c++", "-std=c++17", "-fsyntax-only", "-x", "c++", "-"],
+                                    input=code, text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
 
     @unittest.skipUnless(shutil.which("c++"), "root-axis reuse check requires a C++ compiler")
     def test_contact_root_axes_reuse_exact_rotations_for_one_and_two_free_trees(self):
@@ -200,6 +207,84 @@ int main() {
                 self.assertEqual(compiled.returncode, 0, compiled.stderr)
                 result = subprocess.run([str(path / "axes")], text=True, capture_output=True)
                 self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipUnless(shutil.which("c++"), "contact-motion check requires a C++ compiler")
+    def test_contact_support_walk_preserves_dense_motion_sums_with_passive_dofs(self):
+        motion = adjoint.ADJ_DEVICE.split("  float Vv[3] =", 1)[1].split("  float Wv[3]", 1)[0]
+        motion = "  float Vv[3] =" + motion
+        # Keep the arithmetic fixed: the reference visits the same dofs by a dense scan.
+        contribution = "float sg =" + motion.split("      float sg =", 1)[1].rsplit("\n    }\n  }", 1)[0]
+        dense = motion.split("  // Body and local-dof order", 1)[0] + """
+  for (int i = 0; i < NV; i++) {
+    int bi = c_dofbody[i], local = c_doflocal[i];
+    if (!((sup >> bi) & 1ull)) continue;
+""" + contribution + "\n  }\n"
+        store = """
+  const float values[18] = {Vv[0],Vv[1],Vv[2],Va[0],Va[1],Va[2],Vl[0],Vl[1],Vl[2],
+                           Ov[0],Ov[1],Ov[2],Oa[0],Oa[1],Oa[2],Ol[0],Ol[1],Ol[2]};
+  std::memcpy(output, values, sizeof(values));
+}
+"""
+        harness = r'''
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+struct Adj { float v[NV],a[NV],lam[NV],X[NB][3],z[NB][3],zr[3*NR][3]; };
+inline int __ffsll(unsigned long long value) { return __builtin_ffsll(value); }
+inline void cross(const float* a,const float* b,float* out) {
+  out[0]=a[1]*b[2]-a[2]*b[1];out[1]=a[2]*b[0]-a[0]*b[2];out[2]=a[0]*b[1]-a[1]*b[0];
+}
+inline void adj_contact_root_axis(const Adj& s,int body,int axis,float* out) {
+  for(int k=0;k<3;k++)out[k]=s.zr[(body==c_roots[0]?0:3)+axis][k];
+}
+'''
+        main = r'''
+int main() {
+  Adj s;
+  for(int pass=0;pass<8;pass++) {
+    float* state=reinterpret_cast<float*>(&s);
+    for(unsigned k=0;k<sizeof(s)/sizeof(float);k++)state[k]=std::sin(float(1+pass+7*k));
+    for(int b1=0;b1<NB;b1++)for(int b2=0;b2<NB;b2++) {
+      float p[3]={.13f*b1,-.17f*b2,.03f*(b1-b2)}, actual[18],expected[18];
+      sparse(s,b1,b2,p,actual);dense(s,b1,b2,p,expected);
+      if(std::memcmp(actual,expected,sizeof(actual))) {
+        std::fprintf(stderr,"motion mismatch: pass=%d bodies=%d,%d\n",pass,b1,b2);return 1;
+      }
+    }
+  }
+}
+'''
+        with tempfile.TemporaryDirectory(prefix="nabla-contact-support-cpu-") as directory:
+            path = Path(directory)
+            for roots, hinges in ((1, 58), (2, 26)):
+                model = hand_model(hinges, roots=roots, passive=True)
+                source.constants(model, source.free_roots(model))
+                _, masks = step.extra_constants(model)
+                local = np.arange(model.nv) - model.body_dofadr[model.dof_bodyid]
+                arrays = {"c_dadr": model.body_dofadr, "c_isfree": model.body_dofnum == 6,
+                          "c_dofbody": model.dof_bodyid, "c_doflocal": local, "c_roots": source.free_roots(model)}
+                constants = "".join(f'int {name}[]={{' + ",".join(str(int(x)) for x in values) + "};\n"
+                                    for name, values in arrays.items())
+                constants += "unsigned long long c_ancmask[]={" + ",".join(f"{int(x)}ull" for x in masks) + "};\n"
+                code = constants + harness
+                for name, body in (("sparse", motion), ("dense", dense)):
+                    code += f'void {name}(const Adj& s,int b1,int b2,const float* p,float* output) {{\n' + body + store
+                (path / "motion.cc").write_text(code + main)
+                compiled = subprocess.run(["c++", "-std=c++17", "-O2", "-ffp-contract=off",
+                    f"-DNB={model.nbody}", f"-DNV={model.nv}", f"-DNR={roots}",
+                    str(path / "motion.cc"), "-o", str(path / "motion")], text=True, capture_output=True)
+                self.assertEqual(compiled.returncode, 0, compiled.stderr)
+                result = subprocess.run([str(path / "motion")], text=True, capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipUnless(shutil.which("c++"), "friction-row preprocessing check requires a C++ compiler")
+    def test_adjoint_omits_friction_row_scan_only_when_model_has_none(self):
+        limits = adjoint.ADJ_DEVICE.split("void adj_limits(", 1)[1].split("// Root rotation axes", 1)[0]
+        for count in (0, 3):
+            result = subprocess.run(["c++", "-E", "-P", "-x", "c++", f"-DNFLOSS={count}", "-"],
+                                    input="void adj_limits(" + limits, text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual("c_floss[i]" in result.stdout, count > 0)
 
     @unittest.skipUnless(shutil.which("c++"), "Hessian accumulation check requires a C++ compiler")
     def test_hessian_retains_small_contact_curvature_across_tiles(self):

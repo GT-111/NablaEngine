@@ -252,7 +252,7 @@ struct Adj {
   int hdr, nlim;  // the record's ncon | nefc << 16 and separate limit count
   int flags;  // union of the records' flags (tape.py), ADJ_ROWS_SKIPPED, ADJ_REPLAY_MISMATCH
 #if HAS_NATIVE_COLLISION
-  CMScratch cm_scratch;
+  CMReplayScratch cm_scratch;
   CMLinearization cm_linearization;
   int cm_cached_pair;  // only valid within the current adj_contacts pass
   const float* feature_rec;
@@ -896,6 +896,7 @@ __device__ __noinline__ void adj_limits(Adj& s, int lane, float* dbg_in) {
   float* const dbg = DBG ? dbg_in : nullptr;
   (void)dbg;  // no debug entries without -DDK_ADJ_DEBUG
   const unsigned below = (1u << lane) - 1u;
+#if NFLOSS > 0
   int nf = 0;
   for (int i0 = 0; i0 < NV; i0 += 32) {
     int i = i0 + lane;
@@ -911,6 +912,7 @@ __device__ __noinline__ void adj_limits(Adj& s, int lane, float* dbg_in) {
     }
     nf += __popc(bal);
   }
+#endif
   for (int i = lane; i < NV; i += 32)
     for (int e = 0; e < NEQ; e++) {
       float coef = (i == c_eqdof1[e] ? 1.f : 0.f) - (i == c_eqdof2[e] ? c_eqpoly[2 * e + 1] : 0.f);
@@ -1022,24 +1024,28 @@ __device__ __forceinline__ float adj_contact_one(Adj& s, int c, int pair, int sl
   float Vv[3] = {0.f, 0.f, 0.f}, Va[3] = {0.f, 0.f, 0.f}, Vl[3] = {0.f, 0.f, 0.f};
   float Ov[3] = {0.f, 0.f, 0.f}, Oa[3] = {0.f, 0.f, 0.f}, Ol[3] = {0.f, 0.f, 0.f};
   const unsigned long long m1 = c_ancmask[b1], m2 = c_ancmask[b2], sup = m1 ^ m2;
-  for (int i = 0; i < NV; i++) {
-    int bi = c_dofbody[i], local = c_doflocal[i];
-    if (!((sup >> bi) & 1ull)) continue;
-    float sg = (m2 >> bi) & 1ull ? 1.f : -1.f;
-    float vi = sg * s.v[i], ai = sg * s.a[i], li = sg * s.lam[i];
-    float z[3] = {0.f, 0.f, 0.f}, col[3] = {0.f, 0.f, 0.f};
-    if (c_isfree[bi] && local < 3) col[local] = 1.f;
-    else {
-      if (c_isfree[bi]) {
-        adj_contact_root_axis(s, bi, local - 3, z);
-      } else for (int t = 0; t < 3; t++) z[t] = s.z[bi][t];
-      float r[3];
-      for (int t = 0; t < 3; t++) r[t] = p[t] - s.X[bi][t];
-      cross(z, r, col);
-    }
-    for (int t = 0; t < 3; t++) {
-      Vv[t] += vi * col[t]; Va[t] += ai * col[t]; Vl[t] += li * col[t];
-      Ov[t] += vi * z[t]; Oa[t] += ai * z[t]; Ol[t] += li * z[t];
+  // Body and local-dof order is dof order, including all FREE and passive dofs.
+#pragma unroll 1
+  for (unsigned long long pending = sup; pending; pending &= pending - 1ull) {
+    int bi = __ffsll(pending) - 1, width = c_isfree[bi] ? 6 : 1;
+    for (int local = 0; local < width; local++) {
+      int i = c_dadr[bi] + local;
+      float sg = (m2 >> bi) & 1ull ? 1.f : -1.f;
+      float vi = sg * s.v[i], ai = sg * s.a[i], li = sg * s.lam[i];
+      float z[3] = {0.f, 0.f, 0.f}, col[3] = {0.f, 0.f, 0.f};
+      if (c_isfree[bi] && local < 3) col[local] = 1.f;
+      else {
+        if (c_isfree[bi]) {
+          adj_contact_root_axis(s, bi, local - 3, z);
+        } else for (int t = 0; t < 3; t++) z[t] = s.z[bi][t];
+        float r[3];
+        for (int t = 0; t < 3; t++) r[t] = p[t] - s.X[bi][t];
+        cross(z, r, col);
+      }
+      for (int t = 0; t < 3; t++) {
+        Vv[t] += vi * col[t]; Va[t] += ai * col[t]; Vl[t] += li * col[t];
+        Ov[t] += vi * z[t]; Oa[t] += ai * z[t]; Ol[t] += li * z[t];
+      }
     }
   }
   float Wv[3], Wa[3], Wl[3], cot[13], fg[12];  // cot = (d bar, p bar, frame bar): adj_contact_geom's cotangent
