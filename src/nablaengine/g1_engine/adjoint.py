@@ -263,7 +263,7 @@ struct Adj {
   float AL2[NB][3];  // channel 2: angular acceleration at a~ with v = 0, no gravity (the twist recursion of a~)
   float Wl[NB][3], Wy[NB][3];  // angular parts of the twists of lambda, -y
 #ifdef DK_ADJ_DEBUG  // outside UB: the debug build's pass by source runs adj_tree_down after adj_contacts
-  float A[NB][3], zr[3][3], Pq[NV], Pv[NV];
+  float A[NB][3], zr[3 * NR][3], Pq[NV], Pv[NV];
 #endif
   union {  // UA
     struct {  // A0 .. A1
@@ -292,7 +292,7 @@ struct Adj {
         struct {  // A5 / A6 (adj_contacts; a batch's per-contact words stay in the registers of the contacts' lanes)
           float gx[NGEOMC_STORAGE][3], gq[NGEOMC_STORAGE][4];  // world poses of the collision geoms (the forward's geom_poses)
 #ifndef DK_ADJ_DEBUG
-          float zr[3][3];  // the root's rotation axes R_1 e_k (the anchor of their Jacobian columns is X_1)
+          float zr[3 * NR][3];  // each FREE root's world rotation axes, anchored at that root's X
 #endif
         };
         float rb[NB][3];  // A7: r bar_b of r_b = X_b - X_parent (the parent subtracts it from its F)
@@ -963,6 +963,21 @@ __device__ __noinline__ void adj_limits(Adj& s, int lane, float* dbg_in) {
   APROF(APROF_LIMITS);
 }
 
+// Root rotation axes are invariant across this pass's contacts. The coupled
+// row-motion and body-reduction loops share the same qrot results, as the
+// single-root path already does for its body reduction.
+__device__ __forceinline__ void adj_contact_root_axes(Adj& s, int lane) {
+  if (lane < 3 * NR) {
+    int axis = lane % 3;
+    const float e[3] = {axis == 0 ? 1.f : 0.f, axis == 1 ? 1.f : 0.f, axis == 2 ? 1.f : 0.f};
+    qrot(s.Q[c_roots[lane / 3]], e, s.zr[lane]);
+  }
+}
+__device__ __forceinline__ void adj_contact_root_axis(const Adj& s, int body, int axis, float* z) {
+  int i = (body == c_roots[0] ? 0 : 3) + axis;
+  for (int k = 0; k < 3; k++) z[k] = s.zr[i][k];
+}
+
 // A5 / A6 of contact c of the tape's table, (pair, slot) with the zone bits of its rows (bit e: row e on its quadratic
 // zone), on its own lane: the replay (adj_pair_geom: dist, pos, frame bitwise the forward's), the rows' impedance with
 // the forward's expressions (substep_pre: mu = the world's foot friction on a foot pair, the pyramid invweight for
@@ -1016,8 +1031,7 @@ __device__ __forceinline__ float adj_contact_one(Adj& s, int c, int pair, int sl
     if (c_isfree[bi] && local < 3) col[local] = 1.f;
     else {
       if (c_isfree[bi]) {
-        float e[3] = {0.f, 0.f, 0.f}; e[local - 3] = 1.f;
-        qrot(s.Q[bi], e, z);
+        adj_contact_root_axis(s, bi, local - 3, z);
       } else for (int t = 0; t < 3; t++) z[t] = s.z[bi][t];
       float r[3];
       for (int t = 0; t < 3; t++) r[t] = p[t] - s.X[bi][t];
@@ -1109,6 +1123,7 @@ __device__ void adj_contacts_coupled(Adj& s, int lane, float* dbg) {
     int b = c_gbody[g];
     geom_pose(g, s.Q[b], s.X[b], s.gx[g], s.gq[g]);
   }
+  adj_contact_root_axes(s, lane);
 #if HAS_NATIVE_COLLISION
   // Forward native pairs emit contiguous slots with one selected feature. Keep
   // their common linearization across contact tiles, then discard it at the
@@ -1183,8 +1198,7 @@ __device__ void adj_contacts_coupled(Adj& s, int lane, float* dbg) {
             if (c_isfree[b] && a < 3) { pv[a] += sg * w[a]; continue; }
             float z[3], r[3], col[3], G[3], u[3], v[3], y[3];
             if (c_isfree[b]) {
-              float axis[3] = {0.f, 0.f, 0.f}; axis[a - 3] = 1.f;
-              qrot(s.Q[b], axis, z);
+              adj_contact_root_axis(s, b, a - 3, z);
             } else for (int k = 0; k < 3; k++) z[k] = s.z[b][k];
             for (int k = 0; k < 3; k++) {
               r[k] = w[9 + k] - s.X[b][k];
@@ -1226,10 +1240,7 @@ __device__ __noinline__ void adj_contacts(Adj& s, int lane, float* dbg_in) {
     const int b = c_gbody[g];
     geom_pose(g, s.Q[b], s.X[b], s.gx[g], s.gq[g]);
   }
-  if (lane < 3) {
-    const float e[3] = {lane == 0 ? 1.f : 0.f, lane == 1 ? 1.f : 0.f, lane == 2 ? 1.f : 0.f};
-    qrot(s.Q[1], e, s.zr[lane]);
-  }
+  adj_contact_root_axes(s, lane);
 #ifdef DK_ADJ_DEBUG
   if (dbg) {
     for (int g = lane; g < NGEOMC; g += 32)
