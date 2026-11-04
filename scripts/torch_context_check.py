@@ -7,9 +7,11 @@ fake shapes, not CUDA numerical correctness. CUDA uses two real model artifacts.
 import argparse
 from contextlib import contextmanager
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -28,7 +30,8 @@ def contexts():
         nq, nv, nu, nb, rec = 8+index, 7+index, 1+index, 3+index, 9+index*8
         context = F.ModelContext(cid)
         nr = 1+index%2
-        context._state["info"] = dict(nq=nq, nv=nv, nu=nu, nbody=nb, nr=nr, com_width=3*nr, rec_words=rec)
+        context._state["info"] = dict(key=f"context-check-model-{index}", nq=nq, nv=nv, nu=nu,
+            nbody=nb, nr=nr, com_width=3*nr, rec_words=rec)
         F._CONTEXTS[cid] = context
         values.append(context)
     try:
@@ -100,14 +103,54 @@ int main() {
         with contexts() as owners, FakeTensorMode():
             for context in (*owners, owners[0]):
                 q, v, w, u, fr, com, force, kp = inputs(context)
-                out = ops["forward"](q, v, w, u, fr, com, force, kp, 10, 4, True, True, context.context_id)
+                out = ops["forward"](q, v, w, u, fr, com, force, kp, 10, 4, True, True,
+                    context.context_id, context.info["key"])
                 self.assertEqual(out[4].shape, (2, 4 * context.info["rec_words"]))
                 self.assertEqual(out[6].shape, (2, context.info["nbody"], 3))
                 self.assertEqual(context.tape_bytes(2), 4 * 2 * 4 * context.info["rec_words"])
                 grads = ops["backward"](out[4], fr, com, q, v, None, [], [], 4, 0, 3, 0.,
-                                        force, kp, context.context_id)
+                                        force, kp, context.context_id, context.info["key"])
                 self.assertEqual(grads[2].shape, u.shape)
                 self.assertEqual(grads[4].shape, force.shape)
+
+    def test_inductor_cache_distinguishes_models_reusing_a_context_id(self):
+        # The same context integer and operand shapes can describe a different
+        # model in the next process. Both processes must share the same cache.
+        code = """
+import sys
+import torch
+from nablaengine import torch_ffi as F
+
+owner = F.ModelContext(0)
+owner._state['info'] = dict(key=sys.argv[1], nq=46, nv=44, nu=32, nbody=35,
+    nr=2, com_width=6, rec_words=int(sys.argv[2]))
+F._CONTEXTS[0] = owner
+
+def native(q, v, w, u, fr, com, force, kp, iterations, substeps, tape, kin, cid):
+    rec = F._CONTEXTS[cid].info['rec_words']
+    return [q.clone(), v.clone(), w.clone(), torch.zeros(q.shape[0], 4, dtype=torch.int32),
+        torch.zeros(q.shape[0], substeps*rec)]
+
+F._forward_impl = native
+F._custom_ops()
+
+def program(q, v, w, u, fr, com):
+    return owner.forward(q, v, w, u, fr, com, tape=True)[4]
+
+batch = [torch.zeros(shape) for shape in ((2,46), (2,44), (2,44), (2,32), (2,), (2,6))]
+result = torch.compile(program, fullgraph=True)(*batch)
+assert result.shape == (2, 4*owner.info['rec_words']), result.shape
+print(tuple(result.shape))
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            env = dict(os.environ, CUDA_VISIBLE_DEVICES="", TORCHINDUCTOR_CACHE_DIR=directory,
+                TORCHINDUCTOR_FX_GRAPH_CACHE="1", TORCHINDUCTOR_AUTOGRAD_CACHE="1")
+            env["PYTHONPATH"] = str(Path(F.__file__).resolve().parents[1])+os.pathsep+env.get("PYTHONPATH", "")
+            for key, rec in (("mesh-model", 1352), ("capsule-model", 584)):
+                result = subprocess.run((sys.executable, "-c", code, key, str(rec)),
+                    env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+                self.assertEqual(result.stdout.strip(), str((2, 4*rec)))
 
     def test_delayed_backward_retains_context_and_force_gradient(self):
         launches = []
@@ -126,8 +169,8 @@ int main() {
             return [gq * gain, gv * gain, gu, tp.new_zeros((tp.shape[0],), dtype=torch.int32), gv * gain]
 
         F._custom_ops()  # real init also registers before any compilation
-        with contexts() as owners, patch.dict(F._IMPL, forward=forward, backward=backward), \
-                patch.object(F, "_forward_impl", forward), patch.object(F, "_backward_impl", backward):
+        with contexts() as owners, patch.object(F, "_forward_impl", forward), \
+                patch.object(F, "_backward_impl", backward):
             for compiled in (False, True):
                 launches.clear()
                 batches, results = [], []
@@ -158,8 +201,8 @@ int main() {
             return [qbar, gv.clone(), ubar, tp.new_zeros((tp.shape[0],), dtype=torch.int32), gv.clone()]
 
         F._custom_ops()
-        with contexts() as owners, patch.dict(F._IMPL, forward=forward, backward=backward), \
-                patch.object(F, "_forward_impl", forward), patch.object(F, "_backward_impl", backward):
+        with contexts() as owners, patch.object(F, "_forward_impl", forward), \
+                patch.object(F, "_backward_impl", backward):
             owner = owners[1]  # two FREE roots, six COM operands
             for compiled in (False, True):
                 for kin in (False, True):

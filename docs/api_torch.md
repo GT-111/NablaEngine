@@ -96,9 +96,10 @@ and the G1 default remains `(B, 3)` with its torso binding. `context.info` recor
 `com_body_ids` and the actual FREE Q/V addresses. Contexts are retained for the process lifetime because delayed autograd and
 captured CUDA graphs reference their libraries and constants. There is no model reload or global constant switch.
 
-Custom ops register once and carry a static integer context identity. Their fake shapes use that context's Q/V,
-actuator, body and tape dimensions. Forward saves the same identity for delayed backward, including after another
-model has run. Prepare each context on every target device with `context.init(device)` before capture.
+Custom ops register once and carry both the process-local context ID and the existing artifact model key.
+The key distinguishes model shapes in persistent compiler caches when a new process reuses a context number.
+Their fake shapes use that context's Q/V, actuator, body and tape dimensions. Forward saves both identities for
+delayed backward, including after another model has run. Prepare each context on every target device with `context.init(device)` before capture.
 `scripts/torch_context_check.py` checks routing and fake shapes on CPU; `--cuda ARTIFACT_A ARTIFACT_B` additionally
 checks real delayed VJPs and compiled/graph execution on CUDA. CPU routing checks are not CUDA qualification.
 
