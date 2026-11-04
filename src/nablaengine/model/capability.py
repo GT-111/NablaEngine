@@ -49,9 +49,9 @@ J, G, T = mujoco.mjtJoint, mujoco.mjtGeom, mujoco.mjtTrn
 GEOM_CODE = {int(G.mjGEOM_PLANE): 0, int(G.mjGEOM_SPHERE): 1, int(G.mjGEOM_CAPSULE): 2, int(G.mjGEOM_BOX): 3,
              int(G.mjGEOM_MESH): 4}
 FORWARD_TYPES = {0, 1, 2, 3, 4}
-ADJOINT_PAIRS = {(0, 1), (0, 2), (1, 1), (1, 2), (2, 2), (3, 3), (3, 4), (4, 4)}
-DISPATCHED = ADJOINT_PAIRS | {(0, 3), (2, 3)}
-CONTACTS_PER_PAIR = {(0, 1): 1, (0, 2): 2, (0, 3): 4, (1, 1): 1, (1, 2): 1, (2, 2): 2, (2, 3): 2,
+ADJOINT_PAIRS = {(0, 1), (0, 2), (1, 1), (1, 2), (1, 3), (2, 2), (2, 3), (3, 3), (3, 4), (4, 4)}
+DISPATCHED = ADJOINT_PAIRS | {(0, 3)}
+CONTACTS_PER_PAIR = {(0, 1): 1, (0, 2): 2, (0, 3): 4, (1, 1): 1, (1, 2): 1, (1, 3): 1, (2, 2): 2, (2, 3): 2,
                      (3, 3): 8, (3, 4): 4, (4, 4): 4}
 D, E = mujoco.mjtDisableBit, mujoco.mjtEnableBit
 # disable flags that cannot change the engine's results: sensors (the engine computes none), Euler damping (Euler is
@@ -307,12 +307,11 @@ def check(m, foot_pairs=None, com_body=COM_BODY, scope="engine"):
     add("H14a", types <= FORWARD_TYPES, "error", "contact pair geoms are planes, spheres, capsules, boxes or meshes", tnames)
     planes_off_world = [g for g in cg if m.geom_type[g] == G.mjGEOM_PLANE and m.geom_bodyid[g] != 0]
     add("H14b", set(pair_codes) <= ADJOINT_PAIRS and not planes_off_world, "error", "contact adjoint routes are plane "
-        "(on world)-sphere/capsule, sphere/capsule pairs, box-box, box-mesh or mesh-mesh",
+        "(on world)-sphere/capsule, sphere/capsule/box pairs, box-mesh or mesh-mesh",
         dict(types=tnames, planes_off_world=planes_off_world[:4]),
         ("adjoint",))
     combos = sorted(set(pair_codes) - DISPATCHED)
-    add("H14c", not combos, "error", "every pair's type combination is one the forward collides (not plane-plane, "
-        "sphere-box)", combos)
+    add("H14c", not combos, "error", "every pair's type combination is one the forward collides", combos)
     # Native mesh GJK/EPA uses the authored CCD options. MuJoCo 3.17 dispatches
     # box-box to its specialized SAT collider independently of those options.
     boxbox = pair_codes.count((3, 3))

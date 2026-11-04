@@ -2,18 +2,18 @@
 # (mujoco_warp/_src/collision_primitive_core.py, math.make_frame; Copyright 2025 The Newton Developers, Apache License
 # 2.0), and follow the conventions of MuJoCo Warp's adjoint (google-deepmind/mujoco_warp pull request 1535:
 # collision_adjoint.py, adjoint_util.py, constraint_adjoint.py) so that they can be checked against it; the derivations
-# are this engine's.
+# are this engine's. Box primitives retain the full selected-branch derivative, including the second
+# capsule-box offset (the upstream frozen-witness replay holds that offset constant).
 """CUDA device functions of the contact side of the analytic adjoint: impedance derivatives, the joint-limit row VJP,
 the contact row VJP Psi_c, the per-dof pose cotangents of a contact Jacobian column, and the collision-primitive VJPs
-of the mjlab model (plane-sphere, plane-capsule, sphere-sphere, sphere-capsule, capsule-capsule) with make_frame, the
+(plane-sphere, plane-capsule, sphere-sphere, sphere-capsule, capsule-capsule, sphere-box, capsule-box) with make_frame, the
 normal option DK_ADJ_NORMAL and the near-parallel capsule option DK_ADJ_PARALLEL.
 
 All functions are pure: pointers and scalars in, pointers out (no struct Sim, no struct Adj), meant for one lane per
 contact or row; no warp intrinsics, no shared state. They need source.DEVICE (qrot, cross, dot3, the *_rn helpers) and
 step.STEP_DEVICE (kbimp, imp_raw, efc_D, contact_invw, sphere_sphere, make_frame and the primitives' geometry that
 collide_pair uses: plane_point, plane_capsule_frame, capsule_end, segment_point, capcap_*) before them in the compilation
-unit, and header(m) (which asserts the
-model: no box contacts). Unit-test labels: U4-U9 (docs/verification.md).
+unit, and header(m). Unit-test labels: U4-U9 (docs/verification.md).
 
 Conventions:
 - P = grad Psi with MuJoCo Warp's res_* sign (the adjoint kernel subtracts it: qbar = qbar_dir - P). Every "bar"
@@ -62,7 +62,7 @@ def check_model(m):
     """Primitive contacts and the native mesh / specialized box-box routes."""
     types = {int(m.geom_type[g]) for g in step.collision_geoms(m)}
     codes = {tuple(sorted(step.GEOM_TYPE[int(m.geom_type[g])] for g in pair)) for pair in step.contact_pairs(m)}
-    assert codes <= {(0, 1), (0, 2), (1, 1), (1, 2), (2, 2), (3, 3), (3, 4), (4, 4)}, \
+    assert codes <= {(0, 1), (0, 2), (1, 1), (1, 2), (1, 3), (2, 2), (2, 3), (3, 3), (3, 4), (4, 4)}, \
         "contact adjoint combination outside primitive / native convex routes"
     planes = [g for g in step.collision_geoms(m) if int(m.geom_type[g]) == int(mujoco.mjtGeom.mjGEOM_PLANE)]
     assert all(int(m.geom_bodyid[g]) == 0 for g in planes), "a plane not on the world body (it gets no cotangent)"
@@ -85,7 +85,6 @@ def header(m):
 #ifndef DK_ADJ_PARALLEL_EPS
 #define DK_ADJ_PARALLEL_EPS 1.2e-3f  // sin^2(theta) = |a1 x a2|^2 / (|a1|^2 |a2|^2) of DK_ADJ_PARALLEL 1 (strict <):
 #endif                               // ~sin^2(2 degrees) (theta < 1.99 degrees)
-static_assert(!HAS_PRIMITIVE_BOX, "the contact adjoint has no primitive box collisions");
 // adj_contact_geom's branch bits (its return value; -1: a type combination without a VJP)
 #define ADJ_BR_FREE1 1      // capsule-capsule: segment parameter x1 free (inside, not clamped)
 #define ADJ_BR_FREE2 2      // capsule-capsule x2 / sphere-capsule t free
@@ -296,8 +295,116 @@ __device__ __forceinline__ void sphere_core_vjp(const float* n, float nu, float 
   for (int k = 0; k < 3; k++) { c2bar[k] += vb[k]; c1bar[k] += pbar[k] - vb[k]; }
 }
 
+#if HAS_BOX
+// Exact selected-branch sphere-box VJP. The sphere-core normal options do not freeze box geometry.
+__device__ void sphere_box_vjp(const float* sp, float r, const float* bp, const float* R, const float* bs,
+                              const float* fr, const float* cot, float* gb) {
+  float d[3], c[3], cl[3], dir[3], nl[3] = {0.f, 0.f, 0.f}, pl[3], pb[3], nb[3], localnb[3];
+  for (int k = 0; k < 3; k++) d[k] = RSUB(sp[k], bp[k]);
+  mtv3(R, d, c);
+  mtv3(R, cot + 1, pb);
+  make_frame_vjp(fr, cot + 4, nb);
+  mtv3(R, nb, localnb);
+  for (int k = 0; k < 3; k++) { cl[k] = fmaxf(-bs[k], fminf(bs[k], c[k])); dir[k] = RSUB(cl[k], c[k]); }
+  float dd = sqrtf(dot3_rn(dir, dir)), cb[3];
+  if (dd <= 1e-15f) {
+    float closest = RMUL(2.f, RADD(RADD(bs[0], bs[1]), bs[2]));
+    int face = 0;
+    for (int i = 0; i < 6; i++) {
+      float fd = fabsf(RSUB((i % 2) ? bs[i / 2] : -bs[i / 2], c[i / 2]));
+      if (closest > fd) { closest = fd; face = i; }
+    }
+    nl[face / 2] = (face % 2) ? -1.f : 1.f;
+    for (int k = 0; k < 3; k++) { pl[k] = RADD(c[k], RMUL(0.5f, RMUL(nl[k], RSUB(r, closest)))); cb[k] = pb[k]; }
+    cb[face / 2] += nl[face / 2] * (-cot[0] - 0.5f * dot3(nl, pb));
+  } else {
+    float nt[3];
+    for (int k = 0; k < 3; k++) {
+      nl[k] = dir[k] / dd;
+      pl[k] = RMUL(0.5f, RFMA(nl[k], r, RADD(cl[k], c[k])));
+      nt[k] = localnb[k] + 0.5f * r * pb[k];
+    }
+    float along = dot3(nl, nt);
+    for (int k = 0; k < 3; k++) {
+      float db = nl[k] * cot[0] + (nt[k] - nl[k] * along) / dd;
+      cb[k] = 0.5f * pb[k] - db;
+      if (-bs[k] <= c[k] && c[k] < bs[k]) cb[k] += 0.5f * pb[k] + db;
+    }
+  }
+  float rotated[3], torque[3], part[3];
+  mv3(R, cb, gb);
+  for (int k = 0; k < 3; k++) { gb[3 + k] = 0.f; gb[6 + k] = cot[1 + k] - gb[k]; }
+  mv3(R, pl, rotated);
+  cross(rotated, cot + 1, torque);
+  cross(fr, nb, part);
+  for (int k = 0; k < 3; k++) torque[k] += part[k];
+  cross(gb, d, part);
+  for (int k = 0; k < 3; k++) gb[9 + k] = torque[k] + part[k];
+}
+
+// Reverse the winning witness and the actual slot-1 offset branch, without differentiating the feature search.
+__device__ void capsule_box_params_vjp(const CapsuleBox& cb, int slot, float hl, const float* bs,
+                                      float segbar, float* pb, float* hb) {
+  float segmentbar = segbar, boxbar = 0.f;
+  if (slot == 1) {
+    int axis = cb.secondaxis;
+    float ha = cb.ha[axis];
+    if (cb.secondkind == 1) segmentbar -= segbar;  // the second witness is the other capsule end
+    else if (cb.secondkind == 2 || cb.secondkind == 3) {
+      if (ha != 0.f) hb[axis] -= segbar * cb.second / ha;
+      if (cb.secondkind == 3)
+        boxbar += segbar * float(cb.secondmul * cb.secondboxsign) * bs[axis]
+                  / (ha != 0.f ? fabsf(ha) : 1e-15f);
+    } else if (cb.secondkind == 4) {
+      float har = safe_div(float(cb.secondmul), ha);
+      pb[axis] -= segbar * float(cb.secondmul) * har;
+      hb[axis] += segbar * har;
+      if (ha != 0.f) hb[axis] -= segbar * cb.second / ha;
+    }
+  }
+  if (cb.cltype < 0) return;  // the primary witness is a capsule end
+  int axis = cb.cledge, s1 = cb.cltype / 3, s2 = cb.cltype % 3;
+  float dif[3];
+  for (int k = 0; k < 3; k++) dif[k] = (k == axis ? 0.f : ((cb.clcorner & (1 << k)) ? bs[k] : -bs[k])) - cb.pos[k];
+  float ma = RMUL(bs[axis], bs[axis]), mb = RMUL(-bs[axis], cb.ha[axis]), mc = RMUL(hl, hl);
+  float z1 = 0.f, z2 = 0.f;
+  if (s1 == 1 && s2 == 1) {
+    float det = RFMA(ma, mc, -RMUL(mb, mb));
+    z1 = (mc * boxbar - mb * segmentbar) / det;
+    z2 = (ma * segmentbar - mb * boxbar) / det;
+  } else if (s1 == 1) z1 = safe_div(boxbar, ma);
+  else if (s2 == 1) z2 = safe_div(segmentbar, mc);
+  for (int k = 0; k < 3; k++) { pb[k] -= z2 * cb.ha[k]; hb[k] += z2 * dif[k]; }
+  pb[axis] += z1 * bs[axis];
+  hb[axis] += bs[axis] * (z1 * cb.bestseg + z2 * cb.bestbox);
+}
+
+__device__ void capsule_box_vjp(const CapsuleBox& cb, int slot, const float* cp, const float* axisw, float hl,
+                               const float* bp, const float* R, const float* bs, const float* pointgb, float* gb) {
+  float seg = slot == 0 ? cb.bestseg : RADD(cb.bestseg, cb.second);
+  float pb[3], hb[3], lc[3], rotated[3], force[3], axisbar[3], part[3];
+  mtv3(R, pointgb, pb);
+  float segbar = dot3(cb.ha, pb);
+  for (int k = 0; k < 3; k++) { hb[k] = seg * pb[k]; lc[k] = RFMA(cb.ha[k], seg, cb.pos[k]); }
+  mv3(R, lc, rotated);
+  cross(rotated, pointgb, part);
+  for (int k = 0; k < 3; k++) { gb[6 + k] = pointgb[6 + k] + pointgb[k]; gb[9 + k] = pointgb[9 + k] + part[k]; }
+  capsule_box_params_vjp(cb, slot, hl, bs, segbar, pb, hb);
+  mv3(R, pb, force);
+  mv3(R, hb, axisbar);
+  float d[3];
+  for (int k = 0; k < 3; k++) {
+    gb[k] = force[k]; gb[6 + k] -= force[k]; d[k] = cp[k] - bp[k]; axisbar[k] *= hl;
+  }
+  cross(force, d, part);
+  for (int k = 0; k < 3; k++) gb[9 + k] += part[k];
+  cross(axisw, axisbar, gb + 3);
+  for (int k = 0; k < 3; k++) gb[9 + k] -= gb[3 + k];
+}
+#endif
+
 // One contact's geometry from the two geoms' world poses (geom_poses: s.gx, s.gq): the replay and, with cot, its VJP.
-// t1 <= t2: engine geom types of the pair's geoms g1, g2 (0 plane, 1 sphere, 2 capsule; c_gtype[PG1 / PG2]), sz1, sz2
+// t1 <= t2: engine geom types of the pair's geoms g1, g2 (0 plane, 1 sphere, 2 capsule, 3 box), sz1, sz2
 // their sizes (c_gsize + 3 g), slot: the tape's (plane-capsule end 0: +axis, 1: -axis; parallel capsule-capsule
 // candidate 0..3; else 0). Replay (always): dist, pos[3], fr[9] = the forward's (collide_pair) bitwise, and nu = the
 // sphere core's centre distance |c2 - c1| before the radii (the tape's min_nu; +inf for plane contacts): by collide_pair's
@@ -308,7 +415,7 @@ __device__ __forceinline__ void sphere_core_vjp(const float* n, float nu, float 
 // replay only) = (dbar, pbar[3], frbar[9]) = dL/d(dist, pos, frame rows); then gb[12] = (xbar1, tbar1,
 // xbar2, tbar2): the geoms' pose cotangents (world; torque form, see the module docstring); the plane's are 0. The
 // normal derivative of the sphere core follows DK_ADJ_NORMAL. Returns the ADJ_BR_* branch bits, -1 for a type
-// combination without a VJP (boxes; the replay outputs are then undefined). One copy of the code: called twice per
+// combination without a VJP (e.g. plane-box; the replay outputs are then undefined). Called twice per
 // contact by the adjoint (replay before the row VJPs, VJP after)
 __device__ __noinline__ int adj_contact_geom(int t1, int t2, int slot, const float* p1, const float* q1,
                                              const float* sz1, const float* p2, const float* q2, const float* sz2,
@@ -318,6 +425,31 @@ __device__ __noinline__ int adj_contact_geom(int t1, int t2, int slot, const flo
   *nu = __int_as_float(0x7f800000);
   if (cot)
     for (int k = 0; k < 12; k++) gb[k] = 0.f;
+#if HAS_BOX
+  if ((t1 == 1 || t1 == 2) && t2 == 3) {
+    float R[9], n[3], axis[3], center[3];
+    quat2mat(q2, R);
+    CapsuleBox cb;
+    const float* sp = p1;
+    if (t1 == 2) {
+      zaxis_rn(q1, axis);
+      capsule_box_setup(p1, axis, sz1[1], p2, R, sz2, cb);
+      if (cb.cltype == -4 || (slot == 1 && !(cb.second > -3.f))) return -1;
+      capsule_box_point(cb, slot, p2, R, center);
+      sp = center;
+    }
+    sphere_box(sp, sz1[0], p2, R, sz2, dist, pos, n);
+    make_frame(n, fr);
+    if (!(-0.5f < n[1] && n[1] < 0.5f)) br |= ADJ_BR_FRAME_Z;
+    if (cot) {
+      float pointgb[12];
+      sphere_box_vjp(sp, sz1[0], p2, R, sz2, fr, cot, pointgb);
+      if (t1 == 2) capsule_box_vjp(cb, slot, p1, axis, sz1[1], p2, R, sz2, pointgb, gb);
+      else for (int k = 0; k < 12; k++) gb[k] = pointgb[k];
+    }
+    return br;
+  }
+#endif
   if (t1 == 0) {  // plane (the floor, static): normal = its z axis; the frame does not depend on the other geom...
     float n[3];
     zaxis_rn(q1, n);

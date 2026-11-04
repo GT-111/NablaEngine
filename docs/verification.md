@@ -46,6 +46,9 @@ gates of `2e-3 / 5e-4 / 1e-4 / 1e-4` and full-gradient cosine at least `0.99999`
 finite differences at `h` and `2h`, their difference and the float64 scalar-cancellation floor, raw absolute/relative
 errors, and the error above that floor. Native finite fixtures are selected with
 `--cases coupled_mesh,coupled_box_mesh,coupled_box_box`; they keep enabled contacts and the original pyramidal rows.
+Primitive box fixtures use `--cases coupled_sphere_box,coupled_capsule_box`. Their CPU geometry checks are
+`PYTHONPATH=src python scripts/convex_mesh_check.py PrimitiveBoxCheck`; they execute production forward dispatch,
+replay and full pose VJPs, including the moving second capsule-box offset. These do not replace CUDA qualification.
 
 ## Data
 

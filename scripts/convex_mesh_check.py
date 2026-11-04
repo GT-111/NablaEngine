@@ -14,7 +14,8 @@ import unittest
 import mujoco
 import numpy as np
 
-from nablaengine.g1_engine import convex_mesh
+from nablaengine.g1_engine import adjoint, adjoint_contact, convex_mesh, source, step, tape
+from nablaengine.model import capability
 
 
 VERTICES = "-.1 -.12 -.08 .1 -.12 -.08 -.1 .12 -.08 .1 .12 -.08 -.1 -.12 .08 .1 -.12 .08 -.1 .12 .08 .1 .12 .08"
@@ -266,6 +267,188 @@ def perturb(x, q, index, amount):
         mujoco.mju_mulQuat(changed, delta, q[geom])
         q[geom] = changed
     return np.asarray(x, np.float32), np.asarray(q, np.float32)
+
+
+class PrimitiveBoxCheck(unittest.TestCase):
+    """Execute production dispatch, replay and reverse code with the CPU collision oracle."""
+
+    @classmethod
+    def setUpClass(cls):
+        from coupled_physics_check import primitive_box_model
+
+        cls.models = {kind: primitive_box_model(mujoco, kind) for kind in ("sphere_box", "capsule_box")}
+        model = cls.models["capsule_box"]
+        math = source.DEVICE.split("__device__ __forceinline__ float warp_sum", 1)[0]
+        geometry = "__device__ __forceinline__ void normalize3_rn" + step.STEP_DEVICE.split(
+            "__device__ __forceinline__ void normalize3_rn", 1)[1].split("// x^p for the solimp", 1)[0]
+        reverse = "__device__ __forceinline__ float adj_kappa" + adjoint_contact.DEVICE.split(
+            "__device__ __forceinline__ float adj_kappa", 1)[1].split(
+                "__device__ __forceinline__ int adj_pair_geom", 1)[0]
+        prefix = r'''
+#include <cmath>
+#include <cstring>
+#define __device__
+#define __forceinline__ inline
+#define __noinline__
+#define DK_INL_COLLIDE
+float __fmul_rn(float a,float b){return a*b;}
+float __fadd_rn(float a,float b){return a+b;}
+float __fsub_rn(float a,float b){return a-b;}
+float __fmaf_rn(float a,float b,float c){return std::fma(a,b,c);}
+float rsqrtf(float x){return 1.f/std::sqrt(x);}
+float __int_as_float(int x){float y;std::memcpy(&y,&x,4);return y;}
+int __float_as_int(float x){int y;std::memcpy(&y,&x,4);return y;}
+int atomicAdd(int* p,int x){int old=*p;*p+=x;return old;}
+void atomicOr(int* p,int x){*p|=x;}
+void atomicMin(int* p,int x){if(x<*p)*p=x;}
+'''
+        wrapper = r'''
+struct Capture {
+  int ncon=0,unsupported=0,min_nu_bits=0x7f800000;
+  int con_pair[MAXCON],con_slot[MAXCON],con_dim[MAXCON];
+  float fric=1.f,gx[2][3],gq[2][4],con_dist[MAXCON],con_pos[MAXCON][3],con_frame[MAXCON][9],con_mu[MAXCON];
+};
+extern "C" int primitive_forward(int type,const float* x,const float* q,const float* size,float* out,int* slot) {
+  Capture s;
+  c_pword[0]=(1u<<8)|(3u<<24); c_pset[0]=1.f;
+  c_gtype[0]=type;c_gtype[1]=3;
+  for(int g=0;g<2;g++) {
+    for(int k=0;k<3;k++){s.gx[g][k]=x[3*g+k];c_gsize[3*g+k]=size[3*g+k];}
+    for(int k=0;k<4;k++)s.gq[g][k]=q[4*g+k];
+    c_grbound[g]=g ? std::sqrt(size[3]*size[3]+size[4]*size[4]+size[5]*size[5]) : size[0]+size[1];
+  }
+  collide_pair(s,0);
+  if(s.unsupported || s.ncon>MAXCON)return -1;
+  for(int c=0;c<s.ncon;c++) {
+    slot[c]=s.con_slot[c];out[13*c]=s.con_dist[c];
+    for(int k=0;k<3;k++)out[13*c+1+k]=s.con_pos[c][k];
+    for(int k=0;k<9;k++)out[13*c+4+k]=s.con_frame[c][k];
+  }
+  return s.ncon;
+}
+extern "C" int primitive_reverse(int type,int slot,const float* x,const float* q,const float* size,
+                                 const float* cot,float* out,float* gradient) {
+  float nu;
+  return adj_contact_geom(type,3,slot,x,q,size,x+3,q+4,size+3,out,out+1,out+4,&nu,cot,gradient);
+}
+extern "C" void primitive_witness(const float* x,const float* q,const float* size,float* values,int* feature) {
+  float R[9],axis[3];quat2mat(q+4,R);zaxis_rn(q,axis);
+  CapsuleBox cb;capsule_box_setup(x,axis,size[1],x+3,R,size+3,cb);
+  values[0]=cb.bestseg;values[1]=cb.second;
+  feature[0]=cb.cltype;feature[1]=cb.clcorner;feature[2]=cb.cledge;
+  feature[3]=cb.secondkind;feature[4]=cb.secondaxis;
+}
+'''
+        header = source.header(model, 2, 1).replace("#include <cuda_runtime.h>", "") + step.step_header(model)
+        cls.directory = tempfile.TemporaryDirectory(prefix="nabla-primitive-box-cpu-")
+        path = pathlib.Path(cls.directory.name)
+        (path / "geometry.cc").write_text(prefix + header + adjoint_contact.header(model) + math + geometry + reverse
+                                          + wrapper)
+        compiled = subprocess.run(["c++", "-shared", "-fPIC", "-std=c++17", "-O2", "-ffp-contract=off",
+                                   str(path / "geometry.cc"), "-o", str(path / "geometry.so")], capture_output=True,
+                                  text=True)
+        if compiled.returncode:
+            raise AssertionError(compiled.stderr)
+        cls.library = ctypes.CDLL(str(path / "geometry.so"))
+        fp, ip, integer = ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_int32), ctypes.c_int
+        cls.library.primitive_forward.argtypes = [integer, fp, fp, fp, fp, ip]
+        cls.library.primitive_reverse.argtypes = [integer, integer, fp, fp, fp, fp, fp, fp]
+        cls.library.primitive_witness.argtypes = [fp, fp, fp, fp, ip]
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.directory.cleanup()
+
+    def forward(self, kind, x, q, size):
+        values, slots = np.empty((2, 13), np.float32), np.empty(2, np.int32)
+        n = self.library.primitive_forward(1 if kind == "sphere_box" else 2,
+            *(NativeGeometry._float(np.ascontiguousarray(a, np.float32)) for a in (x, q, size, values)),
+            NativeGeometry._int(slots))
+        self.assertGreaterEqual(n, 0)
+        return values[:n], slots[:n]
+
+    def reverse(self, kind, x, q, size, slot, cotangent):
+        value, gradient = np.empty(13, np.float32), np.empty(12, np.float32)
+        branch = self.library.primitive_reverse(1 if kind == "sphere_box" else 2, int(slot),
+            *(NativeGeometry._float(np.ascontiguousarray(a, np.float32)) for a in
+              (x, q, size, cotangent, value, gradient)))
+        self.assertGreaterEqual(branch, 0)
+        return value, gradient
+
+    def witness(self, x, q, size):
+        values, feature = np.empty(2, np.float32), np.empty(5, np.int32)
+        self.library.primitive_witness(*(NativeGeometry._float(np.ascontiguousarray(a, np.float32))
+                                        for a in (x, q, size, values)), NativeGeometry._int(feature))
+        return values, feature
+
+    def assert_geometry(self, kind, x, q, size):
+        model = self.models[kind]
+        model.geom_size[0], model.geom_size[2] = size
+        data = mujoco.MjData(model)
+        data.qpos[:3], data.qpos[3:7] = x[0], q[0]
+        data.qpos[8:11], data.qpos[11:15] = x[1], q[1]
+        mujoco.mj_fwdPosition(model, data)
+        actual, slots = self.forward(kind, x, q, size)
+        self.assertEqual(len(actual), data.ncon)
+        for value, contact in zip(actual, data.contact):
+            np.testing.assert_allclose(value[:4], np.r_[contact.dist, contact.pos], atol=2e-7, rtol=2e-6)
+            np.testing.assert_allclose(value[4:7], contact.frame[:3], atol=3e-6)
+        for value, slot in zip(actual, slots):
+            cot = np.random.default_rng(71 + int(slot)).normal(size=13).astype(np.float32)
+            replay, gradient = self.reverse(kind, x, q, size, slot, cot)
+            np.testing.assert_array_equal(replay.view(np.uint32), value.view(np.uint32))
+            finite = np.zeros(12)
+            for dof in range(12):
+                plus, plus_slots = self.forward(kind, *perturb(x, q, dof, 1e-4), size)
+                minus, minus_slots = self.forward(kind, *perturb(x, q, dof, -1e-4), size)
+                np.testing.assert_array_equal(plus_slots, slots)
+                np.testing.assert_array_equal(minus_slots, slots)
+                index = int(np.flatnonzero(slots == slot)[0])
+                finite[dof] = np.dot(cot.astype(np.float64), plus[index].astype(np.float64)
+                                     - minus[index].astype(np.float64)) / 2e-4
+            np.testing.assert_allclose(gradient, finite, atol=2e-3, rtol=5e-3)
+            np.testing.assert_allclose(gradient[:3] + gradient[6:9], cot[1:4], atol=2e-5)
+        return actual, slots
+
+    def test_sphere_box_face_edge_corner_and_inside(self):
+        size = np.array([[.06, 0, 0], [.1, .12, .08]], np.float32)
+        q = np.array([[1, 0, 0, 0], [1, 0, 0, 0]], np.float32)
+        for position in ((.14, .013, .009), (.13, .145, .009), (.12, .14, .10), (.07, .013, .009)):
+            x = np.array([position, (0, 0, 0)], np.float32)
+            self.assert_geometry("sphere_box", x, q, size)
+
+    def test_capsule_box_endpoints_interior_and_rotating_second_offset(self):
+        size = np.array([[.06, .13, 0], [.1, .12, .08]], np.float32)
+        q = np.array([[1, 0, 0, 0], [1, 0, 0, 0]], np.float32)
+        cases = [((.14, .015, .01), (.4, .2, .5)), ((.14, .14, .01), (.4, .2, .5)),
+                 ((.14, .015, .16), (.2, -.3, .4)), ((.02, .015, .01), (.4, .2, .5))]
+        kinds, primary, moving = set(), set(), False
+        for position, euler in cases:
+            x = np.array([position, (0, 0, 0)], np.float32)
+            quaternion = np.empty(4)
+            mujoco.mju_euler2Quat(quaternion, np.array(euler), "xyz")
+            q[0] = quaternion
+            contacts, slots = self.assert_geometry("capsule_box", x, q, size)
+            values, feature = self.witness(x, q, size)
+            kinds.add(int(feature[3])); primary.add(bool(feature[0] >= 0 and feature[0] % 3 == 1))
+            if 1 in slots:
+                plus, _ = self.witness(*perturb(x, q, 4, 1e-4), size)
+                minus, _ = self.witness(*perturb(x, q, 4, -1e-4), size)
+                moving |= abs(float(plus[1] - minus[1])) > 1e-5
+        self.assertTrue(moving, "slot-1 offset must vary with rotation in the fixture")
+        self.assertEqual(primary, {False, True})
+        self.assertGreaterEqual(len(kinds), 2)
+
+    def test_admission_and_source_use_only_primitive_routes(self):
+        for model in self.models.values():
+            roots = source.free_roots(model)
+            capability.require(model, [], roots)
+            generated = adjoint.cuda_source(model, com_body_id=roots)
+            self.assertFalse(step.native_collision(model))
+            self.assertNotIn("feature", tape.layout(model))
+            self.assertIn("sphere_box_vjp", generated)
+            self.assertNotIn("namespace cmgeom", generated)
+            self.assertGreaterEqual(step.contact_multiplicity(model)[0], 1)
 
 
 class ConvexMeshCheck(unittest.TestCase):

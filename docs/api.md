@@ -192,7 +192,10 @@ The engine's model class is a free root and one hinge per later body, with at mo
 and 12 hinge ancestors. Position actuators may drive any unique subset of hinges, with independent `nu`; passive
 hinges remain in `qpos` and `qvel`. Linear joint damping, dof frictionloss and up to six active soft linear hinge
 equalities are represented. Contact pairs may be absent. Sphere, capsule and world-plane contact pairs have an
-analytic adjoint; primitive plane-box and capsule-box pairs remain forward-only. The published numerical qualification is for the mjlab G1; CPU
+analytic adjoint, including sphere-box and capsule-box with both contact slots and the second point's sliding
+derivative. Primitive plane-box pairs remain forward-only. Box primitive derivatives follow the selected geometry
+branch, including normal and frame; the sphere-core `normal` regularization option does not freeze them.
+The published numerical qualification is for the mjlab G1; CPU
 generation checks for smaller models are described in `docs/verification.md`.
 The current candidate additionally generates two top-level FREE roots with up to 64 bodies, two compiled COM
 offsets and 12 soft linear joint equalities. Implicit `contype` / `conaffinity` primitive pairs use the authored masks,

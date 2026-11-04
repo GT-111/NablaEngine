@@ -50,6 +50,21 @@ def native_contact_model(mujoco, kind):
         <position joint="right_hinge" kp="20" kv=".2"/></actuator></mujoco>''')
 
 
+def primitive_box_model(mujoco, kind):
+    first = 'type="sphere" size=".06"' if kind == "sphere_box" else 'type="capsule" size=".06 .13"'
+    return mujoco.MjModel.from_xml_string(f'''<mujoco><compiler angle="radian"/>
+      <option integrator="implicitfast" solver="Newton" cone="pyramidal" timestep=".005" tolerance="1e-9"/>
+      <worldbody>
+        <body name="left" pos=".14 .015 .01" euler=".4 .2 .5"><freejoint/><geom {first}/>
+          <body pos="0 0 .12"><joint name="left_hinge" damping=".1" armature=".001" range="-1 1"/>
+            <geom type="sphere" size=".02" contype="0" conaffinity="0"/></body></body>
+        <body name="right"><freejoint/><geom type="box" size=".1 .12 .08"/>
+          <body pos="0 0 .12"><joint name="right_hinge" damping=".1" armature=".001" range="-1 1"/>
+            <geom type="sphere" size=".02" contype="0" conaffinity="0"/></body></body>
+      </worldbody><actuator><position joint="left_hinge" kp="20" kv=".2"/>
+        <position joint="right_hinge" kp="20" kv=".2"/></actuator></mujoco>''')
+
+
 def set_reference_com(model, base_ipos, base_sameframe, body_ids, offsets):
     """Apply physical COM offsets without the compiler's old inertial-frame shortcut."""
     import mujoco
@@ -293,6 +308,9 @@ def main():
                 pairs, bodies = list(range(len(step.contact_pairs(model)))), tuple(source.free_roots(model))
             elif name in ("coupled_mesh", "coupled_box_mesh", "coupled_box_box"):
                 model = native_contact_model(mujoco, name.removeprefix("coupled_"))
+                pairs, bodies = list(range(len(step.contact_pairs(model)))), tuple(source.free_roots(model))
+            elif name in ("coupled_sphere_box", "coupled_capsule_box"):
+                model = primitive_box_model(mujoco, name.removeprefix("coupled_"))
                 pairs, bodies = list(range(len(step.contact_pairs(model)))), tuple(source.free_roots(model))
             elif name == "coupled_capacity":
                 from model_generation_check import dense_contact_model

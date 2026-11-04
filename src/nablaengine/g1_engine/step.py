@@ -305,10 +305,6 @@ def step_header(m, max_contacts=None):
 __device__ const unsigned c_hcol[{max(1, len(hcol))}] = {{{", ".join(map(str, hcol)) or "0"}}};  // a | b << 8 | thr << 16
 #define HAS_BOX {int(any(m.geom_type[g] == mujoco.mjtGeom.mjGEOM_BOX for g in collision_geoms(m)))}  // compile box code
 #define HAS_NATIVE_COLLISION {int(native_collision(m))}
-#define HAS_PRIMITIVE_BOX {int(any(mujoco.mjtGeom.mjGEOM_BOX in (m.geom_type[a], m.geom_type[b])
-                                 and mujoco.mjtGeom.mjGEOM_MESH not in (m.geom_type[a], m.geom_type[b])
-                                 and not m.geom_type[a] == m.geom_type[b] == mujoco.mjtGeom.mjGEOM_BOX
-                                 for a, b in contact_pairs(m)))}
 #define FLOOR_G {floor_geom(m)}  // the geom table index of the only plane (-1: none or several)
 #define NEFC {nr}
 #define DOF_BODY_ROOT6 {int(dof_body_root6(m))}  // step.dof_body_root6 (support_mask in closed form)
@@ -684,57 +680,64 @@ __device__ __forceinline__ float capcap_core(const float* p1, const float* p2, c
   return sphere_sphere(v1, r1, v2, r2, dist, pos, n);
 }
 
-// 3x3 helpers (row-major float[9]) for the box collisions, MuJoCo Warp's quat_to_mat convention
+// Box helpers (row-major float[9]), with explicit roundings shared by forward and adjoint replay.
 __device__ __forceinline__ void quat2mat(const float* q, float* R) {
-  float q00 = q[0] * q[0], q01 = q[0] * q[1], q02 = q[0] * q[2], q03 = q[0] * q[3], q11 = q[1] * q[1];
-  float q12 = q[1] * q[2], q13 = q[1] * q[3], q22 = q[2] * q[2], q23 = q[2] * q[3], q33 = q[3] * q[3];
-  R[0] = q00 + q11 - q22 - q33; R[1] = 2.f * (q12 - q03); R[2] = 2.f * (q13 + q02);
-  R[3] = 2.f * (q12 + q03); R[4] = q00 - q11 + q22 - q33; R[5] = 2.f * (q23 - q01);
-  R[6] = 2.f * (q13 - q02); R[7] = 2.f * (q23 + q01); R[8] = q00 - q11 - q22 + q33;
+  float q00 = RMUL(q[0], q[0]), q01 = RMUL(q[0], q[1]), q02 = RMUL(q[0], q[2]), q03 = RMUL(q[0], q[3]);
+  float q11 = RMUL(q[1], q[1]), q12 = RMUL(q[1], q[2]), q13 = RMUL(q[1], q[3]);
+  float q22 = RMUL(q[2], q[2]), q23 = RMUL(q[2], q[3]), q33 = RMUL(q[3], q[3]);
+  R[0] = RSUB(RSUB(RADD(q00, q11), q22), q33); R[1] = RMUL(2.f, RSUB(q12, q03)); R[2] = RMUL(2.f, RADD(q13, q02));
+  R[3] = RMUL(2.f, RADD(q12, q03)); R[4] = RSUB(RADD(RSUB(q00, q11), q22), q33); R[5] = RMUL(2.f, RSUB(q23, q01));
+  R[6] = RMUL(2.f, RSUB(q13, q02)); R[7] = RMUL(2.f, RADD(q23, q01)); R[8] = RADD(RSUB(RSUB(q00, q11), q22), q33);
 }
 __device__ __forceinline__ void mv3(const float* A, const float* v, float* o) {
-  for (int i = 0; i < 3; i++) o[i] = A[3 * i] * v[0] + A[3 * i + 1] * v[1] + A[3 * i + 2] * v[2];
+  for (int i = 0; i < 3; i++) o[i] = RFMA(A[3 * i + 2], v[2], RFMA(A[3 * i], v[0], RMUL(A[3 * i + 1], v[1])));
 }
 __device__ __forceinline__ void mtv3(const float* A, const float* v, float* o) {
-  for (int i = 0; i < 3; i++) o[i] = A[i] * v[0] + A[3 + i] * v[1] + A[6 + i] * v[2];
+  for (int i = 0; i < 3; i++) o[i] = RFMA(A[6 + i], v[2], RFMA(A[i], v[0], RMUL(A[3 + i], v[1])));
 }
 __device__ __forceinline__ float safe_div(float x, float y) { return x / (y != 0.f ? y : 1e-15f); }
 
 // sphere-box (MuJoCo Warp's sphere_box): distance, position, normal (from the sphere towards the box)
 __device__ void sphere_box(const float* sp, float r, const float* bp, const float* R, const float* bs, float* dist,
                            float* pos, float* n) {
-  float d[3] = {sp[0] - bp[0], sp[1] - bp[1], sp[2] - bp[2]}, c[3], cl[3], dir[3], pl[3], nl[3] = {0.f, 0.f, 0.f};
+  float d[3] = {RSUB(sp[0], bp[0]), RSUB(sp[1], bp[1]), RSUB(sp[2], bp[2])}, c[3], cl[3], dir[3], pl[3], nl[3] = {0.f, 0.f, 0.f};
   mtv3(R, d, c);
-  for (int k = 0; k < 3; k++) { cl[k] = fmaxf(-bs[k], fminf(bs[k], c[k])); dir[k] = cl[k] - c[k]; }
-  float dd = sqrtf(dot3(dir, dir));
+  for (int k = 0; k < 3; k++) { cl[k] = fmaxf(-bs[k], fminf(bs[k], c[k])); dir[k] = RSUB(cl[k], c[k]); }
+  float dd = sqrtf(dot3_rn(dir, dir));
   if (dd <= 1e-15f) {
-    float closest = 2.f * (bs[0] + bs[1] + bs[2]);
+    float closest = RMUL(2.f, RADD(RADD(bs[0], bs[1]), bs[2]));
     int kk = 0;
     for (int i = 0; i < 6; i++) {
-      float fd = fabsf(((i % 2) ? 1.f : -1.f) * bs[i / 2] - c[i / 2]);
+      float fd = fabsf(RSUB((i % 2) ? bs[i / 2] : -bs[i / 2], c[i / 2]));
       if (closest > fd) { closest = fd; kk = i; }
     }
     nl[kk / 2] = (kk % 2) ? -1.f : 1.f;
-    for (int k = 0; k < 3; k++) pl[k] = c[k] + nl[k] * (r - closest) / 2.f;
-    *dist = -closest - r;
+    for (int k = 0; k < 3; k++) pl[k] = RADD(c[k], RMUL(0.5f, RMUL(nl[k], RSUB(r, closest))));
+    *dist = RSUB(-closest, r);
   } else {
-    for (int k = 0; k < 3; k++) { nl[k] = dir[k] / dd; pl[k] = 0.5f * (cl[k] + c[k] + nl[k] * r); }
-    *dist = dd - r;
+    for (int k = 0; k < 3; k++) { nl[k] = dir[k] / dd; pl[k] = RMUL(0.5f, RFMA(nl[k], r, RADD(cl[k], c[k]))); }
+    *dist = RSUB(dd, r);
   }
   mv3(R, nl, n);
   float t[3];
   mv3(R, pl, t);
-  for (int k = 0; k < 3; k++) pos[k] = bp[k] + t[k];
+  for (int k = 0; k < 3; k++) pos[k] = RADD(bp[k], t[k]);
 }
 
-// capsule-box (MuJoCo Warp's capsule_box_witness + capsule_box): up to two sphere-box contacts along the segment
-template <class S>
-__device__ void capsule_box(S& s, int pair, const float* cp, const float* axisw, float cr, float hl, const float* bp,
-                            const float* R, const float* bs) {
-  float d[3] = {cp[0] - bp[0], cp[1] - bp[1], cp[2] - bp[2]}, pos[3], axis[3], ha[3];
+// MuJoCo Warp's capsule_box_witness, with the selected second-offset branch retained for its full VJP.
+struct CapsuleBox {
+  float pos[3], ha[3], bestseg, bestbox, second;
+  int cltype, clcorner, cledge;
+  int secondkind;  // 0 constant, 1 capsule end, 2 axis ratio, 3 edge ratio, 4 face intersection
+  int secondaxis, secondmul, secondboxsign;
+};
+__device__ void capsule_box_setup(const float* cp, const float* axisw, float hl, const float* bp,
+                                 const float* R, const float* bs, CapsuleBox& cb) {
+  float d[3] = {RSUB(cp[0], bp[0]), RSUB(cp[1], bp[1]), RSUB(cp[2], bp[2])}, axis[3];
+  float *pos = cb.pos, *ha = cb.ha;
   mtv3(R, d, pos);
   mtv3(R, axisw, axis);
-  for (int k = 0; k < 3; k++) ha[k] = axis[k] * hl;
+  for (int k = 0; k < 3; k++) ha[k] = RMUL(axis[k], hl);
   int axisdir = int(ha[0] > 0.f) + 2 * int(ha[1] > 0.f) + 4 * int(ha[2] > 0.f);
   float bestdist = 1e32f, bestseg = -12.f, bestbox = 0.f;
   int cltype = -4, clface = -12, clcorner = -123, cledge = -123;
@@ -742,44 +745,47 @@ __device__ void capsule_box(S& s, int pair, const float* cp, const float* axisw,
     float tip[3], bpnt[3];
     int nout = 0, axout = -1;
     for (int j = 0; j < 3; j++) {
-      tip[j] = pos[j] + float(i) * ha[j];
+      tip[j] = RFMA(float(i), ha[j], pos[j]);
       bpnt[j] = tip[j];
       if (bpnt[j] < -bs[j]) { nout++; axout = j; bpnt[j] = -bs[j]; }
       else if (bpnt[j] > bs[j]) { nout++; axout = j; bpnt[j] = bs[j]; }
     }
     if (nout > 1) continue;
     float dist = 0.f;
-    for (int j = 0; j < 3; j++) dist += (bpnt[j] - tip[j]) * (bpnt[j] - tip[j]);
+    for (int j = 0; j < 3; j++) { float delta = RSUB(bpnt[j], tip[j]); dist = RFMA(delta, delta, dist); }
     if (dist < bestdist) { bestdist = dist; bestseg = float(i); cltype = -2 + i; clface = axout; }
   }
   for (int i = 0; i < 8; i++)  // a box edge closest
     for (int j = 0; j < 3; j++) {
       if (i & (1 << j)) continue;
-      float bpt[3] = {((i & 1) ? 1.f : -1.f) * bs[0], ((i & 2) ? 1.f : -1.f) * bs[1], ((i & 4) ? 1.f : -1.f) * bs[2]};
+      float bpt[3] = {(i & 1) ? bs[0] : -bs[0], (i & 2) ? bs[1] : -bs[1], (i & 4) ? bs[2] : -bs[2]};
       bpt[j] = 0.f;
-      float dif[3] = {bpt[0] - pos[0], bpt[1] - pos[1], bpt[2] - pos[2]};
-      float u = -bs[j] * dif[j], v = dot3(ha, dif), ma = bs[j] * bs[j], mb = -bs[j] * ha[j], mc = hl * hl;
-      float det = ma * mc - mb * mb;
+      float dif[3] = {RSUB(bpt[0], pos[0]), RSUB(bpt[1], pos[1]), RSUB(bpt[2], pos[2])};
+      float u = RMUL(-bs[j], dif[j]), v = dot3_rn(ha, dif), ma = RMUL(bs[j], bs[j]), mb = RMUL(-bs[j], ha[j]), mc = RMUL(hl, hl);
+      float det = RFMA(ma, mc, -RMUL(mb, mb));
       if (fabsf(det) < 1e-15f) continue;
-      float idet = 1.f / det, x1 = (mc * u - mb * v) * idet, x2 = (ma * v - mb * u) * idet;
+      float idet = 1.f / det, x1 = RMUL(RFMA(mc, u, -RMUL(mb, v)), idet), x2 = RMUL(RFMA(ma, v, -RMUL(mb, u)), idet);
       int s1 = 1, s2 = 1;
-      if (x1 > 1.f) { x1 = 1.f; s1 = 2; x2 = safe_div(v - mb, mc); }
-      else if (x1 < -1.f) { x1 = -1.f; s1 = 0; x2 = safe_div(v + mb, mc); }
+      if (x1 > 1.f) { x1 = 1.f; s1 = 2; x2 = safe_div(RSUB(v, mb), mc); }
+      else if (x1 < -1.f) { x1 = -1.f; s1 = 0; x2 = safe_div(RADD(v, mb), mc); }
       bool over = x2 > 1.f;
       if (over || x2 < -1.f) {
-        if (over) { x2 = 1.f; s2 = 2; x1 = safe_div(u - mb, ma); }
-        else { x2 = -1.f; s2 = 0; x1 = safe_div(u + mb, ma); }
+        if (over) { x2 = 1.f; s2 = 2; x1 = safe_div(RSUB(u, mb), ma); }
+        else { x2 = -1.f; s2 = 0; x1 = safe_div(RADD(u, mb), ma); }
         if (x1 > 1.f) { x1 = 1.f; s1 = 2; } else if (x1 < -1.f) { x1 = -1.f; s1 = 0; }
       }
-      for (int k = 0; k < 3; k++) dif[k] -= ha[k] * x2;
-      dif[j] += bs[j] * x1;
+      for (int k = 0; k < 3; k++) dif[k] = RFMS(ha[k], x2, dif[k]);
+      dif[j] = RFMA(bs[j], x1, dif[j]);
       int ct = s1 * 3 + s2;
-      float dsq = dot3(dif, dif);
-      if (dsq < bestdist - 1e-15f) {
+      float dsq = dot3_rn(dif, dif);
+      if (dsq < RSUB(bestdist, 1e-15f)) {
         bestdist = dsq; bestseg = x2; bestbox = x1;
         clcorner = i + (1 << j) * (ct / 6); cledge = j; cltype = ct;
       }
     }
+  cb.secondkind = 0; cb.secondaxis = cb.secondmul = cb.secondboxsign = 0;
+  cb.cltype = cltype; cb.clcorner = clcorner; cb.cledge = cledge;
+  cb.bestseg = bestseg; cb.bestbox = bestbox; cb.second = -4.f;
   if (cltype == -4) return;
   float second = -4.f;
   if (cltype >= 0 && cltype / 3 != 1) {  // closest to a box corner
@@ -789,14 +795,19 @@ __device__ void capsule_box(S& s, int pair, const float* cp, const float* axisw,
       if (c1 == 1 || c1 == 2 || c1 == 4) mul = 1; else { mul = -1; c1 = 7 - c1; }
       if (c1 == 1) { ax = 0; ax1 = 1; ax2 = 2; } else if (c1 == 2) { ax = 1; ax1 = 2; ax2 = 0; }
       else if (c1 == 4) { ax = 2; ax1 = 0; ax2 = 1; }
-      if (axis[ax] * axis[ax] > 0.5f) {
-        float m = 2.f * safe_div(bs[ax], fabsf(ha[ax]));
-        second = fminf(1.f - float(mul) * bestseg, m);
+      if (RMUL(axis[ax], axis[ax]) > 0.5f) {
+        float m = RMUL(2.f, safe_div(bs[ax], fabsf(ha[ax]))), end = RFMS(float(mul), bestseg, 1.f);
+        second = fminf(end, m);
+        cb.secondkind = end <= m ? 1 : 2;
+        cb.secondaxis = ax;
       } else {
-        float m = 2.f * fminf(safe_div(bs[ax1], fabsf(ha[ax1])), safe_div(bs[ax2], fabsf(ha[ax2])));
-        second = -fminf(1.f + float(mul) * bestseg, m);
+        float r1 = safe_div(bs[ax1], fabsf(ha[ax1])), r2 = safe_div(bs[ax2], fabsf(ha[ax2]));
+        float m = RMUL(2.f, fminf(r1, r2)), end = RFMA(float(mul), bestseg, 1.f);
+        second = -fminf(end, m);
+        cb.secondkind = end <= m ? 1 : 2;
+        cb.secondaxis = r1 <= r2 ? ax1 : ax2;
       }
-      second *= float(mul);
+      second = RMUL(second, float(mul));
     }
   } else if (cltype >= 0 && cltype / 3 == 1) {  // on a box edge
     int c1 = (axisdir ^ clcorner) & (7 - (1 << cledge));
@@ -807,37 +818,54 @@ __device__ void capsule_box(S& s, int pair, const float* cp, const float* axisw,
       if (cledge == 2) { ax1 = 0; ax2 = 1; }
       if (fabsf(axis[ax1]) > fabsf(axis[ax2])) ax1 = ax2;
       ax2 = 3 - ax - ax1;
-      if (c1 & (1 << ax2)) { mul = 1; second = 1.f - bestseg; } else { mul = -1; second = 1.f + bestseg; }
-      float e1 = 2.f * safe_div(bs[ax2], fabsf(ha[ax2]));
+      if (c1 & (1 << ax2)) { mul = 1; second = RSUB(1.f, bestseg); } else { mul = -1; second = RADD(1.f, bestseg); }
+      float e1 = RMUL(2.f, safe_div(bs[ax2], fabsf(ha[ax2])));
+      cb.secondkind = e1 < second ? 2 : 1; cb.secondaxis = ax2;
       second = fminf(e1, second);
-      float e2 = (((axisdir & (1 << ax)) != 0) == ((c1 & (1 << ax2)) != 0)) ? 1.f - bestbox : 1.f + bestbox;
-      e1 = bs[ax] * safe_div(e2, fabsf(ha[ax]));
+      bool reverse = ((axisdir & (1 << ax)) != 0) == ((c1 & (1 << ax2)) != 0);
+      float e2 = reverse ? RSUB(1.f, bestbox) : RADD(1.f, bestbox);
+      e1 = RMUL(bs[ax], safe_div(e2, fabsf(ha[ax])));
+      if (e1 < second) { cb.secondkind = 3; cb.secondaxis = ax; }
+      cb.secondmul = mul; cb.secondboxsign = reverse ? -1 : 1;
       second = fminf(e1, second);
-      second *= float(mul);
+      second = RMUL(second, float(mul));
     }
   } else if (clface != -1) {  // a capsule end closest to a face
     int mul = cltype == -3 ? 1 : -1;
     second = 2.f;
     float t1[3];
-    for (int k = 0; k < 3; k++) t1[k] = pos[k] - ha[k] * float(mul);
+    for (int k = 0; k < 3; k++) t1[k] = RFMS(ha[k], float(mul), pos[k]);
     for (int i = 0; i < 3; i++) {
       if (i == clface) continue;
       float har = safe_div(float(mul), ha[i]);
-      float e1 = (bs[i] - t1[i]) * har;
-      if (0.f < e1 && e1 < second) second = e1;
-      e1 = (-bs[i] - t1[i]) * har;
-      if (0.f < e1 && e1 < second) second = e1;
+      float e1 = RMUL(RSUB(bs[i], t1[i]), har);
+      if (0.f < e1 && e1 < second) { second = e1; cb.secondkind = 4; cb.secondaxis = i; }
+      e1 = RMUL(RSUB(-bs[i], t1[i]), har);
+      if (0.f < e1 && e1 < second) { second = e1; cb.secondkind = 4; cb.secondaxis = i; }
     }
-    second *= float(mul);
+    cb.secondmul = mul;
+    second = RMUL(second, float(mul));
   }
+  cb.second = second;
+}
+__device__ __forceinline__ void capsule_box_point(const CapsuleBox& cb, int slot, const float* bp,
+                                                 const float* R, float* ce) {
+  float seg = slot == 0 ? cb.bestseg : RADD(cb.bestseg, cb.second), lc[3], t[3];
+  for (int k = 0; k < 3; k++) lc[k] = RFMA(cb.ha[k], seg, cb.pos[k]);
+  mv3(R, lc, t);
+  for (int k = 0; k < 3; k++) ce[k] = RADD(bp[k], t[k]);
+}
+// Up to two sphere-box contacts along the segment; replay uses the same setup and point arithmetic.
+template <class S>
+__device__ void capsule_box(S& s, int pair, const float* cp, const float* axisw, float cr, float hl, const float* bp,
+                            const float* R, const float* bs) {
+  CapsuleBox cb;
+  capsule_box_setup(cp, axisw, hl, bp, R, bs, cb);
+  if (cb.cltype == -4) return;
   for (int e = 0; e < 2; e++) {
-    if (e == 1 && !(second > -3.f)) break;
-    float seg = e == 0 ? bestseg : bestseg + second, ce[3], dist, pc[3], n[3], fr[9];
-    for (int k = 0; k < 3; k++) ce[k] = bp[k];
-    float lc[3], t[3];
-    for (int k = 0; k < 3; k++) lc[k] = pos[k] + ha[k] * seg;
-    mv3(R, lc, t);
-    for (int k = 0; k < 3; k++) ce[k] += t[k];
+    if (e == 1 && !(cb.second > -3.f)) break;
+    float ce[3], dist, pc[3], n[3], fr[9];
+    capsule_box_point(cb, e, bp, R, ce);
     sphere_box(ce, cr, bp, R, bs, &dist, pc, n);
     if (dist < 0.f) { make_frame(n, fr); add_contact(s, pair, e, dist, pc, fr); }
   }
@@ -928,6 +956,13 @@ __device__ DK_INL_COLLIDE void collide_pair(S& s, int pair) {
     return;
   }
 #if HAS_BOX
+  if (t1 == 1 && t2 == 3) {  // sphere-box
+    float R2[9], dist, pc[3], n[3], fr[9];
+    quat2mat(q2, R2);
+    sphere_box(p1, sz1[0], p2, R2, sz2, &dist, pc, n);
+    if (dist < 0.f) { make_frame(n, fr); add_contact(s, pair, 0, dist, pc, fr); }
+    return;
+  }
   if (t1 == 2 && t2 == 3) {  // capsule-box
     float a1[3], R2[9];
     zaxis_rn(q1, a1);
