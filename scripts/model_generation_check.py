@@ -141,6 +141,66 @@ class GenerationCheck(unittest.TestCase):
                                 input=code, text=True, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    @unittest.skipUnless(shutil.which("c++"), "root-axis reuse check requires a C++ compiler")
+    def test_contact_root_axes_reuse_exact_rotations_for_one_and_two_free_trees(self):
+        rotation = source.DEVICE.split("__device__ __forceinline__ void qrot(", 1)[1]
+        rotation = "void qrot(" + rotation.split("__device__ __forceinline__ void qrot_inv", 1)[0]
+        axes = adjoint.ADJ_DEVICE.split("__device__ __forceinline__ void adj_contact_root_axes", 1)[1]
+        axes = "void adj_contact_root_axes" + axes.split("// A5 / A6 of contact c", 1)[0]
+        harness = r'''
+#include <cmath>
+#include <cstring>
+#define __device__
+#define __forceinline__ inline
+#define NB 35
+int c_roots[NR]={1
+#if NR == 2
+  ,18
+#endif
+};
+struct Adj {
+  float Q[NB][4];
+  unsigned before;
+  float zr[3 * NR][3];
+  unsigned after;
+};
+'''
+        main = r'''
+int main() {
+  Adj s={}; s.before=0x12345678u; s.after=0x87654321u;
+  for(int pass=0;pass<50;pass++) {
+    for(int r=0;r<NR;r++) {
+      float norm=0.f;
+      for(int k=0;k<4;k++) {
+        float value=std::sin(float(1+pass+7*r+3*k));
+        s.Q[c_roots[r]][k]=value; norm+=value*value;
+      }
+      for(int k=0;k<4;k++)s.Q[c_roots[r]][k]/=std::sqrt(norm);
+    }
+    for(int lane=0;lane<32;lane++)adj_contact_root_axes(s,lane);
+    for(int r=0;r<NR;r++)for(int axis=0;axis<3;axis++) {
+      float e[3]={0.f,0.f,0.f},direct[3],cached[3];e[axis]=1.f;
+      qrot(s.Q[c_roots[r]],e,direct);
+      // Repeated contact slots read the same world axis without recomputing.
+      for(int contact=0;contact<127;contact++) {
+        adj_contact_root_axis(s,c_roots[r],axis,cached);
+        if(std::memcmp(direct,cached,sizeof(direct)))return 1;
+      }
+    }
+    if(s.before!=0x12345678u || s.after!=0x87654321u)return 2;
+  }
+}
+'''
+        with tempfile.TemporaryDirectory(prefix="nabla-root-axes-cpu-") as directory:
+            path = Path(directory)
+            (path / "axes.cc").write_text(harness + rotation + axes + main)
+            for roots in (1, 2):
+                compiled = subprocess.run(["c++", "-std=c++17", "-O2", "-ffp-contract=off", f"-DNR={roots}",
+                    str(path / "axes.cc"), "-o", str(path / "axes")], text=True, capture_output=True)
+                self.assertEqual(compiled.returncode, 0, compiled.stderr)
+                result = subprocess.run([str(path / "axes")], text=True, capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
     @unittest.skipUnless(shutil.which("c++"), "Hessian accumulation check requires a C++ compiler")
     def test_hessian_retains_small_contact_curvature_across_tiles(self):
         model = dense_contact_model()
