@@ -253,6 +253,8 @@ struct Adj {
   int flags;  // union of the records' flags (tape.py), ADJ_ROWS_SKIPPED, ADJ_REPLAY_MISMATCH
 #if HAS_NATIVE_COLLISION
   CMScratch cm_scratch;
+  CMLinearization cm_linearization;
+  int cm_cached_pair;  // only valid within the current adj_contacts pass
   const float* feature_rec;
 #endif
   // bodies, lane b = body b (body 0: the world, at rest). Forward quantities (A3) read up to A7:
@@ -981,14 +983,19 @@ __device__ __forceinline__ float adj_contact_one(Adj& s, int c, int pair, int sl
   CMFeature feature;
   if (native) {
     feature = cm_feature_unpack(s.feature_rec + c * CM_FEATURE_WORDS);
-    CMContact contact;
-    int error = c_gtype[g2] == 4
-      ? convex_contact_replay(g1, g2, &s.gx[0][0], &s.gq[0][0], feature, &s.cm_scratch, &contact)
-      : box_box_contact_replay(g1, g2, &s.gx[0][0], &s.gq[0][0], feature, &s.cm_scratch, &contact);
-    if (error) { atomicOr(&s.flags, (int)ADJ_REPLAY_MISMATCH); return 0.f; }
-    d = contact.dist;
-    for (int k = 0; k < 3; k++) p[k] = contact.pos[k];
-    for (int k = 0; k < 9; k++) fr[k] = contact.frame[k];
+    if (s.cm_cached_pair != pair) {
+      int error = c_gtype[g2] == 4
+        ? convex_manifold_linearize(g1, g2, &s.gx[0][0], &s.gq[0][0], feature,
+                                    &s.cm_scratch, &s.cm_linearization)
+        : box_box_manifold_linearize(g1, g2, &s.gx[0][0], &s.gq[0][0], feature,
+                                     &s.cm_scratch, &s.cm_linearization);
+      if (error) { atomicOr(&s.flags, (int)ADJ_REPLAY_MISMATCH); return 0.f; }
+      s.cm_cached_pair = pair;
+    }
+    const float* geometry = s.cm_linearization.value[feature.slot];
+    d = geometry[0];
+    for (int k = 0; k < 3; k++) p[k] = geometry[1 + k];
+    for (int k = 0; k < 9; k++) fr[k] = geometry[4 + k];
     nu = 1e30f;
   } else
 #endif
@@ -1030,10 +1037,7 @@ __device__ __forceinline__ float adj_contact_one(Adj& s, int c, int pair, int sl
     float d2, p2[3], fr2[9], nu2, gb[12];
 #if HAS_NATIVE_COLLISION
     if (native) {
-      int error = c_gtype[g2] == 4
-        ? convex_contact_vjp(g1, g2, &s.gx[0][0], &s.gq[0][0], feature, cot[0], cot + 1, cot + 4, &s.cm_scratch, gb)
-        : box_box_contact_vjp(g1, g2, &s.gx[0][0], &s.gq[0][0], feature, cot[0], cot + 1, cot + 4, &s.cm_scratch, gb);
-      if (error) { atomicOr(&s.flags, (int)ADJ_REPLAY_MISMATCH); return 0.f; }
+      contact_linearization_vjp(s.cm_linearization, feature.slot, cot[0], cot + 1, cot + 4, gb);
     } else
 #endif
       adj_pair_geom(pair, slot, s.gx, s.gq, &d2, p2, fr2, &nu2, cot, gb);
@@ -1105,6 +1109,12 @@ __device__ void adj_contacts_coupled(Adj& s, int lane, float* dbg) {
     int b = c_gbody[g];
     geom_pose(g, s.Q[b], s.X[b], s.gx[g], s.gq[g]);
   }
+#if HAS_NATIVE_COLLISION
+  // Forward native pairs emit contiguous slots with one selected feature. Keep
+  // their common linearization across contact tiles, then discard it at the
+  // next pass (new poses/substep, or the debug pass's different seeds).
+  if (lane == 0) s.cm_cached_pair = -1;
+#endif
   __syncwarp();
   int ntri = 0;
   for (int c0 = 0; c0 < ncon; c0 += 32) {

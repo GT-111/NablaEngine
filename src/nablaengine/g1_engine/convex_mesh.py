@@ -131,6 +131,7 @@ def header(m, geoms):
 #define CM_MULTI {int(not (int(m.opt.disableflags) & int(mujoco.mjtDisableBit.mjDSBL_MULTICCD)))}
 #define CM_SCRATCH_BYTES {scratch_bytes(m)}
 #define CM_FEATURE_WORDS 12
+#define CM_REPLAY_SLOTS {8 if sum(m.geom_type[g] == mujoco.mjtGeom.mjGEOM_BOX for g in geoms) >= 2 else 4}
 {definitions}
 struct CMFeature {{
   int support1[3], support2[3];
@@ -145,6 +146,11 @@ enum {{ CM_BOX_AXIS_TIE=1, CM_BOX_CLIP_BOUNDARY=2, CM_BOX_CLAMP_BOUNDARY=4,
 static_assert(sizeof(CMFeature) == 4 * CM_FEATURE_WORDS, "contact feature tape ABI");
 struct CMContact {{ float dist, pos[3], frame[9]; CMFeature feature; }};
 struct CMManifold {{ int count, status; CMContact contact[8]; }};
+// One selected manifold's geometry and twelve pose-tangent derivatives. The
+// adjoint reuses it across recorded slots; it is never part of the forward tape.
+struct CMLinearization {{
+  float value[CM_REPLAY_SLOTS][13], jacobian[CM_REPLAY_SLOTS][12][13];
+}};
 struct alignas(8) CMScratch {{ unsigned char bytes[CM_SCRATCH_BYTES]; }};
 CM_DEVICE void convex_manifold(int, int, const float*, const float*, CMScratch*, CMManifold*);
 CM_DEVICE int convex_contact_replay(int, int, const float*, const float*, const CMFeature&,
@@ -156,6 +162,11 @@ CM_DEVICE int box_box_contact_replay(int, int, const float*, const float*, const
                                      CMScratch*, CMContact*);
 CM_DEVICE int box_box_contact_vjp(int, int, const float*, const float*, const CMFeature&,
                                   float, const float*, const float*, CMScratch*, float*);
+CM_DEVICE int convex_manifold_linearize(int, int, const float*, const float*, const CMFeature&,
+                                        CMScratch*, CMLinearization*);
+CM_DEVICE int box_box_manifold_linearize(int, int, const float*, const float*, const CMFeature&,
+                                         CMScratch*, CMLinearization*);
+CM_DEVICE void contact_linearization_vjp(const CMLinearization&, int, float, const float*, const float*, float*);
 """
 
 
@@ -3726,6 +3737,75 @@ CM_DEVICE int convex_contact_vjp(int g1,int g2,const float* gx,const float* gq,
     gb12[seed]=g;
   }
   return 0;
+}
+
+// Seeded replay always reconstructs every slot of the selected manifold. Keep
+// those results once per pair instead of rebuilding the same clipping polygon
+// twelve times for each contact. Each slot's contraction below retains the
+// single-contact VJP's operation order.
+CM_DEVICE void cm_linearization_store(CMLinearization* result,int slot,int seed,
+                                      cm::Dual dist,const cm::Dual* pos,const cm::Dual* frame) {
+  if(seed==0) {
+    result->value[slot][0]=dist.v;
+    for(int k=0;k<3;k++)result->value[slot][1+k]=pos[k].v;
+    for(int k=0;k<9;k++)result->value[slot][4+k]=frame[k].v;
+  }
+  float* derivative=result->jacobian[slot][seed];
+  derivative[0]=dist.d;
+  for(int k=0;k<3;k++)derivative[1+k]=pos[k].d;
+  for(int k=0;k<9;k++)derivative[4+k]=frame[k].d;
+}
+
+CM_DEVICE int convex_manifold_linearize(int g1,int g2,const float* gx,const float* gq,
+                                        const CMFeature& feature,CMScratch* scratch,CMLinearization* result) {
+  if(feature.nsupp1!=3 || feature.nsupp2!=3 || feature.slot<0 || feature.slot>=feature.count ||
+     feature.count>CM_REPLAY_SLOTS)return 16;
+  bool flip=cm_type[g1]>cm_type[g2] || (cm_type[g1]==cm_type[g2] && g1>g2);
+  if(flip){int tmp=g1;g1=g2;g2=tmp;}
+  for(int seed=0;seed<12;seed++) {
+    cm::Replay replay;
+    int canonical_seed=flip ? (seed<6 ? seed+6 : seed-6) : seed;
+    int error=cm::replay(g1,g2,gx,gq,feature,canonical_seed,scratch,&replay);
+    if(error || replay.count!=feature.count)return 16;
+    for(int slot=0;slot<replay.count;slot++) {
+      cm::Dual d,p[3],frame[9];
+      cm::contact_geometry(replay,slot,&d,p,frame);
+      if(flip)for(int k=0;k<3;k++){frame[k]=-frame[k];frame[6+k]=-frame[6+k];}
+      cm_linearization_store(result,slot,seed,d,p,frame);
+    }
+  }
+  return 0;
+}
+
+CM_DEVICE int box_box_manifold_linearize(int g1,int g2,const float* gx,const float* gq,
+                                         const CMFeature& feature,CMScratch* scratch,CMLinearization* result) {
+  if(!cmbb::valid_feature(feature) || feature.count>CM_REPLAY_SLOTS)return 16;
+  bool flip=g1>g2;
+  if(flip){int tmp=g1;g1=g2;g2=tmp;}
+  for(int seed=0;seed<12;seed++) {
+    int canonical_seed=flip ? (seed<6 ? seed+6 : seed-6) : seed;
+    CMFeature active;
+    int count=cmbb::evaluate(g1,g2,gx,gq,&feature,canonical_seed,scratch,&active);
+    if(count!=feature.count)return 16;
+    const cmbb::Contact* contacts=((cmbb::Scratch*)scratch->bytes)->contact;
+    for(int slot=0;slot<count;slot++) {
+      cmbb::T frame[9];cmgeom::frame<cmbb::T>(contacts[slot].normal,frame);
+      if(flip)for(int k=0;k<3;k++){frame[k]=-frame[k];frame[6+k]=-frame[6+k];}
+      cm_linearization_store(result,slot,seed,contacts[slot].dist,contacts[slot].pos,frame);
+    }
+  }
+  return 0;
+}
+
+CM_DEVICE void contact_linearization_vjp(const CMLinearization& result,int slot,float dbar,
+                                         const float* pbar,const float* frbar,float* gb12) {
+  for(int seed=0;seed<12;seed++) {
+    const float* derivative=result.jacobian[slot][seed];
+    float g=dbar*derivative[0];
+    for(int k=0;k<3;k++)g+=pbar[k]*derivative[1+k];
+    for(int k=0;k<9;k++)g+=frbar[k]*derivative[4+k];
+    gb12[seed]=g;
+  }
 }
 
 
