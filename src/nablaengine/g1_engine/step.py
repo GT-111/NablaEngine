@@ -1803,12 +1803,18 @@ __device__ void substep_pre(S& s, const float* ctrl, int lane, float* rec, const
       for (int t = 0; t < 3; t++) pos[t] = s.con_pos[c][t];
       for (int t = 0; t < 9; t++) fr[t] = s.con_frame[c][t];
       int base = 0;
+#if NR == 2
+      unsigned long long support = 0ull;  // the Jacobian ballots already encode this contact's dof support
+#endif
 #pragma unroll
       for (int h = 0; h < 2; h++) {
         int i = lane + 32 * h, bi = dbody[h];
         int in2 = (m2 >> bi) & 1, in1 = (m1 >> bi) & 1;
         bool on = i < NV && in1 != in2;
         unsigned bal = __ballot_sync(0xffffffffu, on);
+#if NR == 2
+        support |= (unsigned long long)bal << (32 * h);
+#endif
         if (on) {
           int k = base + __popc(bal & ((1u << lane) - 1u));
           float r[3], u[3], jp[3];
@@ -1822,10 +1828,17 @@ __device__ void substep_pre(S& s, const float* ctrl, int lane, float* rec, const
         base += __popc(bal);
       }
       if (lane == 0) s.con_nd[c] = base;
+#if NR == 2
+      if (lane == (c & 31)) am1[c >> 5] = support;
+#endif
     }
 #pragma unroll
     for (int h = 0; h < CON_TILES; h++)
+#if NR == 2
+      if (lane + 32 * h < ncon) s.con_mask[lane + 32 * h] = am1[h];
+#else
       if (lane + 32 * h < ncon) s.con_mask[lane + 32 * h] = support_mask(am1[h] ^ am2[h]);  // (the ballots' bits)
+#endif
   }
   PROF(3);
 

@@ -466,6 +466,82 @@ int main() {
         single = hand_model(31, 5)
         self.assertIn("H1", capability.check(single, [], 1, scope="forward").codes("error"))
 
+    @unittest.skipUnless(shutil.which("c++"), "contact support check requires a C++ compiler")
+    def test_contact_jacobian_support_matches_dofs_for_two_roots(self):
+        model = hand_model(26, roots=2)
+        dofbody, ancestors = step.extra_constants(model)
+        pairs = [(1 + (7 * c) % (model.nbody - 1), 1 + (13 * c + 27) % (model.nbody - 1)) for c in range(80)]
+        jac = step.STEP_KERNEL.split("  {  // contact Jacobians:", 1)[1].split("  PROF(3);", 1)[0]
+        support = step.STEP_KERNEL.split("__device__ __forceinline__ unsigned long long support_mask", 1)[1]
+        support = "__device__ __forceinline__ unsigned long long support_mask" + support.split("// the Newton Hessian", 1)[0]
+        declarations = f'''
+#include <cstdlib>
+#define __device__
+#define __forceinline__ inline
+#define NR 2
+#define NV {model.nv}
+#define NB {model.nbody}
+#define CON_TILES 3
+#define DOF_BODY_ROOT6 0
+#define PG1(p) (2*(p))
+#define PG2(p) (2*(p)+1)
+int c_dofbody[NV] = {{{','.join(str(int(v)) for v in dofbody)}}};
+int c_doflocal[NV] = {{}};
+unsigned long long c_ancmask[NB] = {{{','.join(str(int(v)) + 'ull' for v in ancestors)}}};
+int c_gbody[160] = {{{','.join(str(v) for pair in pairs for v in pair)}}};
+'''
+        harness = r'''
+int lane_id, shuffles, ballots;
+unsigned long long __shfl_sync(unsigned, unsigned long long, int src) {
+  int c=shuffles/2, side=shuffles++%2;
+  if(src!=(c&31))std::abort();
+  return c_ancmask[c_gbody[2*c+side]];
+}
+unsigned __ballot_sync(unsigned, bool on) {
+  int c=ballots/2, h=ballots++%2;
+  auto x=c_ancmask[c_gbody[2*c]]^c_ancmask[c_gbody[2*c+1]];
+  unsigned result=0;
+  for(int j=0;j<32;j++)if(32*h+j<NV && ((x>>c_dofbody[32*h+j])&1ull))result|=1u<<j;
+  if(on!=bool((result>>lane_id)&1u))std::abort();
+  return result;
+}
+int __popc(unsigned x) { return __builtin_popcount(x); }
+void dof_motion(int,int,const float*,const float*,const float*,float* w,float* v) {
+  for(int i=0;i<3;i++)w[i]=v[i]=0.f;
+}
+void cross(const float*,const float*,float* out) { for(int i=0;i<3;i++)out[i]=0.f; }
+float dot3(const float*,const float*) { return 0.f; }
+struct State {
+  float Q[NB][4],X[NB][3],con_pos[80][3],con_frame[80][9],con_J[80][3][NV];
+  int con_pair[80],con_nd[80]; unsigned char con_dof[80][NV]; unsigned long long con_mask[80];
+};
+'''
+        main = r'''
+int main() {
+  static State s{};
+  for(int c=0;c<80;c++)s.con_pair[c]=c;
+  for(int lane=0;lane<32;lane++){lane_id=lane;shuffles=ballots=0;run(s,80,lane);}
+  for(int c=0;c<80;c++) {
+    auto x=c_ancmask[c_gbody[2*c]]^c_ancmask[c_gbody[2*c+1]], expected=0ull;
+    int k=0;
+    for(int i=0;i<NV;i++)if((x>>c_dofbody[i])&1ull){
+      expected|=1ull<<i;
+      if(s.con_dof[c][k++]!=i)return 1;
+    }
+    if(s.con_mask[c]!=expected || s.con_nd[c]!=k)return 2;
+  }
+}
+'''
+        code = declarations + harness + support + "\nvoid run(State& s, int ncon, int lane) {\n" \
+            + "const float O[3]={};\n{  // contact Jacobians:" + jac + "}\n" + main
+        with tempfile.TemporaryDirectory(prefix="nabla-contact-support-cpu-") as directory:
+            binary = str(Path(directory) / "support")
+            compiled = subprocess.run(["c++", "-std=c++17", "-O2", "-x", "c++", "-", "-o", binary],
+                                      input=code, text=True, capture_output=True)
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
+            result = subprocess.run([binary], text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_soft_equalities_and_frictionloss(self):
         model = hand_model(passive=True, damping=0.1, frictionloss=0.05, equality=True)
         capability.require(model, [], 1)
