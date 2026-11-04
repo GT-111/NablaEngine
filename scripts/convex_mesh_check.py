@@ -155,6 +155,25 @@ extern "C" int cm_replay(int g1,int g2,const float* x,const float* q,const int* 
   if(guard.before!=0x18273645 || guard.after!=0x54637281) error|=32;
   return error;
 }
+extern "C" int cm_linearize(int g1,int g2,const float* x,const float* q,const int* feature,
+                             const float* cotangent,float* value,float* gradient) {
+  GuardedScratch guard; guard.before=0x18273645; guard.after=0x54637281;
+  struct { uint64_t before; CMLinearization data; uint64_t after; } cache;
+  cache.before=0x18273645; cache.after=0x54637281;
+  CMFeature f; const unsigned char* p=(const unsigned char*)feature; unsigned char* b=(unsigned char*)&f;
+  for(int i=0;i<(int)sizeof(f);i++) b[i]=p[i];
+  int error=f.reserved==1 ? box_box_manifold_linearize(g1,g2,x,q,f,&guard.scratch,&cache.data)
+                        : convex_manifold_linearize(g1,g2,x,q,f,&guard.scratch,&cache.data);
+  if(error)return error;
+  for(int slot=0;slot<f.count;slot++) {
+    for(int k=0;k<13;k++)value[13*slot+k]=cache.data.value[slot][k];
+    contact_linearization_vjp(cache.data,slot,cotangent[13*slot],cotangent+13*slot+1,
+                              cotangent+13*slot+4,gradient+12*slot);
+  }
+  if(guard.before!=0x18273645 || guard.after!=0x54637281 ||
+     cache.before!=0x18273645 || cache.after!=0x54637281)error|=32;
+  return error;
+}
 '''.replace("LOAD", "\n".join(load))
         path = pathlib.Path(self.directory.name)
         (path / "geometry.cc").write_text("#define DKC\n" + convex_mesh.header(m, geoms)
@@ -168,6 +187,7 @@ extern "C" int cm_replay(int g1,int g2,const float* x,const float* q,const int* 
         self.library.cm_forward.argtypes = [ctypes.c_int, ctypes.c_int, fp, fp, fp, ip, ip]
         self.library.cm_reverse.argtypes = [ctypes.c_int, ctypes.c_int, fp, fp, ip, fp, fp]
         self.library.cm_replay.argtypes = [ctypes.c_int, ctypes.c_int, fp, fp, ip, fp]
+        self.library.cm_linearize.argtypes = [ctypes.c_int, ctypes.c_int, fp, fp, ip, fp, fp, fp]
         self.library.cm_load(packed.ctypes.data_as(fp))
 
     @staticmethod
@@ -203,6 +223,16 @@ extern "C" int cm_replay(int g1,int g2,const float* x,const float* q,const int* 
         if error:
             raise AssertionError(f"feature replay status={error}")
         return result
+
+    def linearize(self, x, q, feature, cotangent, pair=(0, 1)):
+        x, q, cotangent = (np.ascontiguousarray(a, np.float32) for a in (x, q, cotangent))
+        feature = np.ascontiguousarray(feature, np.int32)
+        value, gradient = np.empty((8, 13), np.float32), np.empty((8, 12), np.float32)
+        error = self.library.cm_linearize(*pair, self._float(x), self._float(q), self._int(feature),
+            self._float(cotangent), self._float(value), self._float(gradient))
+        if error:
+            raise AssertionError(f"manifold linearization status={error}")
+        return value[:feature[9]], gradient[:feature[9]]
 
 
 def perturb(x, q, index, amount):
@@ -373,6 +403,28 @@ class ConvexMeshCheck(unittest.TestCase):
                 contacts, features = engine.forward(x, q, pair=pair)
                 for contact, feature in zip(contacts, features):
                     np.testing.assert_array_equal(engine.replay(x, q, feature, pair=pair), contact)
+
+    def test_manifold_linearization_reuses_all_slots_without_changing_geometry_or_vjp(self):
+        rng = np.random.default_rng(421)
+        for model in (self.mesh, self.box, self.single, self.prism, self.pyramid,
+                      self.multiple, self.boxes, self.octagon, self.octagon_no_multi):
+            engine = self.engines[id(model)]
+            _, x, q = poses(model)
+            for pair in ((0, 1), (1, 0)):
+                with self.subTest(model=model, pair=pair):
+                    contacts, features = engine.forward(x, q, pair=pair)
+                    self.assertGreater(len(contacts), 0)
+                    bar = rng.normal(size=contacts.shape).astype(np.float32)
+                    bar[::2] = 0.  # inactive slots retain their exact zero VJP
+                    values, gradients = engine.linearize(x, q, features[-1], bar, pair=pair)
+                    np.testing.assert_array_equal(values.view(np.uint32), contacts.view(np.uint32))
+                    for slot, feature in enumerate(features):
+                        expected = engine.reverse(x, q, feature, bar[slot], pair=pair)
+                        np.testing.assert_array_equal(gradients[slot].view(np.uint32), expected.view(np.uint32))
+                    invalid = features[-1].copy()
+                    invalid[9] += 1
+                    with self.assertRaisesRegex(AssertionError, "linearization status=16"):
+                        engine.linearize(x, q, invalid, bar, pair=pair)
 
     def test_shallow_mesh_face_frame_preserves_translation_independence(self):
         engine = self.engines[id(self.mesh)]
