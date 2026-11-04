@@ -1479,23 +1479,14 @@ __device__ __forceinline__ void hessian(S& s, int ncon, const unsigned* world, c
 
 // The two-root scene has block-diagonal smooth dynamics and one coupled constraint solve. Body work is tiled over
 // the warp; every depth finishes before either tile reads the next depth.
-// Stage shared inputs before stores, as in the single-root path, to avoid false alias dependencies.
 template <class S>
 __device__ void coupled_smooth(S& s, int lane) {
   for (int L = 1; L <= MAXD; L++) {
     for (int b = lane; b < NB; b += 32)
       if (c_depth[b] == L) {
         int p = c_parent[b];
-        float Qp[4], Xp[3], Wp[3], Vp[3], ALp[3], Ap[3], Qb[4], Xb[3], Wb[3], Vb[3], ALb[3], Ab[3];
-        for (int k = 0; k < 4; k++) Qp[k] = s.Q[p][k];
-        for (int k = 0; k < 3; k++) {
-          Xp[k] = s.X[p][k]; Wp[k] = s.W[p][k]; Vp[k] = s.V[p][k]; ALp[k] = s.AL[p][k]; Ap[k] = s.A[p][k];
-        }
-        fwd_body(b, Qp, Xp, Wp, Vp, ALp, Ap, s.qpos, s.qvel, s.zero, Qb, Xb, Wb, Vb, ALb, Ab);
-        for (int k = 0; k < 4; k++) s.Q[b][k] = Qb[k];
-        for (int k = 0; k < 3; k++) {
-          s.X[b][k] = Xb[k]; s.W[b][k] = Wb[k]; s.V[b][k] = Vb[k]; s.AL[b][k] = ALb[k]; s.A[b][k] = Ab[k];
-        }
+        fwd_body(b, s.Q[p], s.X[p], s.W[p], s.V[p], s.AL[p], s.A[p], s.qpos, s.qvel, s.zero,
+                 s.Q[b], s.X[b], s.W[b], s.V[b], s.AL[b], s.A[b]);
       }
     __syncwarp();
   }
@@ -1503,19 +1494,13 @@ __device__ void coupled_smooth(S& s, int lane) {
   for (int b = lane; b < NB; b += 32) {
     if (!b) continue;
     int root = c_root[b];
-    float ip[3], Qb[4], Xb[3], O[3], Wb[3], ALb[3], Ab[3], Fb[3], Nb[3], Jb[10];
-    for (int k = 0; k < 4; k++) Qb[k] = s.Q[b][k];
-    for (int k = 0; k < 3; k++) {
-      Xb[k] = s.X[b][k]; O[k] = s.X[root][k]; Wb[k] = s.W[b][k]; ALb[k] = s.AL[b][k]; Ab[k] = s.A[b][k];
-    }
+    float ip[3];
     body_ipos(b, s.com, ip);
-    body_force(b, Qb, Wb, ALb, Ab, ip, Fb, Nb);
-    body_inertia(b, Qb, Xb, O, ip, Jb);
-    for (int k = 0; k < 3; k++) { s.F[b][k] = Fb[k]; s.N[b][k] = Nb[k]; }
-    for (int k = 0; k < 10; k++) s.J[b][k] = Jb[k];
+    body_force(b, s.Q[b], s.W[b], s.AL[b], s.A[b], ip, s.F[b], s.N[b]);
+    body_inertia(b, s.Q[b], s.X[b], s.X[root], ip, s.J[b]);
     if (!c_isfree[b]) {
       float w[3], v[3];
-      dof_motion(b, 0, Qb, Xb, O, w, v);
+      dof_motion(b, 0, s.Q[b], s.X[b], s.X[root], w, v);
       for (int k = 0; k < 3; k++) { s.W[b][k] = w[k]; s.V[b][k] = v[k]; }
     }
   }
@@ -1523,59 +1508,38 @@ __device__ void coupled_smooth(S& s, int lane) {
   SUBPROF(15);
   for (int L = MAXD - 1; L >= 1; L--) {
     for (int b = lane; b < NB; b += 32)
-      if (c_depth[b] == L && c_nchild[b] > 0) {
-        float Xb[3], Fb[3], Nb[3], Jb[10];
-        for (int k = 0; k < 3; k++) { Xb[k] = s.X[b][k]; Fb[k] = s.F[b][k]; Nb[k] = s.N[b][k]; }
-        for (int k = 0; k < 10; k++) Jb[k] = s.J[b][k];
+      if (c_depth[b] == L)
         for (int j = 0; j < c_nchild[b]; j++) {
           int c = c_child[MAX_CHILD * b + j];
-          float Xc[3], Fc[3], Nc[3];
-          for (int k = 0; k < 3; k++) { Xc[k] = s.X[c][k]; Fc[k] = s.F[c][k]; Nc[k] = s.N[c][k]; }
-          accumulate(Xb, Xc, Fc, Nc, Fb, Nb);
-          for (int k = 0; k < 10; k++) Jb[k] += s.J[c][k];
+          accumulate(s.X[b], s.X[c], s.F[c], s.N[c], s.F[b], s.N[b]);
+          for (int k = 0; k < 10; k++) s.J[b][k] += s.J[c][k];
         }
-        for (int k = 0; k < 3; k++) { s.F[b][k] = Fb[k]; s.N[b][k] = Nb[k]; }
-        for (int k = 0; k < 10; k++) s.J[b][k] = Jb[k];
-      }
     __syncwarp();
   }
   SUBPROF(16);
   for (int b = lane; b < NB; b += 32) {
     if (!b) continue;
+    torques(b, s.Q[b], s.F[b], s.N[b], s.qsm);
     const int root = c_root[b], droot = c_dadr[root], d = c_dadr[b];
-    float Qb[4], Xb[3], Qr[4], O[3], Jb[10], Fb[3], Nb[3];
-    for (int k = 0; k < 4; k++) { Qb[k] = s.Q[b][k]; Qr[k] = s.Q[root][k]; }
-    for (int k = 0; k < 3; k++) { Xb[k] = s.X[b][k]; O[k] = s.X[root][k]; Fb[k] = s.F[b][k]; Nb[k] = s.N[b][k]; }
-    for (int k = 0; k < 10; k++) Jb[k] = s.J[b][k];
-    torques(b, Qb, Fb, Nb, s.qsm);
     float n[3], f[3], sw[3], sv[3], kw[3], kv[3];
     if (c_isfree[b]) {
       for (int j = 0; j < 6; j++) {
-        dof_motion(b, j, Qb, Xb, Xb, sw, sv);
-        apply_inertia(Jb, sw, sv, n, f);
+        dof_motion(b, j, s.Q[b], s.X[b], s.X[b], sw, sv);
+        apply_inertia(s.J[b], sw, sv, n, f);
         for (int i = 0; i <= j; i++) {
-          dof_motion(b, i, Qb, Xb, Xb, kw, kv);
+          dof_motion(b, i, s.Q[b], s.X[b], s.X[b], kw, kv);
           s.M[TRI(d + j, d + i)] = dot3(kw, n) + dot3(kv, f) + (i == j ? c_armature[d + j] : 0.f);
         }
       }
     } else {
-      int na = c_nanc[b], ad[12];
-      float aw[12][3], av[12][3];
-      for (int k = 0; k < 3; k++) { sw[k] = s.W[b][k]; sv[k] = s.V[b][k]; }
-#pragma unroll
-      for (int a = 0; a < 12; a++)
-        if (a < na) {
-          int k = c_anc[12 * b + a];
-          ad[a] = c_dadr[k];
-          for (int t = 0; t < 3; t++) { aw[a][t] = s.W[k][t]; av[a][t] = s.V[k][t]; }
-        }
-      apply_inertia(Jb, sw, sv, n, f);
-      s.M[TRI(d, d)] = dot3(sw, n) + dot3(sv, f) + c_armature[d];
-#pragma unroll
-      for (int a = 0; a < 12; a++)
-        if (a < na) s.M[TRI(d, ad[a])] = dot3(aw[a], n) + dot3(av[a], f);
+      apply_inertia(s.J[b], s.W[b], s.V[b], n, f);
+      s.M[TRI(d, d)] = dot3(s.W[b], n) + dot3(s.V[b], f) + c_armature[d];
+      for (int j = 0; j < c_nanc[b]; j++) {
+        int a = c_anc[12 * b + j];
+        s.M[TRI(d, c_dadr[a])] = dot3(s.W[a], n) + dot3(s.V[a], f);
+      }
       for (int j = 0; j < 6; j++) {
-        dof_motion(root, j, Qr, O, O, kw, kv);
+        dof_motion(root, j, s.Q[root], s.X[root], s.X[root], kw, kv);
         s.M[TRI(d, droot + j)] = dot3(kw, n) + dot3(kv, f);
       }
     }
