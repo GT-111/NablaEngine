@@ -2172,13 +2172,21 @@ __device__ __forceinline__ void substep(S& s, const float* ctrl, int iterations,
 // half of k_substep's). Their members have struct Sim's names, so the device code above runs unchanged on all three;
 // arrays that live in global memory are pointers there (struct Hand, one per world: what substep_pre hands to
 // substep_post).
-// substep_post runs on SimNT<SPLIT_NCON, SPLIT_NEFC> in shared memory when the world's contacts and rows fit (corpora:
-// at most 31 contacts and 122 rows), else on a full-capacity SimN in Hand (global memory, the same code).
+// substep_post runs on SimNT<SPLIT_NCON, SPLIT_NEFC> in shared memory when the world's contacts and rows fit,
+// else on a full-capacity SimN in Hand (global memory, the same code).
 #ifndef SPLIT_NCON
+#if NR == 2 && !defined(DK_TAPE_VERIFY)  // its extra Hessian must also fit the default 48 KiB shared-memory limit
+#define SPLIT_NCON (MAXCON < 96 ? MAXCON : 96)  // k_post's shared-memory capacity: contacts
+#else
 #define SPLIT_NCON (MAXCON < 32 ? MAXCON : 32)  // k_post's shared-memory capacity: contacts
 #endif
+#endif
 #ifndef SPLIT_NEFC
+#if NR == 2 && !defined(DK_TAPE_VERIFY)
+#define SPLIT_NEFC (NEFC < NFLOSS + NEQ + NV + 4 * SPLIT_NCON ? NEFC : NFLOSS + NEQ + NV + 4 * SPLIT_NCON)
+#else
 #define SPLIT_NEFC (NEFC < 128 ? NEFC : 128)  // and constraint rows
+#endif
 #endif
 template <int NC, int NROW>
 struct SimNT {  // substep_post: Newton, implicitfast; capacity NC contacts, NR rows. Members whose lifetimes do not

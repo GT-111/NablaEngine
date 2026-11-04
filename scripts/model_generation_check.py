@@ -17,8 +17,9 @@ from nablaengine.g1_engine import adjoint, source, step, tape
 from nablaengine.model import capability
 
 
-def hand_model(nhinge=12, fingers=5, *, passive=False, damping=0.0, frictionloss=0.0, equality=False, roots=1):
-    """One or two real FREE palms and hinge chains, with no collision geometry."""
+def hand_model(nhinge=12, fingers=5, *, passive=False, damping=0.0, frictionloss=0.0, equality=False, roots=1,
+               collision=False):
+    """One or two real FREE palms and hinge chains, optionally with dense contacts."""
     bodies, acts, equalities = [], [], []
     for root in range(roots):
         chains, index = [], root * nhinge
@@ -33,6 +34,7 @@ def hand_model(nhinge=12, fingers=5, *, passive=False, damping=0.0, frictionloss
             chains.append(chain + "</body>" * length)
         bodies.append(f'<body name="palm{root}" pos="0 {root * 0.2} 0"><freejoint/>'
                       '<inertial mass="0.5" pos="0 0 0" diaginertia="0.01 0.01 0.01"/>'
+                      + ('<geom type="sphere" size=".1"/>' * 12 if collision else '')
                       + "".join(chains) + '</body>')
         joints = list(range(nhinge)) if not passive else list(range(0, nhinge, 2))[::-1]
         acts += [f'<position joint="j{root * nhinge + i}" kp="20" kv="0.2"/>' for i in joints]
@@ -46,18 +48,20 @@ def hand_model(nhinge=12, fingers=5, *, passive=False, damping=0.0, frictionloss
         + ('<equality>' + ''.join(equalities) + '</equality>' if equalities else '') + '</mujoco>')
 
 
-def dense_contact_model(nconmax=320, njmax=1400):
+def dense_contact_model(nconmax=320, njmax=1400, *, frictionloss=0.0, equality=False):
     geoms = '<geom type="sphere" size=".1"/>' * 17
     bodies = []
     for index, x in enumerate((0, .15)):
         bodies.append(f'<body pos="{x} 0 0"><freejoint/>' + geoms
-                      + f'<body pos="0 0 .1"><joint name="j{index}" range="-1 1"/>'
+                      + f'<body pos="0 0 .1"><joint name="j{index}" range="-1 1" frictionloss="{frictionloss}"/>'
                       '<inertial mass=".1" pos=".02 0 0" diaginertia=".001 .001 .001"/></body></body>')
     return mujoco.MjModel.from_xml_string(
         f'<mujoco><size nconmax="{nconmax}" njmax="{njmax}"/>'
         '<option timestep=".005" integrator="implicitfast" solver="Newton" cone="pyramidal"/>'
         '<worldbody>' + ''.join(bodies) + '</worldbody><actuator>'
-        '<position joint="j0" kp="20" kv=".2"/><position joint="j1" kp="20" kv=".2"/></actuator></mujoco>')
+        '<position joint="j0" kp="20" kv=".2"/><position joint="j1" kp="20" kv=".2"/></actuator>'
+        + ('<equality><joint joint1="j0" joint2="j1" polycoef="0 1 0 0 0"/></equality>' if equality else '')
+        + '</mujoco>')
 
 
 class GenerationCheck(unittest.TestCase):
@@ -131,15 +135,36 @@ class GenerationCheck(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("c++"), "state layout check requires a C++ compiler")
     def test_state_layout_compiles_with_root_count_macro(self):
-        model = hand_model(22, roots=2)
-        header = source.header(model, maxd=8, wpb=1).replace("#include <cuda_runtime.h>", "")
         sim = step.STEP_DEVICE.split("struct Sim {", 1)[1].split("// a condition that", 1)[0]
         split = step.STEP_KERNEL.split("// The split forward (host.py:", 1)[1]
-        code = ("#define __device__\n" + header + step.step_header(model) + "struct Sim {" + sim
-                + "// The split forward (host.py:" + split + "\nstatic_assert(sizeof(Hand) > 0);\n")
-        result = subprocess.run(["c++", "-std=c++17", "-fsyntax-only", "-x", "c++", "-"],
-                                input=code, text=True, capture_output=True)
-        self.assertEqual(result.returncode, 0, result.stderr)
+        g1 = mujoco.MjModel.from_binary_path(str(Path(__file__).resolve().parents[1] / "fixtures/mjlab/g1_train.mjb"))
+        dense = dense_contact_model(frictionloss=.1, equality=True)
+        large = hand_model(26, roots=2, frictionloss=.1, equality=True, collision=True)
+        large.dof_frictionloss[:] = .1  # FREE dofs may have frictionloss too, so NFLOSS can equal NV.
+        capability.require(large, [], source.free_roots(large))
+        cases = (
+            ("one root", g1, (), 32, 128),
+            ("two roots limited", hand_model(22, roots=2), (), 32, 44),
+            ("two roots full", dense, (), 96, 401),
+            ("two roots capped", dense_contact_model(64, 64), (), 64, 258),
+            ("contact override", dense, ("-DSPLIT_NCON=16",), 16, 81),
+            ("row override", dense, ("-DSPLIT_NEFC=79",), 96, 79),
+            ("large two roots", large, (), 96, 524),
+            ("large tape verification", large, ("-DDK_TAPE_VERIFY",), 32, 128),
+        )
+        for name, model, defines, ncon, nefc in cases:
+            with self.subTest(name=name):
+                header = source.header(model, maxd=8, wpb=1).replace("#include <cuda_runtime.h>", "")
+                code = ("#define __device__\n" + header + step.step_header(model) + "struct Sim {" + sim
+                        + "// The split forward (host.py:" + split
+                        + f"\nstatic_assert(SPLIT_NCON == {ncon} && SPLIT_NEFC == {nefc});\n"
+                        + f"static_assert(sizeof(((SimN*)0)->con_dim) == {ncon});\n"
+                        + f"static_assert(sizeof(((SimN*)0)->efc_kind) == {nefc});\n"
+                        + "static_assert(sizeof(SimN) <= sizeof(SimNfull) && sizeof(SimN) <= 48 * 1024);\n"
+                        + "static_assert(sizeof(Hand) > 0);\n")
+                result = subprocess.run(["c++", "-std=c++17", "-fsyntax-only", *defines, "-x", "c++", "-"],
+                                        input=code, text=True, capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
 
     @unittest.skipUnless(shutil.which("c++"), "root-axis reuse check requires a C++ compiler")
     def test_contact_root_axes_reuse_exact_rotations_for_one_and_two_free_trees(self):
