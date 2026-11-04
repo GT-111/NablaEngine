@@ -1000,15 +1000,7 @@ __device__ __forceinline__ float adj_contact_one(Adj& s, int c, int pair, int sl
   CMFeature feature;
   if (native) {
     feature = cm_feature_unpack(s.feature_rec + c * CM_FEATURE_WORDS);
-    if (s.cm_cached_pair != pair) {
-      int error = c_gtype[g2] == 4
-        ? convex_manifold_linearize(g1, g2, &s.gx[0][0], &s.gq[0][0], feature,
-                                    &s.cm_scratch, &s.cm_linearization)
-        : box_box_manifold_linearize(g1, g2, &s.gx[0][0], &s.gq[0][0], feature,
-                                     &s.cm_scratch, &s.cm_linearization);
-      if (error) { atomicOr(&s.flags, (int)ADJ_REPLAY_MISMATCH); return 0.f; }
-      s.cm_cached_pair = pair;
-    }
+    // The caller prepares this pair before its slots read the shared linearization.
     const float* geometry = s.cm_linearization.value[feature.slot];
     d = geometry[0];
     for (int k = 0; k < 3; k++) p[k] = geometry[1 + k];
@@ -1159,22 +1151,35 @@ __device__ void adj_contacts_coupled(Adj& s, int lane, float* dbg) {
     int cb = -1;
     bool bad = false;
 #if HAS_NATIVE_COLLISION
-    // Native replay reuses this world's single scratch buffer. The result of
-    // each serial lane-zero call returns to its contact's lane for reduction.
-    for (int j = 0; j < min(32, ncon - c0); j++) {
-      int pj = __shfl_sync(0xffffffffu, pair, j), sj = __shfl_sync(0xffffffffu, slot, j);
-      unsigned zj = __shfl_sync(0xffffffffu, zone, j);
-      bool uj = __shfl_sync(0xffffffffu, (int)use, j) != 0;
-      float words[CS_N] = {}, distance = -1.f;
-      if (lane == 0 && uj && (zj || dbg))
-        distance = adj_contact_one(s, c0 + j, pj, sj, zj, words, dbg);
-      for (int k = 0; k < CS_N; k++) {
-        float value = __shfl_sync(0xffffffffu, words[k], 0);
-        if (lane == j) cw[k] = value;
+    bool active = use && (zone || dbg);
+    bool native = on && (c_gtype[PG2(pair)] == 4 || (c_gtype[PG1(pair)] == 3 && c_gtype[PG2(pair)] == 3));
+    if (active && !native)
+      bad = !(adj_contact_one(s, c, pair, slot, zone, cw, dbg) < 0.f);
+    // One pair owns the shared scratch; its slots then consume immutable results.
+    unsigned pending = __ballot_sync(0xffffffffu, active && native);
+    while (pending) {
+      int leader = __ffs(pending) - 1, pj = __shfl_sync(0xffffffffu, pair, leader);
+      unsigned same = __ballot_sync(0xffffffffu, active && native && pair == pj);
+      int error = 0;
+      if (lane == 0 && s.cm_cached_pair != pj) {
+        int g1 = PG1(pj), g2 = PG2(pj);
+        CMFeature feature = cm_feature_unpack(s.feature_rec + (c0 + leader) * CM_FEATURE_WORDS);
+        error = c_gtype[g2] == 4
+          ? convex_manifold_linearize(g1, g2, &s.gx[0][0], &s.gq[0][0], feature,
+                                      &s.cm_scratch, &s.cm_linearization)
+          : box_box_manifold_linearize(g1, g2, &s.gx[0][0], &s.gq[0][0], feature,
+                                       &s.cm_scratch, &s.cm_linearization);
+        if (error) atomicOr(&s.flags, (int)ADJ_REPLAY_MISMATCH);
+        else s.cm_cached_pair = pj;
       }
-      float value = __shfl_sync(0xffffffffu, distance, 0);
-      if (lane == j && uj && (zj || dbg)) bad = !(value < 0.f);
+      error = __shfl_sync(0xffffffffu, error, 0);
       __syncwarp();
+      if ((same >> lane) & 1u) {
+        if (error) bad = true;
+        else bad = !(adj_contact_one(s, c, pair, slot, zone, cw, dbg) < 0.f);
+      }
+      __syncwarp();
+      pending &= ~same;
     }
     if (use && zone) cb = c_gbody[PG1(pair)] | c_gbody[PG2(pair)] << 8;
 #else

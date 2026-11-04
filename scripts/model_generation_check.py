@@ -286,6 +286,114 @@ int main() {
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual("c_floss[i]" in result.stdout, count > 0)
 
+    @unittest.skipUnless(shutil.which("c++"), "contact-group check requires a C++ compiler")
+    def test_native_contact_groups_keep_pair_cache_and_per_slot_results(self):
+        group = "    bool active = use && (zone || dbg);" + adjoint.ADJ_DEVICE.split(
+            "    bool active = use && (zone || dbg);", 1)[1].split("#else", 1)[0]
+        flags = "    unsigned skip = __ballot_sync" + adjoint.ADJ_DEVICE.split(
+            "    unsigned skip = __ballot_sync", 1)[1].split("    for (int tile", 1)[0]
+        # Execute the real group/state logic; CPU barriers do not qualify CUDA memory ordering.
+        harness = r'''
+#include <atomic>
+#include <barrier>
+#include <cstdio>
+#include <thread>
+#define CS_N 24
+#define CM_FEATURE_WORDS 1
+#define ADJ_ROWS_SKIPPED 4096
+#define ADJ_REPLAY_MISMATCH 8192
+#define PG1(p) (2*(p))
+#define PG2(p) (2*(p)+1)
+thread_local int test_lane;
+std::barrier warp(32);
+int exchange[32],c_gtype[68],c_gbody[68],pairs[64],slots[64],prepared[34];
+unsigned zones[64];bool enabled[64],bad_out[64];float features[64],words_out[64][CS_N];
+int bodies_out[64],fail_pair,distance_error;std::atomic<int> failures{0},called[64];
+void __syncwarp() { warp.arrive_and_wait(); }
+int __ffs(unsigned value) { return __builtin_ffs(value); }
+int __shfl_sync(unsigned,int value,int from) {
+  exchange[test_lane]=value;__syncwarp();int result=exchange[from];__syncwarp();return result;
+}
+unsigned __ballot_sync(unsigned,bool value) {
+  exchange[test_lane]=value;__syncwarp();unsigned result=0;
+  for(int k=0;k<32;k++)if(exchange[k])result|=1u<<k;
+  __syncwarp();return result;
+}
+void atomicOr(int* value,int bits) { *value|=bits; }
+struct CMFeature { int contact; };
+CMFeature cm_feature_unpack(const float* value) { return {int(*value)}; }
+struct Adj {
+  int cm_cached_pair=-1,flags=0,cm_scratch=0,cm_linearization=-1;
+  float gx[1][3]{},gq[1][4]{};const float* feature_rec=features;
+};
+int linearize(int g1,int,const float*,const float*,CMFeature feature,int*,int* result) {
+  int pair=g1/2;
+  if(test_lane!=0 || pairs[feature.contact]!=pair)failures++;
+  prepared[pair]++;
+  if(pair==fail_pair)return 16;
+  *result=pair;return 0;
+}
+#define convex_manifold_linearize linearize
+#define box_box_manifold_linearize linearize
+float adj_contact_one(Adj& s,int c,int pair,int slot,unsigned zone,float* words,float*) {
+  bool native=c_gtype[PG2(pair)]==4 || (c_gtype[PG1(pair)]==3 && c_gtype[PG2(pair)]==3);
+  if((native && (s.cm_cached_pair!=pair || s.cm_linearization!=pair)) ||
+     pair!=pairs[c] || slot!=slots[c] || zone!=zones[c])failures++;
+  called[c]++;
+  for(int k=0;k<CS_N;k++)words[k]=float(1+100*c+k);
+  return c==distance_error ? 0.f : -1.f;
+}
+void run_lane(Adj& s,int lane,bool debug) {
+  test_lane=lane;
+  for(int c0=0;c0<50;c0+=32) {
+    int c=c0+lane;bool on=c<50,use=on && enabled[c];
+    int pair=on?pairs[c]:0,slot=slots[c],cb=-1;unsigned zone=zones[c];
+    float cw[CS_N]={},debug_value=0.f,*dbg=debug?&debug_value:nullptr;bool bad=false;
+'''
+        main = r'''
+    for(int k=0;k<CS_N;k++)words_out[c][k]=cw[k];bad_out[c]=bad;bodies_out[c]=cb;
+    __syncwarp();
+  }
+}
+int main() {
+  for(int p=0;p<34;p++) {
+    c_gtype[2*p]=c_gtype[2*p+1]=p<30?1:(p==31?3:4);
+    c_gbody[2*p]=1;c_gbody[2*p+1]=2;
+  }
+  for(int c=0;c<64;c++) {
+    pairs[c]=c<30?c:(c<34?30:(c<42?31:(c<46?32:33)));
+    slots[c]=c<30?0:(c<34?c-30:(c<42?c-34:(c<46?c-42:c-46)));
+    zones[c]=c<46 && c%2 ? 1u:0u;enabled[c]=c!=1 && c!=39;features[c]=float(c);
+  }
+  for(bool debug:{false,true})for(int error_case=0;error_case<3;error_case++) {
+    fail_pair=error_case==1?32:-1;distance_error=error_case==2?7:-1;Adj state;
+    for(auto& count:called)count=0;for(int& count:prepared)count=0;
+    std::thread lanes[32];
+    for(int lane=0;lane<32;lane++)lanes[lane]=std::thread(run_lane,std::ref(state),lane,debug);
+    for(auto& lane:lanes)lane.join();
+    for(int c=0;c<50;c++) {
+      bool active=enabled[c] && (zones[c] || debug),failed=active && pairs[c]==fail_pair;
+      if(called[c]!=(active && !failed) || bad_out[c]!=(failed || (active && c==distance_error)) ||
+         bodies_out[c]!=(enabled[c] && zones[c] ? 1|(2<<8):-1))failures++;
+      for(int k=0;k<CS_N;k++)if(words_out[c][k]!=(active && !failed?float(1+100*c+k):0.f))failures++;
+    }
+    for(int p=0;p<34;p++)if(prepared[p]!=(p>=30 && (p!=33 || debug)))failures++;
+    int expected=ADJ_ROWS_SKIPPED | (error_case ? ADJ_REPLAY_MISMATCH:0);
+    if(state.flags!=expected)failures++;
+  }
+  if(failures)std::fprintf(stderr,"contact-group failures: %d\n",int(failures));
+  return failures?1:0;
+}
+'''
+        with tempfile.TemporaryDirectory(prefix="nabla-contact-groups-cpu-") as directory:
+            path = Path(directory)
+            (path / "groups.cc").write_text(harness + group + flags + main)
+            compiled = subprocess.run(["c++", "-std=c++20", "-O2", "-pthread", str(path / "groups.cc"),
+                                       "-o", str(path / "groups")], text=True, capture_output=True)
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
+            result = subprocess.run([str(path / "groups")], text=True, capture_output=True, timeout=20)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     @unittest.skipUnless(shutil.which("c++"), "Hessian accumulation check requires a C++ compiler")
     def test_hessian_retains_small_contact_curvature_across_tiles(self):
         model = dense_contact_model()
