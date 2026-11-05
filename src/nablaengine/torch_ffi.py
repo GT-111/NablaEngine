@@ -102,6 +102,8 @@ class ModelContext:
         self._ready = set()
         self._diag = {}
         self._diagnostics_on = _DEFAULT_DIAGNOSTICS_ON
+        # the split forward's scratch memory, per (device, stream, batch size), kept across calls (_forward_impl)
+        self._work = {}
 
     @property
     def info(self):
@@ -600,8 +602,13 @@ def _forward_impl(qpos, qvel, warm, ctrl, friction, com, qfrc_applied, kp_scale,
     if B == 0:
         return [q1, v1, w1, info, tp] + kin
     fns = context._state["fns"]
-    work = torch.empty((max(int(fns["work_bytes"](B)), 1),), dtype=torch.uint8, device=qpos.device)
     st = torch.cuda.current_stream(dev).cuda_stream
+    # The split forward's work memory (a Hand record per world plus DK_SPLIT_ORDER's buckets) is scratch: keep one per
+    # (device, stream, batch size) instead of allocating it on every 5 ms substep. The fused forward needs none.
+    work = context._work.get((dev, st, B))
+    if work is None:
+        work = context._work[(dev, st, B)] = torch.empty((max(int(fns["work_bytes"](B)), 1),), dtype=torch.uint8,
+                                                         device=qpos.device)
     _rc(fns["forward"](st, B, *map(_ptr, (qpos, qvel, warm, ctrl, friction, com)), iterations, substeps, _ptr(q1),
                        _ptr(v1), _ptr(w1), _ptr(info), None, _ptr(tp) if tape else None, _ptr(work),
                        _ptr(qfrc_applied), _ptr(kp_scale)),
