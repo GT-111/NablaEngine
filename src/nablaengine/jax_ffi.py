@@ -296,6 +296,13 @@ extern "C" int @PFX@_kinematics_vjp(cudaStream_t st, int nw, const float* qpos, 
 }
 """
 
+FWD_ATTR = r"""  // the forward kernels' dynamic shared memory, above the 48 KiB default (the cudaFuncSetAttribute opt-in): k_substep
+  // always (the fused forward's whole state, struct Sim), k_pre / k_post for a split forward whose halves exceed it
+  cudaFuncSetAttribute(k_substep, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sizeof(Sim));
+  cudaFuncSetAttribute(k_pre, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sizeof(SimP));
+  cudaFuncSetAttribute(k_post, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sizeof(SimN));
+"""
+
 FFI_UNIT = r"""
 #include <cuda_runtime.h>
 #include <climits>
@@ -847,8 +854,7 @@ def library_sources(m, foot_pairs, forward_unit=False, target=None, com_body_id=
     def unit(v, fwd, pfx):
         src = (VARIANT_UNIT.replace("@FWD_SHIM@", FWD_SHIM if fwd else "")
                .replace("@ENGINE_INCLUDES@", "\n".join(includes))
-               .replace("@FWD_ATTR@", "  cudaFuncSetAttribute(k_substep, cudaFuncAttributeMaxDynamicSharedMemorySize, "
-                                      "(int)sizeof(Sim));" if fwd else "")
+               .replace("@FWD_ATTR@", FWD_ATTR if fwd else "")
                .replace("@PFX@", pfx).replace("@MAX_DEVICES@", str(MAX_DEVICES))
                .replace("@UPLOAD_ERR_SMEM@", str(UPLOAD_ERR_SMEM)).replace("@LOAD_CONSTS@", load)
                .replace("@ENGINE@", engine + (host.KERNEL + g1_kin.KIN_DEVICE if fwd else "")))  # last: never scanned
@@ -861,6 +867,7 @@ def library_sources(m, foot_pairs, forward_unit=False, target=None, com_body_id=
         unit(FWD_VARIANT, True, FWD_UNIT)
     fp = FWD_UNIT if forward_unit else _tag(FWD_VARIANT)  # the unit with the forward and kinematics entries
     defines[f"{fp}.cu"] += cuda.unit_defines("forward", target, defines[f"{fp}.cu"])  # sm_90: the register caps
+    defines[f"{fp}.cu"] += cuda.forward_build_defines()  # $DK_FORWARD_SPLIT / $DK_SPLIT_ORDER (bitwise unchanged)
     defs = [f"#define {k} {val}" for k, val in (
         ("NQ", m.nq), ("NV", m.nv), ("NU", m.nu), ("NB", m.nbody), ("COM_WIDTH", 3*len(g1_source.free_roots(m))),
         ("MAXCON", g1_step.maxcon(m)),

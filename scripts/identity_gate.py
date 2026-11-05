@@ -68,7 +68,8 @@ TARGETS = ("sm_70", "sm_86", "sm_90", "sm_120")
 INCLUDE = "jax_ffi_include"  # placeholder of the XLA FFI headers' directory (dk_ffi.cu's -I)
 EAC_DEFINES = ("DK_ADJ_CLAMP_KV=1", "DK_ADJ_STAGE=3", "DK_ADJ_NORMAL=0", "DK_ADJ_PARALLEL=0")  # the exact mode
 BUILD_ENV = ("DK_SM120_FRONTEND", "DK_SM120_FORWARD_FRONTEND", "DK_SM90_REG_CAPS", "DK_SM120_PRE_CAP", "DK_MAXCON",
-             "DK_TEST_FORWARD_VIRTUAL_ARCH", "DK_TEST_VIRTUAL_ARCH")
+             "DK_TEST_FORWARD_VIRTUAL_ARCH", "DK_TEST_VIRTUAL_ARCH", "DK_FORWARD_SPLIT", "DK_SPLIT_ORDER",
+             "DK_SPLIT_PRE_MINB", "DK_SPLIT_POST_MAXNREG", "DK_SPLIT_POST_MINB")
 ABOUT = ("Identity manifest of the mjlab G1's production build units (scripts/identity_gate.py, nablaengine.identity): "
          "per target and toolchain the L0 / L1 / L2 hashes of every FFI library unit and check binary")
 

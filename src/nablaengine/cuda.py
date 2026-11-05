@@ -47,6 +47,25 @@ well). All of them are bitwise unchanged (outputs, contacts and tape):
                   taken there (1.004 alone, 0.992 with k_pre's cap). Switch DK_SM120_PRE_CAP 1 (default) | 0.
   A caller's own -DSPLIT_PRE_MINB (k_pre), -DSPLIT_POST_MAXNREG or -DSPLIT_POST_MINB (k_post) replaces the cap of that
   kernel. sm_86 / sm_70 get none (the V100: forced caps 4% slower, shared memory allows 12 k_post blocks).
+
+Forward build switches (forward_split, split_order, cap_overrides: $DK_FORWARD_SPLIT, $DK_SPLIT_ORDER, $DK_SPLIT_*):
+a build of the forward kernels (jax_ffi.library_sources, both interfaces and the check binaries that go through it) can
+select the fused forward and its launch scheduling, all of them arithmetic-neutral (the source and its operations are
+host.py's; the DK_SPLIT and DK_SPLIT_ORDER options are checked bitwise, a changed register cap is a code-generation
+change: check it with --tape --save-outputs):
+  DK_FORWARD_SPLIT  1 (default) builds the split forward (k_pre / k_post, host.DK_SPLIT 1: 2 nsub launches per control
+                    step, the per-world Hand in global memory); 0 the fused k_substep (host.DK_SPLIT 0: one launch for
+                    all nsub substeps, the state stays in struct Sim, no Hand traffic and no DK_SPLIT_ORDER memory).
+                    k_substep's dynamic shared memory is sizeof(Sim) (its cudaFuncSetAttribute opt-in is in the unit's
+                    upload), i.e. more than sizeof(SimP) / sizeof(SimN) but with no __maxnreg__ / launch-bound cap, and a
+                    small batch (a few hundred worlds, less than one resident wave) does not pay the split kernels' two
+                    launches per substep. Which is faster depends on the model's NV and the worlds per rank.
+  DK_SPLIT_ORDER    1 (default) / 0: k_post dispatches the worlds by constraint-row count (host.DK_SPLIT_ORDER):
+                    scheduling only, but at about one resident wave the memset and the per-world bucket atomics are a
+                    fixed cost per launch with no makespan to gain.
+  DK_SPLIT_PRE_MINB, DK_SPLIT_POST_MAXNREG, DK_SPLIT_POST_MINB  a cap of that kernel in place of the target's
+                    (cap_overrides; MAXNREG and MINB are alternatives: MINB replaces __maxnreg__, 0 bounds nothing).
+  These are build options (in the library cache key through `defines`); the check binaries' own -D options still win.
 """
 
 import functools
@@ -71,8 +90,12 @@ REG_CAPS = {"sm_90": ("DK_SM90_REG_CAPS", SM90_CAPS, False),
             "sm_90a": ("DK_SM90_REG_CAPS", SM90_CAPS, False),
             "sm_120": ("DK_SM120_PRE_CAP", ("SPLIT_PRE_MINB=16",), True)}
 # a cap's macro -> the macros by which a caller already bounds that kernel
-CAP_BOUNDS = {"SPLIT_PRE_MINB": ("SPLIT_PRE_MINB",), "SPLIT_POST_MAXNREG": ("SPLIT_POST_MAXNREG", "SPLIT_POST_MINB")}
+CAP_BOUNDS = {"SPLIT_PRE_MINB": ("SPLIT_PRE_MINB",), "SPLIT_POST_MAXNREG": ("SPLIT_POST_MAXNREG", "SPLIT_POST_MINB"),
+              "SPLIT_POST_MINB": ("SPLIT_POST_MINB", "SPLIT_POST_MAXNREG")}
 MAXNREG_NVCC = (12, 4)  # __maxnreg__ (SPLIT_POST_MAXNREG): nvcc 12.4 or newer
+FORWARD_SPLIT_VAR = "DK_FORWARD_SPLIT"  # 1 (default): k_pre / k_post; 0: the fused k_substep (module docstring)
+SPLIT_ORDER_VAR = "DK_SPLIT_ORDER"  # 1 (default): k_post's worlds by row count; 0: the world order
+CAP_VARS = tuple(f"DK_{name}" for name in ("SPLIT_PRE_MINB", "SPLIT_POST_MAXNREG", "SPLIT_POST_MINB"))  # cap_overrides
 
 
 def nvcc():
@@ -256,6 +279,49 @@ def reg_caps(target=None):
     return v == "1"
 
 
+def _switch(var, default):
+    """$var as a 1 / 0 build switch (default '1' or '0'); module docstring."""
+    v = (os.environ.get(var) or default).strip()
+    if v not in ("0", "1"):
+        raise ValueError(f"${var}={v!r}: must be 1 or 0")
+    return v == "1"
+
+
+def forward_split():
+    """$DK_FORWARD_SPLIT: True (the default) builds the split forward (k_pre / k_post, host.DK_SPLIT 1), False the fused
+    k_substep (host.DK_SPLIT 0): one launch per control step instead of 2 nsub, no struct Hand traffic and no
+    DK_SPLIT_ORDER memory; the results, tape and contacts are bitwise the split forward's (host.py). A build option."""
+    return _switch(FORWARD_SPLIT_VAR, "1")
+
+
+def split_order():
+    """$DK_SPLIT_ORDER: True (the default) dispatches k_post's worlds by constraint-row count (host.DK_SPLIT_ORDER 1),
+    False in world order (host.DK_SPLIT_ORDER 0: no counter memset, no per-world bucket atomics, no warp scan per
+    launch). Scheduling only (the results do not depend on the order). A build option; the split forward only."""
+    return _switch(SPLIT_ORDER_VAR, "1")
+
+
+def forward_build_defines():
+    """The -D options of forward_split() and split_order() that differ from host.KERNEL's defaults: [] for the default
+    build, -DDK_SPLIT=0 for the fused forward, -DDK_SPLIT_ORDER=0 for the world order."""
+    return ([] if forward_split() else ["-DDK_SPLIT=0"]) + ([] if split_order() else ["-DDK_SPLIT_ORDER=0"])
+
+
+def cap_overrides():
+    """$DK_SPLIT_PRE_MINB / $DK_SPLIT_POST_MAXNREG / $DK_SPLIT_POST_MINB as {macro: value}: a forward-unit register cap
+    in place of the build target's (reg_caps_defines; e.g. a hand model's NV 44 / 56 Cholesky keeps 3 NV floats per lane
+    in chol_solve_reg_save, so the G1's 128-register k_post cap spills). $DK_SPLIT_POST_MINB replaces __maxnreg__ with
+    the launch bound; a value of 0 bounds that kernel not at all. Unset: the target's caps (module docstring)."""
+    out = {}
+    for var in CAP_VARS:
+        v = (os.environ.get(var) or "").strip()
+        if v:
+            if not v.isdigit():
+                raise ValueError(f"${var}={v!r}: must be a non-negative integer")
+            out[var[3:]] = v
+    return out
+
+
 def defined_macros(options):
     """The macro names an nvcc option list defines (-DX, -DX=Y, -D X, --define-macro X, --define-macro=X)."""
     out, it = set(), iter(str(a) for a in options)
@@ -271,9 +337,23 @@ def defined_macros(options):
 
 def reg_caps_defines(options=(), caps=SM90_CAPS):
     """The caps (e.g. ('SPLIT_PRE_MINB=16', ...)) as -D options, less each cap whose kernel the caller's nvcc options
-    already bound (defined_macros; CAP_BOUNDS)."""
+    already bound (defined_macros; CAP_BOUNDS), with cap_overrides()'s macros in place of the target's: an override of 0
+    drops that macro, and $DK_SPLIT_POST_MINB replaces __maxnreg__ with its launch bound (host.py: MAXNREG > 0 wins over
+    MINB)."""
     have = defined_macros(options)
-    return [f"-D{d}" for d in caps if not have.intersection(CAP_BOUNDS[d.split("=", 1)[0]])]
+    over = cap_overrides()
+    chosen = []
+    for d in caps:
+        name = d.split("=", 1)[0]
+        if name == "SPLIT_POST_MAXNREG" and "SPLIT_POST_MINB" in over:
+            continue
+        chosen.append(f"{name}={over[name]}" if name in over else d)
+    if "SPLIT_POST_MINB" in over:
+        chosen.append(f"SPLIT_POST_MINB={over['SPLIT_POST_MINB']}")
+    # MAXNREG 0 is "undefined" (the launch bound applies); MINB 0 is a value of host.py's (no bounds at all)
+    return [f"-D{d}" for d in chosen
+            if not (d.startswith("SPLIT_POST_MAXNREG=") and d == "SPLIT_POST_MAXNREG=0")
+            and not have.intersection(CAP_BOUNDS[d.split("=", 1)[0]])]
 
 
 @functools.lru_cache(maxsize=None)
