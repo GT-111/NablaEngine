@@ -456,6 +456,75 @@ __device__ CHOL_INLINE void chol_solve_reg(const float* A, float* L, float* b, i
   __syncwarp();
 }
 
+__device__ CHOL_INLINE void chol_solve_reg_save(const float* A, float* L, float* b, int lane, float* saved_inv) {
+  static_assert(NV <= 64, "two rows per lane");
+  const int r0 = lane, r1 = lane + 32;
+  const bool has0 = r0 < NV, has1 = r1 < NV;
+  float a0[NV], a1[NV], dinv[NV];
+#pragma unroll
+  for (int j = 0; j < NV; j++) { a0[j] = has0 && j <= r0 ? A[TRI(r0, j)] : 0.f; a1[j] = has1 && j <= r1 ? A[TRI(r1, j)] : 0.f; }
+  __syncwarp();
+#pragma unroll
+  for (int k = 0; k < NV; k++) {
+    float dkk = fmaxf(__shfl_sync(0xffffffffu, k < 32 ? a0[k] : a1[k], k & 31), 1e-30f);
+    float inv = rsqrtf(dkk);
+    inv = inv * (1.5f - 0.5f * dkk * inv * inv);  // one Newton step: about full float precision
+    float d = dkk * inv;
+    dinv[k] = inv;
+    if ((k & 31) == lane) saved_inv[k] = inv;
+    if (r0 > k) a0[k] *= inv; else if (r0 == k) a0[k] = d;
+    if (r1 > k) a1[k] *= inv; else if (r1 == k) a1[k] = d;
+#pragma unroll
+    for (int j = k + 1; j < NV; j++) {  // unpredicated: above the diagonal this updates the symmetric Schur complement
+      float ljk = __shfl_sync(0xffffffffu, j < 32 ? a0[k] : a1[k], j & 31);  // (bounded, never read as L)
+      a0[j] -= a0[k] * ljk;
+      a1[j] -= a1[k] * ljk;
+    }
+  }
+#pragma unroll
+  for (int j = 0; j < NV; j++) { if (has0 && j <= r0) L[TRI(r0, j)] = a0[j]; if (has1 && j <= r1) L[TRI(r1, j)] = a1[j]; }
+  float y0 = has0 ? b[r0] : 0.f, y1 = has1 ? b[r1] : 0.f;
+#pragma unroll
+  for (int k = 0; k < NV; k++) {  // forward: L y = b, column-wise
+    float yk = __shfl_sync(0xffffffffu, k < 32 ? y0 : y1, k & 31) * dinv[k];
+    if (r0 == k) y0 = yk; else if (r0 > k) y0 -= a0[k] * yk;
+    if (r1 == k) y1 = yk; else if (r1 > k) y1 -= a1[k] * yk;
+  }
+  __syncwarp();
+  // backward: L^T x = y; lane i holds y_i and reads row k of L (contiguous) to update its entries i < k
+#pragma unroll
+  for (int k = NV - 1; k >= 0; k--) {
+    float xk = __shfl_sync(0xffffffffu, k < 32 ? y0 : y1, k & 31) * dinv[k];
+    if (r0 == k) y0 = xk; else if (r0 < k) y0 -= L[TRI(k, r0)] * xk;
+    if (r1 == k) y1 = xk; else if (r1 < k) y1 -= L[TRI(k, r1)] * xk;
+  }
+  if (has0) b[r0] = y0;
+  if (has1) b[r1] = y1;
+  __syncwarp();
+}
+
+__device__ __noinline__ void chol_resolve_reg_cached(const float* L, float* b, const float* dinv, int lane) {
+  const int r0 = lane, r1 = lane + 32;
+  const bool has0 = r0 < NV, has1 = r1 < NV;
+  float y0 = has0 ? b[r0] : 0.f, y1 = has1 ? b[r1] : 0.f;
+#pragma unroll
+  for (int k = 0; k < NV; k++) {
+    float yk = __shfl_sync(0xffffffffu, k < 32 ? y0 : y1, k & 31) * dinv[k];
+    if (r0 == k) y0 = yk; else if (has0 && r0 > k) y0 -= L[TRI(r0, k)] * yk;
+    if (r1 == k) y1 = yk; else if (has1 && r1 > k) y1 -= L[TRI(r1, k)] * yk;
+  }
+  __syncwarp();
+#pragma unroll
+  for (int k = NV - 1; k >= 0; k--) {
+    float xk = __shfl_sync(0xffffffffu, k < 32 ? y0 : y1, k & 31) * dinv[k];
+    if (r0 == k) y0 = xk; else if (r0 < k) y0 -= L[TRI(k, r0)] * xk;
+    if (r1 == k) y1 = xk; else if (r1 < k) y1 -= L[TRI(k, r1)] * xk;
+  }
+  if (has0) b[r0] = y0;
+  if (has1) b[r1] = y1;
+  __syncwarp();
+}
+
 // Compact variant of chol_solve_reg (same contract): the column loop is not unrolled. Lane registers a0 / a1 hold the
 // trailing part of rows lane / lane + 32, shifted left by one entry per step (a0[m] = row(k + m) at step k), so every
 // register index stays a compile-time constant; finished columns of L go to shared memory as they are produced. The

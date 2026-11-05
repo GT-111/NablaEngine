@@ -6,6 +6,7 @@ fake shapes, not CUDA numerical correctness. CUDA uses two real model artifacts.
 
 import argparse
 from contextlib import contextmanager
+import ctypes
 import json
 import os
 from pathlib import Path
@@ -15,6 +16,7 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+from types import SimpleNamespace
 
 import torch
 
@@ -62,6 +64,46 @@ class ContextChecks(unittest.TestCase):
                 library="model.so", consts="model.npy")))
             self.assertEqual(F._stale(artifact, "sm_90"),
                 f"artifact version 3, this module reads {F.ARTIFACT_VERSION}")
+
+    def test_previous_nondefault_artifact_is_rejected_before_loading(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            (path / "model.so").touch()
+            (path / "model.npy").touch()
+            artifact = path / "model.json"
+            version = F.ARTIFACT_VERSION - 1
+            artifact.write_text(json.dumps(dict(artifact_version=version, arch="sm_90", default_model=False,
+                                                library="model.so", consts="model.npy")))
+            with (patch.dict(os.environ, {"DK_ARCH": "sm_90"}),
+                  patch.object(torch.cuda, "get_device_capability", return_value=(9, 0)),
+                  patch.object(ctypes.cdll, "LoadLibrary", side_effect=AssertionError("must not load old ABI"))):
+                with self.assertRaisesRegex(RuntimeError, f"artifact version {version}"):
+                    F._load(F.ModelContext(-1), torch, 0, artifact, None, None, None, None)
+
+    def test_forward_skips_unreturned_contact_buffer(self):
+        launches, shapes = [], []
+        original_empty = torch.empty
+
+        def alloc(*args, **kwargs):
+            shapes.append(tuple(args[0]) if isinstance(args[0], (list, tuple)) else args)
+            return original_empty(*args, **kwargs)
+
+        with contexts() as owners:
+            context = owners[0]
+            context.info["maxcon"] = 19
+            context._diagnostics_on = False
+            context._state["fns"] = dict(forward=lambda *args: launches.append(args) or 0,
+                                          work_bytes=lambda n: 256)
+            with (patch.object(F, "_ready", return_value=0), patch.object(F, "_check"),
+                  patch.object(torch.cuda, "current_stream", return_value=SimpleNamespace(cuda_stream=123)),
+                  patch.object(torch, "empty", side_effect=alloc)):
+                q, v, warm, ctrl, friction, com, force, kp = inputs(context)
+                output = F._forward_impl(q, v, warm, ctrl, friction, com, force, kp, 10, 4, True, False,
+                                         context.context_id)
+            self.assertIsNone(launches[0][14])  # Optional contact pointer, before tape/work.
+            self.assertNotIn((2, context.info["maxcon"] * 8), shapes)
+            self.assertEqual(output[4].shape, (2, 4 * context.info["rec_words"]))
+            self.assertEqual(output[3].shape, (2, 4))
 
     @unittest.skipUnless(shutil.which("c++"), "host loader source check requires a C++ compiler")
     def test_uint64_constant_loader_retains_high_body_bits(self):

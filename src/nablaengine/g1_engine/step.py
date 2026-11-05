@@ -366,7 +366,7 @@ struct Sim {
     };
   };
   float M[NTRI], L[NTRI];  // mass matrix and Cholesky scratch, packed lower triangles TRI(i, j)
-  double H[NTRI];  // accumulate contact curvature before rounding once for the float factorization
+  union { double H[NTRI]; float h_inv[NV]; };  // H dies at factorization; reuse its storage for pivots
   float qpos[NQ], qvel[NV], zero[NV], qsm[NV], qacc0[NV], qacc[NV], Ma[NV], grad[NV], p[NV], Mp[NV], tmp[NV];
   alignas(16) float cbuf[72];  // CHOL_SOLVE's scratch (chol_solve_bcast)
   float com[COM_WIDTH], fric;
@@ -1482,8 +1482,16 @@ __device__ void coupled_smooth(S& s, int lane) {
     for (int b = lane; b < NB; b += 32)
       if (c_depth[b] == L) {
         int p = c_parent[b];
-        fwd_body(b, s.Q[p], s.X[p], s.W[p], s.V[p], s.AL[p], s.A[p], s.qpos, s.qvel, s.zero,
-                 s.Q[b], s.X[b], s.W[b], s.V[b], s.AL[b], s.A[b]);
+        float Qp[4], Xp[3], Wp[3], Vp[3], ALp[3], Ap[3], Qb[4], Xb[3], Wb[3], Vb[3], ALb[3], Ab[3];
+        for (int k = 0; k < 4; k++) Qp[k] = s.Q[p][k];
+        for (int k = 0; k < 3; k++) {
+          Xp[k] = s.X[p][k]; Wp[k] = s.W[p][k]; Vp[k] = s.V[p][k]; ALp[k] = s.AL[p][k]; Ap[k] = s.A[p][k];
+        }
+        fwd_body(b, Qp, Xp, Wp, Vp, ALp, Ap, s.qpos, s.qvel, s.zero, Qb, Xb, Wb, Vb, ALb, Ab);
+        for (int k = 0; k < 4; k++) s.Q[b][k] = Qb[k];
+        for (int k = 0; k < 3; k++) {
+          s.X[b][k] = Xb[k]; s.W[b][k] = Wb[k]; s.V[b][k] = Vb[k]; s.AL[b][k] = ALb[k]; s.A[b][k] = Ab[k];
+        }
       }
     __syncwarp();
   }
@@ -1978,7 +1986,13 @@ __device__ void substep_post(S& s, int iterations, int lane, int* niter_out, flo
   int it = 0;
   bool conv = false, zchanged = rec && iterations <= 0, refact = zchanged, zsame = false;
   while (it < iterations || refact) {
-#if NEWTON_REUSE
+#if NR == 2 && !CHOL_BCAST && !CHOL_COMPACT
+    if (zsame && !refact) {  // H and its factor are unchanged; retain the original refined reciprocals
+      for (int i = lane; i < NV; i += 32) s.p[i] = -s.grad[i];
+      __syncwarp();
+      chol_resolve_reg_cached(s.L, s.p, s.h_inv, lane);
+    } else
+#elif NEWTON_REUSE
     if (zsame && !refact) {  // no row changed its zone in the last step: H and its factor in s.L are the same
       for (int i = lane; i < NV; i += 32) s.p[i] = -s.grad[i];
       __syncwarp();
@@ -1990,7 +2004,11 @@ __device__ void substep_post(S& s, int iterations, int lane, int* niter_out, flo
       PROF(7);
       for (int i = lane; i < NV; i += 32) s.p[i] = -s.grad[i];
       __syncwarp();
+#if NR == 2 && !CHOL_BCAST && !CHOL_COMPACT
+      chol_solve_reg_save(s.L, s.L, s.p, lane, s.h_inv);
+#else
       CHOL_SOLVE(s.L, s.L, s.p, lane, s.cbuf);
+#endif
     }
     PROF(8);
     if (refact) break;  // the tape's re-factorization: no step
@@ -2191,7 +2209,7 @@ __device__ __forceinline__ void substep(S& s, const float* ctrl, int iterations,
 template <int NC, int NROW>
 struct SimNT {  // substep_post: Newton, implicitfast; capacity NC contacts, NR rows. Members whose lifetimes do not
   float M[NTRI], L[NTRI];  // overlap share storage (unions), the read-only ones the loop seldom reads stay in Hand
-  double H[NTRI];  // shared or Hand::big scratch; never part of the tape
+  union { double H[NTRI]; float h_inv[NV]; };  // after assembly, keep the factorization pivots
   float qacc[NV], Ma[NV];
   union { float grad[NV], p[NV]; };  // grad is last read by p = -grad (in place)
   union { float Mp[NV], tmp[NV]; };  // Mp: line search to update; tmp: J'f (newton_grad), start's qacc, implicitfast
