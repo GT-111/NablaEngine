@@ -868,6 +868,7 @@ def library_sources(m, foot_pairs, forward_unit=False, target=None, com_body_id=
     fp = FWD_UNIT if forward_unit else _tag(FWD_VARIANT)  # the unit with the forward and kinematics entries
     defines[f"{fp}.cu"] += cuda.unit_defines("forward", target, defines[f"{fp}.cu"])  # sm_90: the register caps
     defines[f"{fp}.cu"] += cuda.forward_build_defines()  # $DK_FORWARD_SPLIT / $DK_SPLIT_ORDER (bitwise unchanged)
+    defines[f"{fp}.cu"] += cuda.split_capacity_defines()  # $DK_SPLIT_NCON / $DK_SPLIT_NEFC (k_post's capacities)
     defs = [f"#define {k} {val}" for k, val in (
         ("NQ", m.nq), ("NV", m.nv), ("NU", m.nu), ("NB", m.nbody), ("COM_WIDTH", 3*len(g1_source.free_roots(m))),
         ("MAXCON", g1_step.maxcon(m)),

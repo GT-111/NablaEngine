@@ -65,6 +65,8 @@ change: check it with --tape --save-outputs):
                     fixed cost per launch with no makespan to gain.
   DK_SPLIT_PRE_MINB, DK_SPLIT_POST_MAXNREG, DK_SPLIT_POST_MINB  a cap of that kernel in place of the target's
                     (cap_overrides; MAXNREG and MINB are alternatives: MINB replaces __maxnreg__, 0 bounds nothing).
+  DK_SPLIT_NCON, DK_SPLIT_NEFC  k_post's shared-memory capacities (step.py's two-root defaults: min(MAXCON, 96) and
+                    NFLOSS + NEQ + NV + 4 * SPLIT_NCON): a world beyond them solves on the global-memory SimNfull.
   These are build options (in the library cache key through `defines`); the check binaries' own -D options still win.
 """
 
@@ -305,6 +307,30 @@ def forward_build_defines():
     """The -D options of forward_split() and split_order() that differ from host.KERNEL's defaults: [] for the default
     build, -DDK_SPLIT=0 for the fused forward, -DDK_SPLIT_ORDER=0 for the world order."""
     return ([] if forward_split() else ["-DDK_SPLIT=0"]) + ([] if split_order() else ["-DDK_SPLIT_ORDER=0"])
+
+
+SPLIT_CAPS_VARS = ("DK_SPLIT_NCON", "DK_SPLIT_NEFC")
+
+
+def split_capacities():
+    """$DK_SPLIT_NCON / $DK_SPLIT_NEFC as {macro: value} (step.py's `#ifndef` defaults: min(MAXCON, 96) contacts and
+    NFLOSS + NEQ + NV + 4 * SPLIT_NCON rows for two roots). A world beyond them runs the same solve on the global-memory
+    SimNfull inside struct Hand; raising them keeps more worlds in shared memory at SPLIT_NCON * sizeof(...) more bytes
+    of SimN (a few hundred worlds fit 3 blocks per SM up to about 70 KB), lowering them fits more worlds per SM. A build
+    option; arithmetic-neutral."""
+    out = {}
+    for var in SPLIT_CAPS_VARS:
+        v = (os.environ.get(var) or "").strip()
+        if v:
+            if not v.isdigit():
+                raise ValueError(f"${var}={v!r}: must be a non-negative integer")
+            out[var[3:]] = v
+    return out
+
+
+def split_capacity_defines():
+    """split_capacities() as -D options (none at the defaults)."""
+    return [f"-D{name}={value}" for name, value in split_capacities().items()]
 
 
 def cap_overrides():
