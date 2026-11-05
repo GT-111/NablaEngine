@@ -1377,18 +1377,25 @@ __device__ __forceinline__ void hessian(S& s, int ncon, const unsigned* world, c
   const int ndof = uniform_int(s.nefc_dof, 8);
 #if NEQ > 0
   __syncwarp();
-  for (int i = 0; i < NV; i++)
-    for (int j = lane; j <= i; j += 32) {
-      double value = s.H[TRI(i, j)];
-      for (int r = 0; r < ndof; r++) {
-        float ci = dof_row_coef(s, r, i), cj = dof_row_coef(s, r, j);
-        if (ci == 0.f || cj == 0.f) continue;
+  // Each entry stays on its copy lane; processing rows in order preserves the dense accumulation order.
+  for (int r = 0; r < ndof; r++) {
+    const int a = s.efc_a[r], kind = s.efc_kind[r];
+    const int i = kind == 4 ? c_eqdof1[a] : a, j = kind == 4 ? c_eqdof2[a] : a;
+    const int ei = TRI(i, i), ej = TRI(j, j), ec = TRI(max(i, j), min(i, j));
+    if ((ei & 31) == lane || (j != i && ((ej & 31) == lane || (ec & 31) == lane))) {
+      const float ci = dof_row_coef(s, r, i), cj = j == i ? ci : dof_row_coef(s, r, j);
+      if (ci != 0.f || cj != 0.f) {
         float ds, dd, cost;
         row_eval(s, r, s.efc_jar[r], &ds, &dd, &cost);
-        value += (double)ci * cj * dd;
+        if (ci != 0.f && (ei & 31) == lane) s.H[ei] += (double)ci * ci * dd;
+        if (j != i && cj != 0.f && (ej & 31) == lane) s.H[ej] += (double)cj * cj * dd;
+        if (j != i && ci != 0.f && cj != 0.f && (ec & 31) == lane) {
+          const float ch = i > j ? ci : cj, cl = i > j ? cj : ci;
+          s.H[ec] += (double)ch * cl * dd;
+        }
       }
-      s.H[TRI(i, j)] = value;
     }
+  }
 #else
 #if DK_HESS_DOFPAR
   if (NFLOSS == 0) {  // limit rows only: one per dof, distinct diagonal entries, each added by its row's lane

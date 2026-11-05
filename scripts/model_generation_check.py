@@ -226,6 +226,111 @@ int main() {
                 result = subprocess.run([str(path / "axes")], text=True, capture_output=True)
                 self.assertEqual(result.returncode, 0, result.stderr)
 
+    @unittest.skipUnless(shutil.which("c++"), "equality Hessian check requires a C++ compiler")
+    def test_equality_hessian_matches_dense_row_order(self):
+        coef = step.STEP_DEVICE.split("template <class S>\n__device__ __forceinline__ float dof_row_coef", 1)[1]
+        coef = "template <class S>\n__device__ __forceinline__ float dof_row_coef" + coef.split("// J v for every row", 1)[0]
+        pieces = step.STEP_DEVICE.split("__device__ __forceinline__ int row_piece", 1)[1]
+        pieces = "__device__ __forceinline__ int row_piece" + pieces.split("// J^T f into out", 1)[0]
+        dof_hessian = step.STEP_KERNEL.split("const int ndof = uniform_int(s.nefc_dof, 8);\n#if NEQ > 0", 1)[1]
+        dof_hessian = dof_hessian.split("\n#else\n#if DK_HESS_DOFPAR", 1)[0]
+        main = r'''
+struct State {
+  double H[NTRI]; int nefc_dof;
+  unsigned char efc_kind[2*NV+NEQ]; unsigned short efc_a[2*NV+NEQ]; signed char efc_b[2*NV+NEQ];
+  float efc_D[2*NV+NEQ], efc_jar[2*NV+NEQ];
+};
+void add_dof_hessian(State& s, int lane) { int ndof=s.nefc_dof;
+''' + dof_hessian + r'''
+}
+float reference_coef(const State& s, int r, int i) {
+  int a=s.efc_a[r];
+  if(s.efc_kind[r]==4)
+    return (i==c_eqdof1[a] ? 1.f : 0.f) - (i==c_eqdof2[a] ? c_eqpoly[2*a+1] : 0.f);
+  return i==a ? (s.efc_kind[r]==0 ? 1.f : (float)s.efc_b[r]) : 0.f;
+}
+int main() {
+  for(int pass=0;pass<8;pass++) {
+    State s={}; int n=0;
+    for(int i=0;i<NV;i++)if(c_floss[i]>0.f) {
+      s.efc_kind[n]=0;s.efc_a[n]=i;s.efc_b[n++]=1;
+    }
+    if(n!=NFLOSS)return 1;
+    for(int e=0;e<NEQ;e++) { s.efc_kind[n]=4;s.efc_a[n]=e;s.efc_b[n++]=1; }
+    for(int i=0;i<NV;i++)if(c_hinge[i] && (i+pass)%3!=0) {
+      s.efc_kind[n]=1;s.efc_a[n]=i;s.efc_b[n++]=i%2 ? 1 : -1;
+    }
+    s.nefc_dof=n;
+    for(int r=0;r<n;r++) {
+      s.efc_D[r]=(1+(r*7)%23)/31.f;
+      s.efc_jar[r]=((r+pass)%5-2)*1.25f;
+    }
+    double expected[NTRI];
+    for(int e=0;e<NTRI;e++)s.H[e]=expected[e]=std::sin((e+3)*.17)*1e5;
+    for(int i=0;i<NV;i++)for(int j=0;j<=i;j++) {
+      double value=expected[TRI(i,j)];
+      for(int r=0;r<n;r++) {
+        float ci=reference_coef(s,r,i),cj=reference_coef(s,r,j);
+        if(ci==0.f || cj==0.f)continue;
+        float D=s.efc_D[r],x=s.efc_jar[r],dd;
+        if(r<NFLOSS) {
+          float bound=(1.f/D)*c_floss[s.efc_a[r]];
+          dd=(x<=-bound || x>=bound) ? 0.f : D;
+        } else dd=r<NFLOSS+NEQ || x<0.f ? D : 0.f;
+        value+=(double)ci*cj*dd;
+      }
+      expected[TRI(i,j)]=value;
+    }
+    for(int lane=0;lane<32;lane++)add_dof_hessian(s,lane);
+    for(int e=0;e<NTRI;e++)if(std::memcmp(&expected[e],&s.H[e],sizeof(double))) {
+      std::fprintf(stderr,"pass=%d entry=%d expected=%.17g actual=%.17g\n",pass,e,expected[e],s.H[e]);return 2;
+    }
+  }
+}
+'''
+        models = (hand_model(12, roots=1, frictionloss=.05, equality=True),
+                  hand_model(12, roots=2, equality=True),
+                  hand_model(16, roots=2, equality=True),
+                  hand_model(16, roots=2, frictionloss=.05, equality=True),
+                  hand_model(22, roots=2, frictionloss=.05, equality=True))
+        for model in models:
+            # A supported zero slope and a reversed, overlapping equality exercise all three entries and row order.
+            model.eq_data[0, 1] = 0
+            model.eq_obj1id[1], model.eq_obj2id[1] = model.eq_obj2id[0], model.eq_obj1id[0]
+            capability.require(model, [], source.free_roots(model))
+            eq1, eq2 = model.jnt_dofadr[model.eq_obj1id], model.jnt_dofadr[model.eq_obj2id]
+            hinge_dofs = model.jnt_dofadr[model.jnt_type == mujoco.mjtJoint.mjJNT_HINGE]
+            def floats(values):
+                return ",".join(f"static_cast<float>({float(value):.17g})" for value in values)
+            header = f'''
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#define __device__
+#define __forceinline__ inline
+#define __syncwarp() ((void)0)
+#define NV {model.nv}
+#define NEQ {model.neq}
+#define NFLOSS {int((model.dof_frictionloss > 0).sum())}
+#define NTRI (NV*(NV+1)/2)
+#define TRI(i,j) ((i)*((i)+1)/2+(j))
+using std::min; using std::max;
+float c_floss[NV]={{{floats(model.dof_frictionloss)}}};
+int c_hinge[NV]={{{','.join('1' if i in hinge_dofs else '0' for i in range(model.nv))}}};
+int c_eqdof1[NEQ]={{{','.join(map(str, eq1))}}};
+int c_eqdof2[NEQ]={{{','.join(map(str, eq2))}}};
+float c_eqpoly[2*NEQ]={{{floats(model.eq_data[:, :2].flat)}}};
+'''
+            with tempfile.TemporaryDirectory(prefix="nabla-equality-hessian-cpu-") as directory:
+                path = Path(directory)
+                (path / "hessian.cc").write_text(header + coef + pieces + main)
+                for contraction in ("off", "fast"):
+                    compiled = subprocess.run(["c++", "-std=c++17", "-O2", f"-ffp-contract={contraction}",
+                        str(path / "hessian.cc"), "-o", str(path / "hessian")], text=True, capture_output=True)
+                    self.assertEqual(compiled.returncode, 0, compiled.stderr)
+                    result = subprocess.run([str(path / "hessian")], text=True, capture_output=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+
     @unittest.skipUnless(shutil.which("c++"), "Hessian accumulation check requires a C++ compiler")
     def test_hessian_retains_small_contact_curvature_across_tiles(self):
         model = dense_contact_model()
