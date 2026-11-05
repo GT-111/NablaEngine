@@ -348,6 +348,17 @@ STEP_DEVICE = r"""
 #ifndef NEWTON_REUSE
 #define NEWTON_REUSE (NV > 32 && NV <= 35)
 #endif
+// The Newton reuse's guard (substep_post's zsame): H = M + J' C J changes only when a row enters or leaves its quadratic
+// zone (dd != 0; both linear pieces of a frictionloss row have dd = 0 too), so the register-resolve path - bitwise a
+// re-factorization's solve - may reuse the factor across a frictionloss row's 2 <-> 3 flip, and a tape record then
+// needs no re-factorization at the final zones either (the tape's zone word records the quadratic rows, which did not
+// change). The older NEWTON_REUSE resolve differs by roundings instead, so its builds keep the strict zone test: the
+// guard only decides which code computes p, never what p is.
+#if NR == 2 && !CHOL_BCAST && !CHOL_COMPACT
+#define ZONE_CHANGED(z0, z1) (((z0) == 1) != ((z1) == 1))
+#else
+#define ZONE_CHANGED(z0, z1) ((z0) != (z1))
+#endif
 struct Sim {
   float Q[NB][4], X[NB][3];  // body poses
   union {  // the smooth phase's body quantities and the constraint rows are never alive at the same time
@@ -2078,7 +2089,8 @@ __device__ void substep_post(S& s, int iterations, int lane, int* niter_out, flo
     float g = 0.f;
     for (int i = lane; i < NV; i += 32)
       g += 0.5f * (s.Ma[i] - s.qsm[i]) * (s.qacc[i] - s.qacc0[i]);
-    bool chg = false;  // a row of this lane changes its zone (tape: the Hessian factored above is then out of date)
+    bool chg = false;  // a row of this lane changes its quadratic zone (ZONE_CHANGED: the Hessian factored above, or the
+                       // tape's factor, is then out of date)
 #pragma unroll
     for (int t = 0; t < RT; t++) {
       int r = lane + 32 * t;
@@ -2086,7 +2098,7 @@ __device__ void substep_post(S& s, int iterations, int lane, int* niter_out, flo
       if (r < nefc) {
         float xn = s.efc_jar[r], ds, dd;
         int z0 = row_piece(r, rx[t], rD[t], rF[t], &ds, &dd), z1 = row_piece(r, xn, rD[t], rF[t], &ds, &dd);
-        chg |= z0 != z1;
+        chg |= ZONE_CHANGED(z0, z1);
         g += row_cost(z1, xn, rD[t], rF[t]);
         s.efc_jv[r] = -ds;  // the line search's J p is not needed any more
       }

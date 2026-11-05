@@ -68,6 +68,13 @@ Consequences at 410 worlds on an H200 (132 SMs):
   dinv[NV]` floats per lane, i.e. 78 / 108 / 132 / 168 registers for NV 26 / 36 / 44 / 56 before the rest of the
   kernel. 128 is below that for NV 36 and up, so the factorization spills; a resolve (the reuse path) needs only
   `dinv` (from shared) and `L`, so the value of the reuse is partly eaten by the spills it is compiled under.
+- 9edd's guard is stricter than the Hessian needs. H = M + J' D J depends on a row only through its curvature `dd`,
+  which is `D` exactly on the quadratic zone and 0 on the inactive zone and on both linear pieces of a frictionloss
+  row (`row_piece` / `row_eval`); the contact rows and limits only have quadratic/inactive. Since the register-resolve
+  path is bitwise a re-factorization's solve, testing "did a row enter or leave the quadratic zone" instead of "did
+  its zone change" is bitwise-equivalent and reuses the factor across a frictionloss row's 2 <-> 3 flip (the tape's
+  zone word records the quadratic rows only, so the record is unaffected except its REFACT diagnostic bit). The hand
+  pools have 0 / 32 / 44 frictionloss dofs, so this is where the remaining re-factorizations are.
 
 ## What to measure, in order
 

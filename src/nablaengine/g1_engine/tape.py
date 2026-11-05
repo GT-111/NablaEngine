@@ -17,7 +17,7 @@ from nablaengine.g1_engine import step
 
 ALIGN = 32  # words (128 bytes): record and block alignment
 FLAG_UNSUPPORTED = 63  # flags bits 0-5: unsupported geometry, capacity or native narrowphase failure (as out_info)
-FLAG_REFACT = 1 << 8  # the zones changed after the last Newton factorization: H re-assembled and re-factored for the tape
+FLAG_REFACT = 1 << 8  # the quadratic rows changed after the last Newton factorization: H re-assembled and re-factored for the tape
 FLAG_NONCONV = 1 << 9  # the Newton iterations ran out before the stopping test held
 FLAG_SINGULAR = 1 << 10  # min_nu < SINGULAR_NU: a self contact whose geom axes (or centres) nearly meet
 FLAG_VERIFY_DIFF = 1 << 11  # -DDK_TAPE_VERIFY: L_H differs from a re-assembly at the final zones (expected only with REFACT)
