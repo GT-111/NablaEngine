@@ -211,6 +211,8 @@ def main():
             cmp("rollout", k, t.grad, j)
     if "diag" in sections:
         torch.cuda.synchronize()
+        # the counters are off by default ($DK_DIAGNOSTICS): this section compares them with jax_ffi's
+        record("diag", "off_by_default", torch_ffi.set_diagnostics(True) is False)
         torch_ffi.read_diagnostics(reset=True)
         jax_ffi.read_diagnostics(reset=True)
         cq, cv = cots[0]
@@ -355,6 +357,7 @@ def main():
         q[:, 7:] += rng.uniform(-1.5, 1.5, q[:, 7:].shape).astype(np.float32)
         ov = [q] + host[1:]
         torch.cuda.synchronize()
+        torch_ffi.set_diagnostics(True)  # the counters are off by default ($DK_DIAGNOSTICS)
         torch_ffi.read_diagnostics(reset=True)
         jax_ffi.read_diagnostics(reset=True)
         to = torch_ffi.forward(*[T(x) for x in ov])

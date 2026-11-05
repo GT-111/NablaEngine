@@ -39,8 +39,10 @@ implementations while torch.compile traces (opaque nodes); eager calls run the s
 Diagnostics (set_diagnostics switches them): per device, the counters of jax_ffi.DIAG (forward calls and worlds, worlds at the iteration limit,
 unsupported worlds, tape flags; backward calls and rows, rows with non-finite gradients or cotangents, replay
 mismatches) are added up on the device by every call, in an int64 tensor that is never read implicitly:
-diagnostics(device) returns it, read_diagnostics() reads it into a dict (a synchronization). The backward's info
-(B,) carries the adjoint's flags | NONFINITE_* << NONFINITE_SHIFT as jax_ffi.backward's.
+diagnostics(device) returns it, read_diagnostics() reads it into a dict (a synchronization). They are off by default
+($DK_DIAGNOSTICS=1, or set_diagnostics(True)): on, they cost one small kernel per forward and per backward and the
+backward's non-finite info bits come from that kernel in any case. The backward's info (B,) carries the adjoint's flags |
+NONFINITE_* << NONFINITE_SHIFT as jax_ffi.backward's (the NONFINITE bits only with the diagnostics on).
 """
 import ctypes
 import hashlib
@@ -79,7 +81,11 @@ def _tag(v):
 _LOCK = threading.Lock()
 _CONTEXTS = {}  # stable integer -> ModelContext; also keeps recorded autograd/CUDA graphs alive
 _DEFAULT_CONTEXT = None
-_DEFAULT_DIAGNOSTICS_ON = True  # preserves set_diagnostics() before the default context is loaded
+# The device counters are off unless a caller asks for them (set_diagnostics; $DK_DIAGNOSTICS): one extra kernel per
+# forward and per backward plus the backward's non-finite info bits, none of which outputs or gradients depend on.
+# Training calls step / backward once per 5 ms substep, where two extra launches per call are not free.
+DIAGNOSTICS_VAR = "DK_DIAGNOSTICS"  # 1: on; unset or 0: off (the default)
+_DEFAULT_DIAGNOSTICS_ON = os.environ.get(DIAGNOSTICS_VAR, "0") not in ("", "0")
 
 
 class ModelContext:
@@ -95,7 +101,7 @@ class ModelContext:
         self._state = {}
         self._ready = set()
         self._diag = {}
-        self._diagnostics_on = True
+        self._diagnostics_on = _DEFAULT_DIAGNOSTICS_ON
 
     @property
     def info(self):
@@ -808,10 +814,10 @@ def _diag_backward(context, dev, st, gq, gv, gu, cq, cv, info):
 
 
 def set_diagnostics(enabled, *, context=None):
-    """Switch the device counters and the backward's non-finite bits on (the default) or off; returns the previous
-    setting. They are one small kernel per forward and per backward (dk_torch_diag_fwd / _bwd); off leaves the
-    counters as they are and the backward's info with the adjoint's flags only.
-    Outputs and gradients are the same either way. A captured CUDA graph keeps the setting of its capture."""
+    """Switch the device counters and the backward's non-finite bits on or off (the default; $DK_DIAGNOSTICS=1 turns them
+    on for a process); returns the previous setting. They are one small kernel per forward and per backward
+    (dk_torch_diag_fwd / _bwd); off leaves the counters as they are and the backward's info with the adjoint's flags
+    only. Outputs and gradients are the same either way. A captured CUDA graph keeps the setting of its capture."""
     global _DEFAULT_DIAGNOSTICS_ON
     if context is None and _DEFAULT_CONTEXT is None:
         prev = _DEFAULT_DIAGNOSTICS_ON

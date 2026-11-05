@@ -57,7 +57,7 @@ On a V100 (sm_70) install a PyTorch build that still targets sm_70, e.g. the CUD
 | `scale_grad(tree, gamma)` | `scale_grad` | on a pytree of tensors (`torch.utils._pytree`); non-floating leaves pass through |
 | `forward(...)`, `backward(...)` | `forward`, `backward` | without autograd; the same outputs, `info` included |
 | `diagnostics(device=None)`, `read_diagnostics(device=None, reset=True)` | `diagnostics`, `read_diagnostics` | the counters of `jax_ffi.DIAG`, kept per device (below) |
-| `set_diagnostics(enabled)` | | the counters on (default) or off; returns the previous setting |
+| `set_diagnostics(enabled)` | | the counters on (off by default; `DK_DIAGNOSTICS=1`) or off; returns the previous setting |
 | `tape_bytes(nworld, substeps=4, steps=1)` | `tape_bytes` | |
 
 Every tensor is float32, contiguous and on one CUDA device, with the worlds as the leading dimension; another dtype,
@@ -122,10 +122,13 @@ dispatch.
 
 ## Diagnostics
 
-Every forward and backward adds its counts (worlds at the solver's iteration limit, tape flags, rows with non-finite
+`set_diagnostics(True)` (or `DK_DIAGNOSTICS=1` for a process) turns the counters on; they are off by default, because
+the training path calls `step` / `backward` once per 5 ms substep and each call then starts one more kernel. With them
+on, every forward and backward adds its counts (worlds at the solver's iteration limit, tape flags, rows with non-finite
 gradients or cotangents, replay mismatches; `jax_ffi.DIAG`) to an int64 tensor on its device, with device operations
 only. `diagnostics()` returns that tensor without reading it; `read_diagnostics()` copies it to the host (a
-synchronization) and by default resets it. The backward's `info` carries the same per-world bits as `jax_ffi.backward`.
+synchronization) and by default resets it. The backward's `info` carries the same per-world bits as `jax_ffi.backward`
+(the `NONFINITE_*` bits come from the diagnostics kernel: with them off it holds the adjoint's flags only).
 
 The artifact's `maxcon` and `nefc` record its model-derived point and row capacities. A positive model `nconmax`
 owns the point budget; automatic models use a bounded 256-point budget, limited by the pair graph with a 32-point
@@ -138,10 +141,11 @@ counters `fwd_contact_overflow_worlds` / `fwd_row_overflow_worlds`, and with `se
 `DK_OVERFLOW_WARN=1`; off by default) a `RuntimeWarning` from `read_diagnostics()` and once more at exit for counts
 nobody read.
 
-`set_diagnostics(False)` switches the counters and the backward's non-finite bits off (the backward's `info` then holds
-the adjoint's flags only); outputs and gradients are the same. The counters are one small kernel per forward and per
-backward in the library, so they cost almost nothing (V100, 4096 worlds: forward + backward 10.56 ms on, 10.53 ms off).
-A captured CUDA graph keeps the setting it was captured with.
+`set_diagnostics(False)` switches the counters and the backward's non-finite bits off again; outputs and gradients are
+the same either way. The counters are one small kernel per forward and per backward in the library (V100, 4096 worlds:
+forward + backward 10.56 ms on, 10.53 ms off), and the fixed cost per call is what matters at a few hundred worlds: one
+launch per native call is a larger share there. A captured CUDA graph keeps the setting it was captured with.
+`set_diagnostics(False)` before the first call keeps them out of the graph altogether.
 
 ## Several GPUs
 
