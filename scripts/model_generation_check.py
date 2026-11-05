@@ -155,6 +155,15 @@ class GenerationCheck(unittest.TestCase):
         for name, model, defines, ncon, nefc in cases:
             with self.subTest(name=name):
                 header = source.header(model, maxd=8, wpb=1).replace("#include <cuda_runtime.h>", "")
+                root_split = int(next(line.split()[2] for line in header.splitlines()
+                                      if line.startswith("#define ROOT_DOF_SPLIT ")))
+                roots = source.free_roots(model)
+                if len(roots) == 1:
+                    self.assertEqual(root_split, model.nv)
+                    expected_roots = np.repeat(roots, model.nv)
+                else:
+                    expected_roots = np.repeat(roots, (root_split, model.nv - root_split))
+                np.testing.assert_array_equal(model.body_rootid[model.dof_bodyid], expected_roots)
                 code = ("#define __device__\n" + header + step.step_header(model) + "struct Sim {" + sim
                         + "// The split forward (host.py:" + split
                         + f"\nstatic_assert(SPLIT_NCON == {ncon} && SPLIT_NEFC == {nefc});\n"
@@ -165,6 +174,186 @@ class GenerationCheck(unittest.TestCase):
                 result = subprocess.run(["c++", "-std=c++17", "-fsyntax-only", *defines, "-x", "c++", "-"],
                                         input=code, text=True, capture_output=True)
                 self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipUnless(shutil.which("c++"), "smooth block solve check requires a C++ compiler")
+    def test_smooth_root_blocks_keep_packed_factors_solutions_and_adjoint_solves(self):
+        core = "template <int N = NV, int OFFSET = 0, bool FACTOR_ONLY = false>" + source.DEVICE.split(
+            "template <int N = NV, int OFFSET = 0, bool FACTOR_ONLY = false>", 1)[1].split("// Compact variant", 1)[0]
+        smooth = "void chol_solve_smooth" + source.DEVICE.split("void chol_solve_smooth", 1)[1].split(
+            "// solve L L^T", 1)[0]
+        triangular = "void tri_solve_packed" + adjoint.ADJ_DEVICE.rsplit(
+            "void tri_solve_packed", 1)[1].split("#endif", 1)[0]
+        backward = "void adj_solves" + adjoint.ADJ_DEVICE.split("void adj_solves", 1)[1].split(
+            "// lam on the dofs", 1)[0]
+        # Fixed pre-change solver: this reference must not follow later source edits.
+        original = r'''
+__device__ CHOL_INLINE void chol_solve_before(const float* A, float* L, float* b, int lane) {
+  static_assert(NV <= 64, "two rows per lane");
+  const int r0 = lane, r1 = lane + 32;
+  const bool has0 = r0 < NV, has1 = r1 < NV;
+  float a0[NV], a1[NV], dinv[NV];
+#pragma unroll
+  for (int j = 0; j < NV; j++) { a0[j] = has0 && j <= r0 ? A[TRI(r0, j)] : 0.f; a1[j] = has1 && j <= r1 ? A[TRI(r1, j)] : 0.f; }
+  __syncwarp();
+#pragma unroll
+  for (int k = 0; k < NV; k++) {
+    float dkk = fmaxf(__shfl_sync(0xffffffffu, k < 32 ? a0[k] : a1[k], k & 31), 1e-30f);
+    float inv = rsqrtf(dkk);
+    inv = inv * (1.5f - 0.5f * dkk * inv * inv);  // one Newton step: about full float precision
+    float d = dkk * inv;
+    dinv[k] = inv;
+    if (r0 > k) a0[k] *= inv; else if (r0 == k) a0[k] = d;
+    if (r1 > k) a1[k] *= inv; else if (r1 == k) a1[k] = d;
+#pragma unroll
+    for (int j = k + 1; j < NV; j++) {  // unpredicated: above the diagonal this updates the symmetric Schur complement
+      float ljk = __shfl_sync(0xffffffffu, j < 32 ? a0[k] : a1[k], j & 31);  // (bounded, never read as L)
+      a0[j] -= a0[k] * ljk;
+      a1[j] -= a1[k] * ljk;
+    }
+  }
+#pragma unroll
+  for (int j = 0; j < NV; j++) { if (has0 && j <= r0) L[TRI(r0, j)] = a0[j]; if (has1 && j <= r1) L[TRI(r1, j)] = a1[j]; }
+  float y0 = has0 ? b[r0] : 0.f, y1 = has1 ? b[r1] : 0.f;
+#pragma unroll
+  for (int k = 0; k < NV; k++) {  // forward: L y = b, column-wise
+    float yk = __shfl_sync(0xffffffffu, k < 32 ? y0 : y1, k & 31) * dinv[k];
+    if (r0 == k) y0 = yk; else if (r0 > k) y0 -= a0[k] * yk;
+    if (r1 == k) y1 = yk; else if (r1 > k) y1 -= a1[k] * yk;
+  }
+  __syncwarp();
+  // backward: L^T x = y; lane i holds y_i and reads row k of L (contiguous) to update its entries i < k
+#pragma unroll
+  for (int k = NV - 1; k >= 0; k--) {
+    float xk = __shfl_sync(0xffffffffu, k < 32 ? y0 : y1, k & 31) * dinv[k];
+    if (r0 == k) y0 = xk; else if (r0 < k) y0 -= L[TRI(k, r0)] * xk;
+    if (r1 == k) y1 = xk; else if (r1 < k) y1 -= L[TRI(k, r1)] * xk;
+  }
+  if (has0) b[r0] = y0;
+  if (has1) b[r1] = y1;
+  __syncwarp();
+}
+
+'''
+        harness = r'''
+#include <algorithm>
+#include <barrier>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <thread>
+#define __device__
+#define __forceinline__ inline
+#define CHOL_INLINE
+#define NTRI (NV*(NV+1)/2)
+#define TRI(i,j) ((i)*((i)+1)/2+(j))
+#define CHOL_SOLVE(A,L,b,lane,cb) chol_solve_reg(A,L,b,lane)
+#define OFF_LQ 0
+#define OFF_LH NTRI
+#define LANE_BOUND(lane)
+#define APROF(x)
+using std::min;
+std::barrier warp(32);
+thread_local int test_lane;
+float exchange[32],c_misc[1]={.005f},c_kv[NV],c_damping[NV];
+int shuffles;
+void __syncwarp() { warp.arrive_and_wait(); }
+float __shfl_sync(unsigned,float value,int from) {
+  exchange[test_lane]=value;__syncwarp();float result=exchange[from];__syncwarp();
+  if(!test_lane)shuffles++;return result;
+}
+float rsqrtf(float value) { return 1.f/std::sqrt(value); }
+float __ldcs(const float* value) { return *value; }
+float rcp_step(float d) { return 1.f/d; }
+float div_fast(float y,float d,float) { return y/d; }
+struct Adj { float L[NTRI],y[NV],abar[NV],ny[NV],lam[NV]; };
+template<class F> int run(F function) {
+  shuffles=0;std::thread lanes[32];
+  for(int lane=0;lane<32;lane++)lanes[lane]=std::thread([&,lane] { test_lane=lane;function(lane); });
+  for(auto& thread:lanes)thread.join();return shuffles;
+}
+'''
+        main = r'''
+int main() {
+ for(int pattern=0;pattern<3;pattern++) {
+  float base[NTRI]={},generator[NTRI]={};
+  for(int i=0;i<NV;i++) {
+    c_kv[i]=.1f+.01f*i;c_damping[i]=.02f+.003f*i;
+    int begin=NR==2 && i>=ROOT_DOF_SPLIT?ROOT_DOF_SPLIT:0;
+    for(int j=begin;j<=i;j++)generator[TRI(i,j)]=i==j?2.f+.03f*i:
+        pattern==1?0.f:.05f*std::sin(float(1+3*i+5*j));
+    for(int j=begin;j<=i;j++) {
+      double value=0.;
+      for(int k=begin;k<=j;k++)value+=(double)generator[TRI(i,k)]*generator[TRI(j,k)];
+      base[TRI(i,j)]=(float)value;
+      if(pattern==1 && i!=j)base[TRI(i,j)]=std::copysign(0.f,(i+j)%2?-1.f:1.f);
+    }
+  }
+  // The Newton factor retains cross-root entries, as a contact Hessian does.
+  float H[NTRI],LH[NTRI],candidate_LH[NTRI],dummy[NV],candidate_dummy[NV];
+  for(int i=0;i<NV;i++)dummy[i]=candidate_dummy[i]=std::sin(float(1+5*i));
+  for(int i=0;i<NV;i++)for(int j=0;j<=i;j++)H[TRI(i,j)]=base[TRI(i,j)]+.03f*(1+i%3)*(1+j%3);
+  run([&](int lane){chol_solve_before(H,LH,dummy,lane);});
+  run([&](int lane){chol_solve_reg(H,candidate_LH,candidate_dummy,lane);});
+  if(std::memcmp(LH,candidate_LH,sizeof(LH)) || std::memcmp(dummy,candidate_dummy,sizeof(dummy)))return 6;
+  if(NR==2 && LH[TRI(ROOT_DOF_SPLIT,0)]==0.f)return 1;
+  for(int implicit=0;implicit<2;implicit++)for(int alias=0;alias<2;alias++) {
+    float A[NTRI],dense[NTRI],blocked[NTRI],bd[NV],bb[NV],rhs[NV],cb[72]={};
+    std::copy_n(base,NTRI,A);
+    for(int i=0;i<NV;i++) {
+      if(implicit)A[TRI(i,i)]+=c_misc[0]*(c_kv[i]+c_damping[i]);
+      rhs[i]=bd[i]=bb[i]=pattern==0?std::sin(float(2+7*i+implicit)):
+          (i==0 || i==ROOT_DOF_SPLIT)?-0.f:0.f;
+    }
+    if(alias) { std::copy_n(A,NTRI,dense);std::copy_n(A,NTRI,blocked); }
+    else { std::fill_n(dense,NTRI,-123.f);std::fill_n(blocked,NTRI,-456.f); }
+    int full=run([&](int lane){chol_solve_before(alias?dense:A,dense,bd,lane);});
+    int blocks=run([&](int lane){chol_solve_smooth(alias?blocked:A,blocked,bb,lane,cb);});
+    if(std::memcmp(dense,blocked,sizeof(dense)) || std::memcmp(bd,bb,sizeof(bd))) {
+      std::fprintf(stderr,"factor/solution differs: pattern=%d implicit=%d alias=%d\n",pattern,implicit,alias);return 2;
+    }
+#if NR == 2 && !CHOL_BCAST && !CHOL_COMPACT
+    if(blocks>=full)return 3;
+#else
+    if(blocks!=full)return 3;
+#endif
+    for(int i=0;i<NV;i++) {
+      double residual=-rhs[i];
+      for(int j=0;j<NV;j++)residual+=(double)A[TRI(std::max(i,j),std::min(i,j))]*bb[j];
+      if(std::abs(residual)>2e-5)return 4;
+    }
+    if(implicit) {
+      float old_record[2*NTRI],new_record[2*NTRI];Adj old{},current{};
+      std::copy_n(dense,NTRI,old_record+OFF_LQ);std::copy_n(blocked,NTRI,new_record+OFF_LQ);
+      std::copy_n(LH,NTRI,old_record+OFF_LH);std::copy_n(LH,NTRI,new_record+OFF_LH);
+      for(int i=0;i<NV;i++)old.abar[i]=current.abar[i]=std::cos(float(3+5*i));
+      run([&](int lane){adj_solves(old,old_record,lane);});
+      run([&](int lane){adj_solves(current,new_record,lane);});
+      if(std::memcmp(&old,&current,sizeof(old)))return 5;
+    }
+    std::printf("NV=%d split=%d pattern=%d implicit=%d alias=%d shuffles=%d/%d\n",NV,ROOT_DOF_SPLIT,pattern,implicit,alias,blocks,full);
+  }
+ }
+}
+'''
+        with tempfile.TemporaryDirectory(prefix="nabla-smooth-block-cpu-") as directory:
+            path = Path(directory)
+            (path / "solve.cc").write_text(harness + original + core + smooth + triangular + backward + main)
+            # The symmetric pairs are the four distinct DOF shapes of the five supported hands;
+            # the asymmetric pairs also exercise a root block larger than one warp. Forced alternate
+            # solvers check that the smooth path keeps the selected full solver.
+            cases = ((14, 0, ()), (13, 13, ()), (18, 18, ()), (22, 22, ()), (28, 28, ()),
+                     (7, 35, ()), (35, 7, ()), (17, 17, ("-DCHOL_BCAST=1",)),
+                     (18, 18, ("-DCHOL_COMPACT=1",)))
+            for first, second, defines in cases:
+                for contraction in ("off", "fast"):
+                    with self.subTest(first=first, second=second, defines=defines, contraction=contraction):
+                        compiled = subprocess.run(["c++", "-std=c++20", "-O2", f"-ffp-contract={contraction}",
+                            "-march=native", "-pthread", *defines, f"-DNV={first+second}", f"-DNR={2 if second else 1}",
+                            f"-DROOT_DOF_SPLIT={first}", str(path / "solve.cc"), "-o", str(path / "solve")],
+                            text=True, capture_output=True)
+                        self.assertEqual(compiled.returncode, 0, compiled.stderr)
+                        result = subprocess.run([str(path / "solve")], text=True, capture_output=True, timeout=60)
+                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     @unittest.skipUnless(shutil.which("c++"), "root-axis reuse check requires a C++ compiler")
     def test_contact_root_axes_reuse_exact_rotations_for_one_and_two_free_trees(self):
