@@ -155,7 +155,9 @@ def check_case(name, model, foot_pairs, com_ids, options, modules):
         factor_h = tape_module.tri_unpack(decoded["L_H"][0, k], model.nv)
         hessian = factor_h @ factor_h.T
         native_mass, native_hessian = np.asarray(native["mass"]), np.asarray(native["hessian"])
-        comparisons.append(dict(engine_L_Q=factor_q.tolist(), engine_L_H=factor_h.tolist(), engine_mass=mass.tolist(),
+        comparisons.append(dict(engine_L_Q=factor_q.tolist(), engine_L_H=factor_h.tolist(),
+                                engine_qpos=decoded["qpos"][0, k].tolist(),
+                                engine_qvel=decoded["qvel"][0, k].tolist(), engine_mass=mass.tolist(),
                                 mass_relative_error=float(np.linalg.norm(mass-native_mass)/np.linalg.norm(native_mass)),
                                 engine_hessian=hessian.tolist(),
                                 hessian_relative_error=float(np.linalg.norm(hessian-native_hessian)/np.linalg.norm(native_hessian)),
@@ -276,7 +278,6 @@ def main():
     import torch
     from nablaengine import fixtures, torch_ffi
     from nablaengine.g1_engine import source, step
-    from model_generation_check import hand_model
     torch.cuda.set_device(args.device)
     result = dict(source_root=str(args.source_root.resolve()), cache=str(args.cache.resolve()),
                   device=torch.cuda.get_device_name(args.device), mujoco=mujoco.__version__,
@@ -300,6 +301,8 @@ def main():
                 model = dense_contact_model()
                 pairs, bodies = list(range(len(step.contact_pairs(model)))), tuple(source.free_roots(model))
             elif name in ("coupled_large", "coupled_equalities"):
+                from model_generation_check import hand_model
+
                 eq = name == "coupled_equalities"
                 model = hand_model(12 if eq else 22, 5, roots=2, passive=eq, equality=eq,
                                    damping=0.1, frictionloss=0.01 if eq else 0.0)
