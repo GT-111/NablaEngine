@@ -44,11 +44,12 @@ Consequences at 410 worlds on an H200 (132 SMs):
   `dk_torch_diag_bwd` per backward). Nothing in the forward/backward path synchronizes or reads device status:
   `torch_ffi` only allocates and launches; the constants upload and `read_diagnostics` are the only synchronizations.
   DexForge's `torch._assert_async` is a device-side assert, not a D2H.
-- At ~410 worlds a launch is one wave and its duration is the slowest world's phase: with 100 Newton iterations at
-  ~2-4 us per iteration the solve is ~0.3-0.4 ms, so a 2-4 us launch tail is 1-2% of a `k_post`. The launch count was
-  the story of the old trace only because its failure-capture variant added a per-call `info.cpu()` and serialized the
-  hand streams (the Lead's diagnosis); at this batch the cost is the Newton loop (iterations x per-iteration work),
-  not the launches.
+- At ~410 worlds a launch is one resident wave (`k_post` 6-16 blocks/SM by shared memory; 410 / 132 = 3.1 blocks per
+  SM are needed for one pool), so its duration is the slowest world's phase and a 2-4 us launch tail is 1-2% of a
+  `k_post` (0.99 ms measured). The launch count was the story of the old trace only because its failure-capture
+  variant added a per-call `info.cpu()` and serialized the hand streams (the Lead's diagnosis); at this batch the cost
+  is the per-iteration work inside the solver (measured: 3-5 Newton iterations, so ~0.2-0.3 ms per iteration at the
+  low per-stream occupancy), not the launches.
 
 ## The 9edd Newton/Cholesky reuse, for these models
 
@@ -85,8 +86,25 @@ Consequences at 410 worlds on an H200 (132 SMs):
 3. `DK_SPLIT_ORDER=0`: at one wave the ordering has no makespan to recover, and its memset, per-world bucket atomics
    and per-launch warp scan remain. Scheduling only (host.py).
 4. `DK_FORWARD_SPLIT=0` only to confirm the four-wave prediction above; expect a loss for all five hand models at B=410.
-5. If the fresh trace shows `k_post` still dominating: count the worlds that take the `big` path from a captured tape
-   (`OFF_HDR` of each substep record is `ncon | nefc << 16`; `ncon > 96` or `nefc > SPLIT_NEFC` means global-memory
-   state). Those worlds are the ones the 96/432 default was never qualified for (the configuration table's two-root
-   default says "parity and performance pending"). Raising `SPLIT_NCON`/`SPLIT_NEFC` (a build knob, not implemented
-   here) still leaves 3 blocks/SM at B=410 and would remove the fallback.
+5. `DK_SPLIT_NCON` / `DK_SPLIT_NEFC` only if the worlds take the `big` path (a captured tape's `OFF_HDR` word is
+   `ncon | nefc << 16`; `ncon > 96` or `nefc > SPLIT_NEFC` means global-memory state).
+
+## Measured on the five-hand B410 H2 gate (2026-11-05)
+
+Physical parity passes for the counters-off / work-buffer arm (`46252a2`, `ecd6287`, `9d9a2f7`) and for the uncapped
+`k_post` arm (`2cdb47f`); the diagnostics counters were the only differences and are informational. Timings (10
+rounds, median device ms, rank 0): base 29.122 against 28.991 (-0.45%) for the first, base 29.19 against 28.965
+(-0.8%) for the uncapped caps, i.e. within the 0.2-3% base-to-base variance: the 128-register cap is not the
+per-iteration cost in practice.
+
+The solver facts from the retained per-substep `info` (rank 0, four substeps, five pools) are what this note did not
+have: `nit` mean 2.4-4.7, max 11; `ncon` mean 1.0-11.3, max 17; `nefc` mean 7.2-79.5, max 104; no world takes the
+`big` path, no refact and no non-converged tape record. So the 100-iteration budget is never exhausted (3-5 iterations
+suffice), the `ZONE_CHANGED` relaxation has nothing to reuse here (`refact = 0`), and the two-root split capacity is
+not a production issue for these five pools. `k_post`'s 0.987 ms per 410-world launch is therefore per-iteration
+Hessian / Cholesky work at low per-stream occupancy: one pool is 410 blocks over 132 SMs, i.e. about 3.1 blocks per
+SM (the five streams overlap only ~2.45x, not 5x, and the per-substep join caps the overlap). An instruction-level
+win would need a `DK_PROFILE` phase breakdown; the structural widening (many more worlds per launch) is blocked by
+the compile-time model constants (`NQ`, `NV`, `NB`, `MAXCON`, `KDOF` are `#define`s of each model's library): the five
+pools cannot share one kernel launch, so the only way to fill the GPU is more stream overlap, which is a caller-side
+change.
