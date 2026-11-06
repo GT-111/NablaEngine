@@ -1692,7 +1692,7 @@ __device__ void substep_pre(S& s, const float* ctrl, int lane, float* rec, const
   PROF(0);
   for (int i = lane; i < NV; i += 32) s.qacc0[i] = s.qsm[i];
   __syncwarp();
-  CHOL_SOLVE(s.M, s.L, s.qacc0, lane, s.cbuf);
+  chol_solve_smooth(s.M, s.L, s.qacc0, lane, s.cbuf);
   PROF(1);
 
   // collision
@@ -2128,7 +2128,7 @@ __device__ void substep_post(S& s, int iterations, int lane, int* niter_out, flo
     s.L[TRI(i, i)] += h * (c_kv[i] + c_damping[i]); s.tmp[i] = s.Ma[i];
   }
   __syncwarp();
-  CHOL_SOLVE(s.L, s.L, s.tmp, lane, s.cbuf);
+  chol_solve_smooth(s.L, s.L, s.tmp, lane, s.cbuf);
   if (rec) {  // tape: L_Q = chol(M + h kv), a* and a_adv (qvel' = qvel + h a_adv), header
     tape_put(rec + OFF_LQ, s.L, NTRI, REC_WORDS - OFF_LQ, lane);
     tape_put(rec + OFF_QACC, s.qacc, NV, NV, lane);

@@ -112,13 +112,15 @@ def constants(m, com_body_id=None):
 
 
 def header(m, maxd, wpb):
+    roots = free_roots(m)
     return f"""
 #include <cuda_runtime.h>
 #define NB {m.nbody}
 #define NQ {m.nq}
 #define NV {m.nv}
 #define NU {m.nu}
-#define NR {len(free_roots(m))}
+#define NR {len(roots)}
+#define ROOT_DOF_SPLIT {int(m.body_dofadr[roots[1]]) if len(roots) == 2 else m.nv}
 #define COM_WIDTH (3 * NR)
 #define MAX_CHILD {max_children(m)}
 #define MAXD {maxd}
@@ -407,19 +409,24 @@ __device__ __forceinline__ void chol_warp(float* A, int lane) {
 // l + 32 (NV <= 64) in registers; the factorization is right-looking with column k broadcast by __shfl_sync, all loops
 // unrolled at compile time. L (packed lower triangle, with the true diagonal) is written to L for the back substitution
 // and for callers that keep it.
+// N / OFFSET select a diagonal block; the defaults retain the full coupled solve.
 #ifndef CHOL_INLINE
 #define CHOL_INLINE __noinline__  // one copy of the (large, fully unrolled) code: -DCHOL_INLINE=__forceinline__ inlines it
 #endif
-__device__ CHOL_INLINE void chol_solve_reg(const float* A, float* L, float* b, int lane) {
-  static_assert(NV <= 64, "two rows per lane");
+template <int N = NV, int OFFSET = 0, bool FACTOR_ONLY = false>
+__device__ CHOL_INLINE void chol_solve_reg(const float* A, float* L, float* b, int lane, float* inverse = nullptr) {
+  static_assert(N <= 64, "two rows per lane");
   const int r0 = lane, r1 = lane + 32;
-  const bool has0 = r0 < NV, has1 = r1 < NV;
-  float a0[NV], a1[NV], dinv[NV];
+  const bool has0 = r0 < N, has1 = r1 < N;
+  float a0[N], a1[N], dinv[N];
 #pragma unroll
-  for (int j = 0; j < NV; j++) { a0[j] = has0 && j <= r0 ? A[TRI(r0, j)] : 0.f; a1[j] = has1 && j <= r1 ? A[TRI(r1, j)] : 0.f; }
+  for (int j = 0; j < N; j++) {
+    a0[j] = has0 && j <= r0 ? A[TRI(OFFSET + r0, OFFSET + j)] : 0.f;
+    a1[j] = has1 && j <= r1 ? A[TRI(OFFSET + r1, OFFSET + j)] : 0.f;
+  }
   __syncwarp();
 #pragma unroll
-  for (int k = 0; k < NV; k++) {
+  for (int k = 0; k < N; k++) {
     float dkk = fmaxf(__shfl_sync(0xffffffffu, k < 32 ? a0[k] : a1[k], k & 31), 1e-30f);
     float inv = rsqrtf(dkk);
     inv = inv * (1.5f - 0.5f * dkk * inv * inv);  // one Newton step: about full float precision
@@ -428,17 +435,25 @@ __device__ CHOL_INLINE void chol_solve_reg(const float* A, float* L, float* b, i
     if (r0 > k) a0[k] *= inv; else if (r0 == k) a0[k] = d;
     if (r1 > k) a1[k] *= inv; else if (r1 == k) a1[k] = d;
 #pragma unroll
-    for (int j = k + 1; j < NV; j++) {  // unpredicated: above the diagonal this updates the symmetric Schur complement
+    for (int j = k + 1; j < N; j++) {  // unpredicated: above the diagonal this updates the symmetric Schur complement
       float ljk = __shfl_sync(0xffffffffu, j < 32 ? a0[k] : a1[k], j & 31);  // (bounded, never read as L)
       a0[j] -= a0[k] * ljk;
       a1[j] -= a1[k] * ljk;
     }
   }
 #pragma unroll
-  for (int j = 0; j < NV; j++) { if (has0 && j <= r0) L[TRI(r0, j)] = a0[j]; if (has1 && j <= r1) L[TRI(r1, j)] = a1[j]; }
-  float y0 = has0 ? b[r0] : 0.f, y1 = has1 ? b[r1] : 0.f;
+  for (int j = 0; j < N; j++) {
+    if (has0 && j <= r0) L[TRI(OFFSET + r0, OFFSET + j)] = a0[j];
+    if (has1 && j <= r1) L[TRI(OFFSET + r1, OFFSET + j)] = a1[j];
+  }
+  if constexpr (FACTOR_ONLY) {
+    for (int i = lane; i < N; i += 32) inverse[OFFSET + i] = dinv[i];
+    __syncwarp();
+    return;
+  }
+  float y0 = has0 ? b[OFFSET + r0] : 0.f, y1 = has1 ? b[OFFSET + r1] : 0.f;
 #pragma unroll
-  for (int k = 0; k < NV; k++) {  // forward: L y = b, column-wise
+  for (int k = 0; k < N; k++) {  // forward: L y = b, column-wise
     float yk = __shfl_sync(0xffffffffu, k < 32 ? y0 : y1, k & 31) * dinv[k];
     if (r0 == k) y0 = yk; else if (r0 > k) y0 -= a0[k] * yk;
     if (r1 == k) y1 = yk; else if (r1 > k) y1 -= a1[k] * yk;
@@ -446,13 +461,13 @@ __device__ CHOL_INLINE void chol_solve_reg(const float* A, float* L, float* b, i
   __syncwarp();
   // backward: L^T x = y; lane i holds y_i and reads row k of L (contiguous) to update its entries i < k
 #pragma unroll
-  for (int k = NV - 1; k >= 0; k--) {
+  for (int k = N - 1; k >= 0; k--) {
     float xk = __shfl_sync(0xffffffffu, k < 32 ? y0 : y1, k & 31) * dinv[k];
-    if (r0 == k) y0 = xk; else if (r0 < k) y0 -= L[TRI(k, r0)] * xk;
-    if (r1 == k) y1 = xk; else if (r1 < k) y1 -= L[TRI(k, r1)] * xk;
+    if (r0 == k) y0 = xk; else if (r0 < k) y0 -= L[TRI(OFFSET + k, OFFSET + r0)] * xk;
+    if (r1 == k) y1 = xk; else if (r1 < k) y1 -= L[TRI(OFFSET + k, OFFSET + r1)] * xk;
   }
-  if (has0) b[r0] = y0;
-  if (has1) b[r1] = y1;
+  if (has0) b[OFFSET + r0] = y0;
+  if (has1) b[OFFSET + r1] = y1;
   __syncwarp();
 }
 
@@ -752,6 +767,41 @@ __device__ __noinline__ void chol_resolve(const float* L, float* b, int lane, fl
 #else
 #define CHOL_SOLVE(A, L, b, lane, cb) chol_solve_reg(A, L, b, lane)
 #endif
+
+// Smooth dynamics is independent across FREE roots; contact Hessians still use CHOL_SOLVE. When the selected full
+// solver is not the register solver, keep it for smooth dynamics as well rather than changing its arithmetic.
+__device__ __forceinline__ void chol_solve_smooth(const float* A, float* L, float* b, int lane, float* cb) {
+#if NR == 2 && !CHOL_BCAST && !CHOL_COMPACT
+  if (A != L)  // preserve the full packed factor, including its cross-root zero block
+    for (int i = ROOT_DOF_SPLIT; i < NV; i++)
+      for (int j = lane; j < ROOT_DOF_SPLIT; j += 32) L[TRI(i, j)] = 0.f;
+  __syncwarp();
+  chol_solve_reg<ROOT_DOF_SPLIT, 0, true>(A, L, b, lane, cb);
+  chol_solve_reg<NV - ROOT_DOF_SPLIT, ROOT_DOF_SPLIT, true>(A, L, b, lane, cb);
+  // Keep the original full-coordinate substitution order, including signed-zero products.
+  const int r0 = lane, r1 = lane + 32;
+  const bool has0 = r0 < NV, has1 = r1 < NV;
+  float y0 = has0 ? b[r0] : 0.f, y1 = has1 ? b[r1] : 0.f;
+#pragma unroll
+  for (int k = 0; k < NV; k++) {
+    float yk = __shfl_sync(0xffffffffu, k < 32 ? y0 : y1, k & 31) * cb[k];
+    if (r0 == k) y0 = yk; else if (has0 && r0 > k) y0 -= L[TRI(r0, k)] * yk;
+    if (r1 == k) y1 = yk; else if (has1 && r1 > k) y1 -= L[TRI(r1, k)] * yk;
+  }
+  __syncwarp();
+#pragma unroll
+  for (int k = NV - 1; k >= 0; k--) {
+    float xk = __shfl_sync(0xffffffffu, k < 32 ? y0 : y1, k & 31) * cb[k];
+    if (r0 == k) y0 = xk; else if (has0 && r0 < k) y0 -= L[TRI(k, r0)] * xk;
+    if (r1 == k) y1 = xk; else if (has1 && r1 < k) y1 -= L[TRI(k, r1)] * xk;
+  }
+  if (has0) b[r0] = y0;
+  if (has1) b[r1] = y1;
+  __syncwarp();
+#else
+  CHOL_SOLVE(A, L, b, lane, cb);
+#endif
+}
 
 // solve L L^T x = b in place (b in shared memory) with the factor from chol_warp
 __device__ __forceinline__ void chol_solve_warp(const float* L, float* b, int lane) {
