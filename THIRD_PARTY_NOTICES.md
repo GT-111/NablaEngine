@@ -10,7 +10,8 @@ third-party software that the checks compare with but that the repository does n
 | MuJoCo | Apache-2.0 | 2021 DeepMind Technologies Limited | through the MuJoCo Warp primitives in `step.py`; the model semantics the engine implements |
 | MuJoCo MJX | Apache-2.0 | 2023 DeepMind Technologies Limited | `src/nablaengine/g1_engine/kinematics.py` (reproduced semantics, no code) |
 | MuJoCo Menagerie, Unitree G1 | BSD-3-Clause | 2016-2023 HangZhou YuShu TECHNOLOGY CO.,LTD. ("Unitree Robotics") | `fixtures/mjlab/g1_train.mjb` |
-| mjlab | Apache-2.0 | 2025, The mjlab Developers | `fixtures/mjlab/g1_train.mjb` (parameter values) |
+| MuJoCo Menagerie, Unitree H1 | BSD-3-Clause | 2016-2023 HangZhou YuShu TECHNOLOGY CO.,LTD. ("Unitree Robotics") | `fixtures/h1/h1_train.mjb` |
+| mjlab | Apache-2.0 | 2025, The mjlab Developers | `fixtures/mjlab/g1_train.mjb` (parameter values), `fixtures/h1/h1_train.mjb` (the recipe's values) |
 
 ## 1. MuJoCo Warp
 
@@ -101,6 +102,17 @@ sources; `fixtures/mjlab/README.md` lists every change.
   - The model takes over values of mjlab's G1 configuration (`mjlab.asset_zoo.robots.unitree_g1`): the sole
     capsules, the contact set, the contact and joint parameters, the PD gains and the setpoint range. No mjlab code
     is included.
+
+The Unitree H1 model, `fixtures/h1/h1_train.mjb` (binary format of MuJoCo 3.17.0), is derived the same way from
+**MuJoCo Menagerie** `unitree_h1/scene.xml` (which includes `unitree_h1/h1.xml`) at commit
+98a70c569c4c1b6da467a20012f766ee1f8dc521:
+<https://github.com/google-deepmind/mujoco_menagerie/tree/98a70c569c4c1b6da467a20012f766ee1f8dc521/unitree_h1>.
+Copyright (c) 2016-2023 HangZhou YuShu TECHNOLOGY CO.,LTD. ("Unitree Robotics"), BSD 3-Clause License;
+`fixtures/h1/LICENSE` is a verbatim copy of Menagerie's `unitree_h1/LICENSE` (the same text as the G1's, below).
+Changes made (`scripts/make_h1_model.py`, `fixtures/h1/README.md`): the collision geoms made capsules and spheres with
+explicit contact pairs, the motors replaced by position servos, contact, joint and actuator parameters changed after
+mjlab's G1 configuration, the timestep set to 5 ms, the integrator set to implicitfast, the meshes, materials and
+textures removed.
 
 Unitree Robotics, Google DeepMind and the mjlab developers do not endorse this project.
 

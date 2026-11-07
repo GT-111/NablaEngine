@@ -1,0 +1,24 @@
+{
+ "mujoco_version": "3.17.0",
+ "foot_pairs": [
+  7,
+  8,
+  9,
+  17,
+  18,
+  19
+ ],
+ "torso_body": "torso_link",
+ "nq": 26,
+ "nv": 25,
+ "nu": 19,
+ "nbody": 21,
+ "npair": 457,
+ "timestep": 0.005,
+ "substeps_per_control_step": 4,
+ "solver": "Newton",
+ "cone": "pyramidal",
+ "integrator": "implicitfast",
+ "robot": "h1",
+ "source": "MuJoCo Menagerie unitree_h1/scene.xml at 98a70c5 (Unitree Robotics, BSD-3-Clause), converted by scripts/make_h1_model.py after the mjlab G1 recipe: capsule and sphere collision geoms with explicit pairs, position servos, implicitfast, 5 ms timestep; meshes removed. See README.md."
+}

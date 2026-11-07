@@ -31,6 +31,8 @@ import numpy as np
 CHECKOUT = Path(__file__).resolve().parents[2]
 ROOT = CHECKOUT / "fixtures"
 DEFAULT = ROOT / "mjlab"  # the default fixtures directory: the mjlab G1 and the references of the public corpora
+H1 = ROOT / "h1"  # the Unitree H1 (scripts/make_h1_model.py, scripts/h1_check.py): load_model(fixtures.H1)
+MODEL_PREFIXES = ("g1", "h1")  # a fixtures directory holds <prefix>_train.mjb and <prefix>_meta.json
 BENCH_DATA = CHECKOUT / "benchmarks" / "data"  # $DK_BENCH_DATA: the benchmark corpora and their truth files
 BENCH_PATTERN = "mf_s*.npz"  # the benchmark corpora of the mjlab G1 that corpora() lists
 MJW_REFERENCE = "mjw317_{name}.npz"  # a corpus's MuJoCo Warp reference in the fixtures directory
@@ -73,8 +75,14 @@ def corpora():
     return names + sorted(p.stem for p in bench_dir().glob(BENCH_PATTERN) if p.stem not in names)
 
 
+def _prefix(d):
+    """The model of fixtures directory d: the first of MODEL_PREFIXES with a <prefix>_meta.json there, else "g1"."""
+    return next((p for p in MODEL_PREFIXES if (Path(d) / f"{p}_meta.json").exists()), MODEL_PREFIXES[0])
+
+
 def meta(d=None):
-    path = Path(d or fixtures_dir()) / "g1_meta.json"
+    d = Path(d or fixtures_dir())
+    path = d / f"{_prefix(d)}_meta.json"
     try:
         return json.loads(path.read_text())
     except FileNotFoundError:
@@ -86,21 +94,22 @@ def meta(d=None):
 
 
 def load_model(d=None, check="forward"):
-    """(MjModel, meta): the model of the fixtures directory d (default fixtures_dir()); the binary format needs the
+    """(MjModel, meta): the model of the fixtures directory d (default fixtures_dir(); fixtures.H1 for the Unitree H1:
+    <prefix>_train.mjb and <prefix>_meta.json, prefix g1 or h1); the binary format needs the
     MuJoCo version it was saved with. check: the capability scope it must pass (nablaengine.model.capability.require
     with the meta's foot pairs and torso body; default "forward", the adjoint asserts the rest; "engine",
     "kinematics", or None: no check), else UnsupportedModel: every script that loads the fixtures model checks it
     this way."""
     d = Path(d or fixtures_dir())
-    mt = meta(d)
+    mt, name = meta(d), f"{_prefix(d)}_train.mjb"
     if mujoco.__version__ != mt["mujoco_version"]:
-        raise RuntimeError(f"g1_train.mjb was saved by MuJoCo {mt['mujoco_version']}, this is {mujoco.__version__}: "
+        raise RuntimeError(f"{name} was saved by MuJoCo {mt['mujoco_version']}, this is {mujoco.__version__}: "
                            f"pip install mujoco=={mt['mujoco_version']}")
-    m = mujoco.MjModel.from_binary_path(str(d / "g1_train.mjb"))
+    m = mujoco.MjModel.from_binary_path(str(d / name))
     if check:
         from nablaengine.model import capability
         capability.require(m, mt["foot_pairs"], mt.get("torso_body", capability.COM_BODY), check,
-                           f"fixtures model {d.name}/g1_train.mjb")
+                           f"fixtures model {d.name}/{name}")
     return m, mt
 
 

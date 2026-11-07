@@ -12,10 +12,12 @@
 #   ffi_bitwise      the JAX interface bitwise against the check binaries for the interface default (clamp_kv 0,
 #                    normal 3) at 50 iterations, and its forward bitwise against this tree's engine_step_check.py
 #                    (scripts/jax_ffi_check.py --sections bitwise)
+#   h1               the Unitree H1 (fixtures/h1, nv 25) against MuJoCo C float64: capability, one control step of 512
+#                    rollout states, exact-mode gradients against central differences (scripts/h1_check.py)
 #   capability       the model checks (scripts/capability_check.py, CPU)
 # Without --quick (about 15 minutes on one V100): env; per corpus mf_s0 and mf_s1 the control step on all 4096 states
 # with the forward-tape checks, on the truth's states, and the contact sets of one substep; every gradient group of
-# both corpora; every section of scripts/jax_ffi_check.py and scripts/kinematics_check.py; capability.
+# both corpora; every section of scripts/jax_ffi_check.py and scripts/kinematics_check.py; h1; capability.
 #
 # Each check prints one line, PASS or FAIL, with its log (and JSON) in OUTDIR; the exit status is 1 when any check
 # failed, else 0. The pass criteria are the scripts' own (their GATES / THRESHOLDS, documented in each script).
@@ -64,6 +66,7 @@ else
   check ffi "$PY" scripts/jax_ffi_check.py --corpora mf_s0,mf_s1 --out "$O/ffi.json"
   check kinematics "$PY" scripts/kinematics_check.py --corpora mf_s0,mf_s1 --out "$O/kinematics.json"
 fi
+check h1 "$PY" scripts/h1_check.py --out "$O/h1.json"
 check capability env JAX_PLATFORMS=cpu "$PY" scripts/capability_check.py --out "$O/capability.json"
 
 if [ ${#FAILED[@]} -eq 0 ]; then

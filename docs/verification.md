@@ -99,6 +99,23 @@ subtree_com <= 1e-5 m, xquat <= 1e-6, cvel median <= 1e-6 and p99 <= 1e-5, VJP m
 step's kinematics outputs and their VJP bitwise those of the separate call. Measured: xpos 4.7e-7, xquat 4.8e-7, cvel
 p99 4.3e-7, VJP p99 8.2e-7.
 
+### `h1` (`scripts/h1_check.py`)
+
+The Unitree H1 (`fixtures/h1`, nv 25: the solves' masked lanes past NV) against MuJoCo C in float64, on 512 states of
+MuJoCo C rollouts under random setpoints and pushes (standing, staggering, falling, lying), at 50 Newton iterations.
+No MuJoCo Warp reference is committed for the H1. Measured on an RTX 4060 Laptop GPU (sm_89, nvcc 12.4):
+
+| gate | threshold | measured |
+|---|---|---|
+| capability: no error, warnings exactly H3, H5, U2 | | H3, H5, U2 |
+| forward: qvel relative error, median (outputs finite and bitwise deterministic) | 1e-5 | 3.6e-7 (p90 9.3e-3, p99 4.3e-2: contact-rich states) |
+| exact-mode gradient (ctrl, qvel) vs central differences, contact-free states, median / p90 | 1e-5 / 1e-4 | 1.5e-7 / 3.0e-7 (ctrl), 1.3e-7 / 2.3e-7 (qvel) |
+| exact-mode gradient (ctrl, qvel), the states as drawn, median | 1e-4 | 5.8e-7 (ctrl), 1.6e-6 (qvel) |
+
+The tails of the gradient errors are states at a kink that central differences straddle: an actuator force at its
+limit or a self contact. The G1 run through the same script gives the same picture (forward median 7.4e-7, p90
+1.1e-2; contact-free gradients 3.3e-7 / 5.4e-7).
+
 ### `capability` (`scripts/capability_check.py`)
 
 The capability checker (`nablaengine.model.capability`): every `MjModel` field of the installed MuJoCo is classified,
@@ -116,6 +133,11 @@ own codes by `capability.require` and by `jax_ffi.init(model=...)`, before anyth
   unit at the first identical level that can clear its L0 difference; `--full` requires every level identical.
 - `scripts/engine_check.py`: the smooth dynamics (mass matrix, bias forces) against MuJoCo C.
 - `scripts/make_mjw_reference.py`: regenerates a MuJoCo Warp reference (needs mujoco-warp 3.17.0).
+- `scripts/make_h1_model.py`: regenerates `fixtures/h1/h1_train.mjb` from MuJoCo Menagerie (byte for byte).
+- `scripts/visualize_rollout.py`: a visual check: a 5 s open-loop rollout (squat and arm swing from a keyframe, ending
+  in a fall) by the engine and by MuJoCo C, rendered side by side into `rollout.mp4` with the qpos deviation per step
+  (float32 rounding level, 1e-7 to 2e-5 through the fall; gate `--tol`, default 1e-4) and the gradient of the final pelvis height. Needs ffmpeg and EGL (or another
+  `MUJOCO_GL`).
 - The benchmark harness (`benchmarks/README.md`) scores the forward and the gradients of every engine against the
   same truth files: `docs/results/paper_accuracy_heldout_v100.md`.
 

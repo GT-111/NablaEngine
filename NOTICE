@@ -16,4 +16,8 @@ BSD 3-Clause License (see fixtures/mjlab/LICENSE). Its modifications follow the 
 configuration of mjlab (https://github.com/mujocolab/mjlab), Copyright 2025, The mjlab
 Developers, licensed under the Apache License, Version 2.0.
 
+The model fixtures/h1/h1_train.mjb is derived from the Unitree H1 description of MuJoCo
+Menagerie, Copyright (c) 2016-2023 HangZhou YuShu TECHNOLOGY CO.,LTD. ("Unitree Robotics"),
+licensed under the BSD 3-Clause License (see fixtures/h1/LICENSE), converted the same way.
+
 THIRD_PARTY_NOTICES.md lists the files concerned, their sources and the changes made.

@@ -442,11 +442,12 @@ __device__ __noinline__ void tri_solve_packed(const float* L, float* b, int lane
 #else
 __device__ __noinline__ void tri_solve_packed(const float* L, float* b, int lane) {
   static_assert(NV <= 64, "two entries per lane");
-  const int r0 = lane, r1 = min(lane + 32, NV - 1);  // r1: clamped to a valid row (only lanes with has1 use it)
-  const bool has1 = lane + 32 < NV;
+  // r0 / r1: clamped to a valid row (only lanes with has0 / has1 use them; has0 is the constant true for NV >= 32)
+  const int r0 = NV >= 32 ? lane : min(lane, NV - 1), r1 = min(lane + 32, NV - 1);
+  const bool has0 = NV >= 32 || lane < NV, has1 = lane + 32 < NV;
   const int t0 = TRI(r0, 0), t1 = TRI(r1, 0);  // the rows' starts
   __syncwarp();
-  float y0 = b[r0], y1 = has1 ? b[r1] : 0.f;
+  float y0 = has0 ? b[r0] : 0.f, y1 = has1 ? b[r1] : 0.f;
 #pragma unroll 5
   for (int k = 0; k < NV; k++) {  // forward: L y = b
     const float d = L[TRI(k, k)], l0 = L[t0 + min(k, r0)], l1 = L[t1 + min(k, r1)];
@@ -463,7 +464,7 @@ __device__ __noinline__ void tri_solve_packed(const float* L, float* b, int lane
     y1 = r1 == k ? xk : (has1 && r1 < k ? y1 - l1 * xk : y1);
   }
   __syncwarp();
-  b[r0] = y0;
+  if (has0) b[r0] = y0;  // (a lane past NV ran row NV - 1's arithmetic on its own registers; it is never read)
   if (has1) b[r1] = y1;
   __syncwarp();
 }

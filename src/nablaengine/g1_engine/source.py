@@ -8,7 +8,8 @@ the mass matrix is taken about the root body's origin and includes the armature 
 
 constants(m) packs the model arrays the kernels read (global memory, see DKC; load order = CONST_LAYOUT) and
 asserts the model structure the kernels assume, among others: a free root at body 1, then one hinge per body at
-its origin, at most 32 bodies, nv >= 32 (the solves give lane l the dof row l), position actuators in joint order
+its origin, at most 32 bodies, nv <= 64 (the solves give lane l the dof rows l and l + 32; with nv < 32 the lanes
+past NV are masked: the Unitree H1, nv 25), position actuators in joint order
 (actuator a on dof 6 + a), and a body named torso_link.
 """
 
@@ -39,10 +40,6 @@ def constants(m):
         j = m.body_jntadr[b]
         assert m.body_jntnum[b] == 1 and m.jnt_type[j] == mujoco.mjtJoint.mjJNT_HINGE and not m.jnt_pos[j].any()
         qadr[b], dadr[b], axis[b] = m.jnt_qposadr[j], m.jnt_dofadr[j], m.jnt_axis[j]
-    assert m.nv >= 32, (
-        f"nv = {m.nv}: the engine needs nv >= 32 (at least 26 hinges). The Cholesky and triangular solves "
-        "(chol_solve_compact / chol_solve_reg here, adjoint.py tri_solve_packed) give lane l the dof row l, so with "
-        "fewer dofs they read and write past their arrays (an illegal address, NaN or silently wrong results)")
     child = np.zeros((nb, 3))
     for b in range(1, nb):
         child[b, :len(children[b])] = children[b]
@@ -362,17 +359,22 @@ __device__ __forceinline__ void chol_warp(float* A, int lane) {
 // before anything is written, so L may alias A), then x = A^-1 b in place (b: shared NV vector). Lane l holds rows l and
 // l + 32 (NV <= 64) in registers; the factorization is right-looking with column k broadcast by __shfl_sync, all loops
 // unrolled at compile time. L (packed lower triangle, with the true diagonal) is written to L for the back substitution
-// and for callers that keep it.
+// and for callers that keep it. With NV < 32 the lanes l >= NV hold no row (HAS0 false): their registers stay zero and
+// they neither read nor write A, L or b; for NV >= 32 HAS0 is the constant true (the code is that of the NV >= 32 build).
+#define HAS0(r0) (NV >= 32 || (r0) < NV)
 #ifndef CHOL_INLINE
 #define CHOL_INLINE __noinline__  // one copy of the (large, fully unrolled) code: -DCHOL_INLINE=__forceinline__ inlines it
 #endif
 __device__ CHOL_INLINE void chol_solve_reg(const float* A, float* L, float* b, int lane) {
   static_assert(NV <= 64, "two rows per lane");
   const int r0 = lane, r1 = lane + 32;
-  const bool has1 = r1 < NV;
+  const bool has0 = HAS0(r0), has1 = r1 < NV;
   float a0[NV], a1[NV], dinv[NV];
 #pragma unroll
-  for (int j = 0; j < NV; j++) { a0[j] = j <= r0 ? A[TRI(r0, j)] : 0.f; a1[j] = has1 && j <= r1 ? A[TRI(r1, j)] : 0.f; }
+  for (int j = 0; j < NV; j++) {
+    a0[j] = has0 && j <= r0 ? A[TRI(r0, j)] : 0.f;
+    a1[j] = has1 && j <= r1 ? A[TRI(r1, j)] : 0.f;
+  }
   __syncwarp();
 #pragma unroll
   for (int k = 0; k < NV; k++) {
@@ -391,8 +393,8 @@ __device__ CHOL_INLINE void chol_solve_reg(const float* A, float* L, float* b, i
     }
   }
 #pragma unroll
-  for (int j = 0; j < NV; j++) { if (j <= r0) L[TRI(r0, j)] = a0[j]; if (has1 && j <= r1) L[TRI(r1, j)] = a1[j]; }
-  float y0 = b[r0], y1 = has1 ? b[r1] : 0.f;
+  for (int j = 0; j < NV; j++) { if (has0 && j <= r0) L[TRI(r0, j)] = a0[j]; if (has1 && j <= r1) L[TRI(r1, j)] = a1[j]; }
+  float y0 = has0 ? b[r0] : 0.f, y1 = has1 ? b[r1] : 0.f;
 #pragma unroll
   for (int k = 0; k < NV; k++) {  // forward: L y = b, column-wise
     float yk = __shfl_sync(0xffffffffu, k < 32 ? y0 : y1, k & 31) * dinv[k];
@@ -407,7 +409,7 @@ __device__ CHOL_INLINE void chol_solve_reg(const float* A, float* L, float* b, i
     if (r0 == k) y0 = xk; else if (r0 < k) y0 -= L[TRI(k, r0)] * xk;
     if (r1 == k) y1 = xk; else if (r1 < k) y1 -= L[TRI(k, r1)] * xk;
   }
-  b[r0] = y0;
+  if (has0) b[r0] = y0;
   if (has1) b[r1] = y1;
   __syncwarp();
 }
@@ -420,10 +422,13 @@ __device__ CHOL_INLINE void chol_solve_reg(const float* A, float* L, float* b, i
 __device__ __noinline__ void chol_solve_compact(const float* A, float* L, float* b, int lane) {
   static_assert(NV <= 64, "two rows per lane");
   const int r0 = lane, r1 = lane + 32;
-  const bool has1 = r1 < NV;
+  const bool has0 = HAS0(r0), has1 = r1 < NV;
   float a0[NV], a1[NV];
 #pragma unroll
-  for (int j = 0; j < NV; j++) { a0[j] = j <= r0 ? A[TRI(r0, j)] : 0.f; a1[j] = has1 && j <= r1 ? A[TRI(r1, j)] : 0.f; }
+  for (int j = 0; j < NV; j++) {
+    a0[j] = has0 && j <= r0 ? A[TRI(r0, j)] : 0.f;
+    a1[j] = has1 && j <= r1 ? A[TRI(r1, j)] : 0.f;
+  }
   __syncwarp();
   for (int k = 0; k < NV; k++) {
     float dkk = fmaxf(__shfl_sync(0xffffffffu, k < 32 ? a0[0] : a1[0], k & 31), 1e-30f);
@@ -431,7 +436,7 @@ __device__ __noinline__ void chol_solve_compact(const float* A, float* L, float*
     inv = inv * (1.5f - 0.5f * dkk * inv * inv);
     float d = dkk * inv;
     float l0 = r0 > k ? a0[0] * inv : (r0 == k ? d : 0.f), l1 = r1 > k ? a1[0] * inv : (r1 == k ? d : 0.f);
-    if (r0 >= k) L[TRI(r0, k)] = l0;
+    if (has0 && r0 >= k) L[TRI(r0, k)] = l0;
     if (has1 && r1 >= k) L[TRI(r1, k)] = l1;
     if (r0 == k) l0 = 0.f;  // the pivot row takes no part in the trailing update
     if (r1 == k) l1 = 0.f;
@@ -448,10 +453,10 @@ __device__ __noinline__ void chol_solve_compact(const float* A, float* L, float*
     }
   }
   __syncwarp();
-  float y0 = b[r0], y1 = has1 ? b[r1] : 0.f;
+  float y0 = has0 ? b[r0] : 0.f, y1 = has1 ? b[r1] : 0.f;
   for (int k = 0; k < NV; k++) {  // forward: L y = b, column-wise
     float yk = __shfl_sync(0xffffffffu, k < 32 ? y0 : y1, k & 31) / L[TRI(k, k)];
-    if (r0 == k) y0 = yk; else if (r0 > k) y0 -= L[TRI(r0, k)] * yk;
+    if (r0 == k) y0 = yk; else if (has0 && r0 > k) y0 -= L[TRI(r0, k)] * yk;
     if (r1 == k) y1 = yk; else if (has1 && r1 > k) y1 -= L[TRI(r1, k)] * yk;
   }
   for (int k = NV - 1; k >= 0; k--) {  // backward: L^T x = y
@@ -459,7 +464,7 @@ __device__ __noinline__ void chol_solve_compact(const float* A, float* L, float*
     if (r0 == k) y0 = xk; else if (r0 < k) y0 -= L[TRI(k, r0)] * xk;
     if (r1 == k) y1 = xk; else if (has1 && r1 < k) y1 -= L[TRI(k, r1)] * xk;
   }
-  b[r0] = y0;
+  if (has0) b[r0] = y0;
   if (has1) b[r1] = y1;
   __syncwarp();
 }

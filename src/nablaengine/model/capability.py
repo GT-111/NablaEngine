@@ -225,7 +225,8 @@ def check(m, foot_pairs=None, com_body=COM_BODY, scope="engine"):
         ("forward", "kinematics"))
     add("H2", nb <= 31, "error", "at most 31 bodies in the adjoint (lanes 0 and 31 carry root rotation dofs)", nb,
         ("adjoint",))
-    add("H3", nv >= 32, "error", "nv >= 32 (the Cholesky / triangular solves give lane l dof row l)", nv)
+    add("H3", nv >= 32, "warn", "nv >= 32 (the Cholesky / triangular solves give lane l dof row l; with nv < 32 the "
+        "lanes past NV are masked, a path checked on the Unitree H1 only, nv 25: scripts/h1_check.py)", nv)
     add("H4", nv <= 64, "error", "nv <= 64 (two rows per lane)", nv)
     add("H5", 33 <= nv <= 35, "warn", "33 <= nv <= 35: the tuned CHOL_BCAST / NEWTON_REUSE / blocked triangular solve "
         "(else the register Cholesky fallback: untested on a corpus, slower)", nv, ("forward", "adjoint"))

@@ -11,7 +11,8 @@ sources, the model constants, the flags, the nvcc version and XLA's FFI headers.
 
 ## Shapes and units
 
-For the mjlab Unitree G1 (`fixtures/mjlab/g1_train.mjb`): `nq = 36`, `nv = 35`, `nu = 29`. B, the number of worlds, is
+For the mjlab Unitree G1 (`fixtures/mjlab/g1_train.mjb`): `nq = 36`, `nv = 35`, `nu = 29`; for the Unitree H1
+(`fixtures/h1/h1_train.mjb`, `jax_ffi.init(model=m, foot_pairs=meta["foot_pairs"])`): `nq = 26`, `nv = 25`, `nu = 19`. B, the number of worlds, is
 read from the arrays at run time: one library serves every batch size, and JAX traces once per shape.
 
 | argument | shape | meaning |

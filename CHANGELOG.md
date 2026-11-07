@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- The Unitree H1 (`fixtures/h1`, nv 25), converted from MuJoCo Menagerie by `scripts/make_h1_model.py` after the mjlab
+  G1 recipe and checked against MuJoCo C in float64 by `scripts/h1_check.py` (in `scripts/verify.sh`).
+- Models with nv < 32: the Cholesky and triangular solves mask the lanes past NV; capability H3 is now a warning
+  (checked on the H1 only). The G1's builds are unchanged (identical PTX and SASS on sm_70, sm_86, sm_89, sm_90).
+- `nablaengine.fixtures.load_model(fixtures.H1)`: a fixtures directory holds `<prefix>_train.mjb` and
+  `<prefix>_meta.json`, prefix `g1` or `h1`.
+- `scripts/visualize_rollout.py` (a visual check against MuJoCo) and `examples/squat_trajopt.py` (trajectory
+  optimization through the engine's gradients; `--robot h1` for the H1).
+
 ## 0.1.0
 
 First release.

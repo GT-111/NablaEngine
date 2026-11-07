@@ -34,6 +34,9 @@ the engine's simulation gradients.
 NablaEngine is specialized for the Unitree G1 (the mjlab model), the first robot it supports: contacts between
 spheres, capsules and the floor, joint limits, PD position actuators, MuJoCo's Newton solver and implicitfast
 integration, in float32. Other models are rejected with an error that names the unsupported features.
+The Unitree H1 (`fixtures/h1`, converted from MuJoCo Menagerie the same way by `scripts/make_h1_model.py`) is the
+second: it is checked against float64 MuJoCo (`scripts/h1_check.py`: forward median relative error 3.6e-7, exact-mode
+gradients 1.5e-7 on contact-free states) but not yet benchmarked like the G1.
 
 Requirements: Linux x86_64, an NVIDIA GPU of compute capability 7.0 or newer (tested: V100, RTX 3090, H100, RTX PRO
 6000), Python 3.12, and a CUDA 12.x toolkit (nvcc) for the one-time build of the CUDA library (about 15 s, cached).
@@ -104,6 +107,20 @@ start `warm (B, 35)`, the position targets `ctrl (B, 29)`, and per-world foot `f
 centre-of-mass offset `com (B, 3)` for domain randomization. Each world holds up to 64 contacts and 192 constraint
 rows; a world beyond them (e.g. deep interpenetration after a fall) drops the extra ones and is flagged and counted
 (`docs/api.md`, Diagnostics).
+
+## Example: trajectory optimization
+
+`examples/squat_trajopt.py` finds open-loop joint targets that make the G1 squat 15 cm and stand up again, by gradient
+descent through a 3 s rollout (`jax.grad` through `lax.scan` of `jax_ffi.step`): 400 Adam iterations, about 35 s on
+an RTX 4060 Laptop GPU. The naive targets (left) fall; the optimized ones (right) follow the reference pelvis height
+within 4 cm, and replayed open loop in float64 MuJoCo they give the same motion (qpos within 4e-5).
+
+<p align="center"><img src="docs/assets/squat_trajopt.gif" alt="Naive joint targets make the G1 fall; targets optimized with jax.grad squat and stand up" width="480"></p>
+
+```bash
+python examples/squat_trajopt.py --out runs/squat        # squat.mp4, squat.npz; --gif for the animation above
+python examples/squat_trajopt.py --robot h1 --out runs/squat_h1   # the same for the Unitree H1 (fixtures/h1)
+```
 
 ## Documentation
 
