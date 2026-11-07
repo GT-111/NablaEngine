@@ -82,10 +82,9 @@ functions) and the contact VJPs (adjoint_contact.source); the caller adds its __
 (the adjoint check binary of nablaengine.checks).
 """
 
-import mujoco
 import numpy as np
 
-from nablaengine.g1_engine import adjoint_contact, source, step, tape
+from nablaengine.g1_engine import adjoint_contact, model_hooks, source, step, tape
 
 ADJ_ROWS_SKIPPED = 1 << 12  # info: a record has contacts or constraint rows that this build does not differentiate
 ADJ_REPLAY_MISMATCH = 1 << 13  # info: a replayed contact is not penetrating, or the replayed limit rows differ in number
@@ -163,14 +162,14 @@ def solimp_powers(m):
     """The solimp powers of the model's constraint rows as the engine packs them (float32): the hinge limits'
     (step.pair_constants: c_jsolimp, one set for all joints) and the contact pairs' parameter sets (c_pset)."""
     sets = np.asarray(step.pair_param_sets(m)[0], np.float32)
-    return sorted({float(np.float32(m.jnt_solimp[1][4]))} | {float(x) for x in sets[:, 3 + 4]})
+    fl = {float(np.float32(x)) for x in m.dof_solimp[m.dof_frictionloss > 0, 4]}  # (none for the G1)
+    return sorted({float(np.float32(m.jnt_solimp[1][4]))} | {float(x) for x in sets[:, 3 + 4]} | fl)
 
 
 def header(m):
     """#defines of the adjoint (stage, options, debug layout, the model's solimp power); asserts the mjlab-only scope."""
-    assert not any(m.geom_type[g] == mujoco.mjtGeom.mjGEOM_BOX for g in step.collision_geoms(m)), \
-        "the adjoint is for the mjlab model: no box geoms"
-    assert not (m.dof_frictionloss > 0).any(), "the adjoint is for the mjlab model: no frictionloss rows"
+    has_box, box_ok, _ = model_hooks.box_pairs(m)
+    assert not has_box or box_ok, "the adjoint has box contacts with planes and boxes only (model_hooks)"
     assert m.nu == m.nv - 6, "one position actuator per hinge dof"
     lay, nw = debug_layout(m)
     lines = [f"#define ADJ_ROWS_SKIPPED {ADJ_ROWS_SKIPPED}u", f"#define ADJ_REPLAY_MISMATCH {ADJ_REPLAY_MISMATCH}u",
@@ -442,12 +441,11 @@ __device__ __noinline__ void tri_solve_packed(const float* L, float* b, int lane
 #else
 __device__ __noinline__ void tri_solve_packed(const float* L, float* b, int lane) {
   static_assert(NV <= 64, "two entries per lane");
-  // r0 / r1: clamped to a valid row (only lanes with has0 / has1 use them; has0 is the constant true for NV >= 32)
-  const int r0 = NV >= 32 ? lane : min(lane, NV - 1), r1 = min(lane + 32, NV - 1);
-  const bool has0 = NV >= 32 || lane < NV, has1 = lane + 32 < NV;
+  const int r0 = lane, r1 = min(lane + 32, NV - 1);  // r1: clamped to a valid row (only lanes with has1 use it)
+  const bool has1 = lane + 32 < NV;
   const int t0 = TRI(r0, 0), t1 = TRI(r1, 0);  // the rows' starts
   __syncwarp();
-  float y0 = has0 ? b[r0] : 0.f, y1 = has1 ? b[r1] : 0.f;
+  float y0 = b[r0], y1 = has1 ? b[r1] : 0.f;
 #pragma unroll 5
   for (int k = 0; k < NV; k++) {  // forward: L y = b
     const float d = L[TRI(k, k)], l0 = L[t0 + min(k, r0)], l1 = L[t1 + min(k, r1)];
@@ -464,7 +462,7 @@ __device__ __noinline__ void tri_solve_packed(const float* L, float* b, int lane
     y1 = r1 == k ? xk : (has1 && r1 < k ? y1 - l1 * xk : y1);
   }
   __syncwarp();
-  if (has0) b[r0] = y0;  // (a lane past NV ran row NV - 1's arithmetic on its own registers; it is never read)
+  b[r0] = y0;
   if (has1) b[r1] = y1;
   __syncwarp();
 }
@@ -1472,24 +1470,93 @@ static inline size_t adj_launch_smem(int worlds_per_sm = -1, cudaError_t* err = 
 """
 
 
-def cuda_source(m, max_contacts=None):
+
+# terrain builds (nablaengine.terrain): the contact table's 10-bit pairs and terrain elements, and the terrain
+# contacts' replay / VJP (adjoint_contact.TERRAIN_DEVICE); applied by cuda_source to the adjoint's text
+ADJ_TERRAIN_HOOKS = (
+    ("""// adj_contact_geom for contact (pair, slot) of the engine's pair table""",
+     adjoint_contact.TERRAIN_DEVICE.lstrip("\n") + """
+// adj_contact_geom for contact (pair, slot) of the engine's pair table"""),
+    ("""  int g1 = PG1(pair), g2 = PG2(pair);
+  return adj_contact_geom(""",
+     """  if (pair >= NPAIR)
+    return adj_terrain_geom(slot, 0u, c_gtype[PG2(pair)], c_gsize + 3 * PG2(pair), gx[PG2(pair)], gq[PG2(pair)], dist,
+                            pos, fr, nu, cot, gb);
+  int g1 = PG1(pair), g2 = PG2(pair);
+  return adj_contact_geom("""),
+    ("""  unsigned con[(MAXCON + 1) / 2];  // the record's contact table: pair | slot << 9 per 16 bits
+""",
+     """  unsigned con[(MAXCON + 1) / 2];  // the record's contact table: pair | slot << 10 per 16 bits (terrain build)
+  unsigned telem[(MAXCON + 1) / 2];  // the contacts' terrain elements, 16 bits each
+"""),
+    ("""  for (int i = lane; i < (MAXCON + 1) / 2; i += 32) s.con[i] = __float_as_uint(__ldcs(rec + OFF_CON + i));
+""",
+     """  for (int i = lane; i < (MAXCON + 1) / 2; i += 32) s.con[i] = __float_as_uint(__ldcs(rec + OFF_CON + i));
+  for (int i = lane; i < (MAXCON + 1) / 2; i += 32) s.telem[i] = __float_as_uint(__ldcs(rec + OFF_TELEM + i));
+"""),
+    ("""    const int pair = e & 511u, slot = e >> 9, dim = on ? PDIM(pair) : 0;""",
+     """    const unsigned x = on ? (s.telem[c >> 1] >> (16 * (c & 1))) & 0xFFFFu : 0u;
+    const int pair = e & 1023u, slot = (int)(e >> 10 | x << 8), dim = on ? PDIM(pair) : 0;"""),
+    ("""      const int pair = (s.con[c >> 1] >> (16 * (c & 1))) & 511u;""",
+     """      const int pair = (s.con[c >> 1] >> (16 * (c & 1))) & 1023u;"""),
+)
+
+
+# native heightfield builds, after ADJ_TERRAIN_HOOKS: the contacts' candidate ids (taux) into adj_terrain_geom
+ADJ_NATIVE_HOOKS = (
+    ("""  unsigned telem[(MAXCON + 1) / 2];  // the contacts' terrain elements, 16 bits each
+""",
+     """  unsigned telem[(MAXCON + 1) / 2];  // the contacts' terrain elements, 16 bits each
+  unsigned taux[MAXCON];  // native heightfield contacts: the candidate ids
+"""),
+    ("""  for (int i = lane; i < (MAXCON + 1) / 2; i += 32) s.telem[i] = __float_as_uint(__ldcs(rec + OFF_TELEM + i));
+""",
+     """  for (int i = lane; i < (MAXCON + 1) / 2; i += 32) s.telem[i] = __float_as_uint(__ldcs(rec + OFF_TELEM + i));
+  for (int i = lane; i < MAXCON; i += 32) s.taux[i] = __float_as_uint(__ldcs(rec + OFF_TAUX + i));
+"""),
+    ("""// a geom's pose cotangent (xbar, tbar = gb + 6 j of adj_contact_geom) onto its body's:""",
+     """// adj_pair_geom with a terrain contact's candidate id
+__device__ __forceinline__ int adj_pair_geom_aux(int pair, int slot, unsigned aux, const float (*gx)[3],
+                                                 const float (*gq)[4], float* dist, float* pos, float* fr, float* nu,
+                                                 const float* cot, float* gb) {
+  if (pair >= NPAIR)
+    return adj_terrain_geom(slot, aux, c_gtype[PG2(pair)], c_gsize + 3 * PG2(pair), gx[PG2(pair)], gq[PG2(pair)], dist,
+                            pos, fr, nu, cot, gb);
+  return adj_pair_geom(pair, slot, gx, gq, dist, pos, fr, nu, cot, gb);
+}
+
+// a geom's pose cotangent (xbar, tbar = gb + 6 j of adj_contact_geom) onto its body's:"""),
+    ("""adj_pair_geom(pair, slot, s.gx, s.gq, &d, p, fr, &nu, nullptr, nullptr)""",
+     """adj_pair_geom_aux(pair, slot, s.taux[c], s.gx, s.gq, &d, p, fr, &nu, nullptr, nullptr)"""),
+    ("""adj_pair_geom(pair, slot, s.gx, s.gq, &d2, p2, fr2, &nu2, cot, gb)""",
+     """adj_pair_geom_aux(pair, slot, s.taux[c], s.gx, s.gq, &d2, p2, fr2, &nu2, cot, gb)"""),
+)
+
+def cuda_source(m, max_contacts=None, terrain=None):
     """The device code of the forward and the adjoint as one compilation unit, with k_adjoint's launch helpers
-    (adj_launch_smem; no __global__ forward kernel, no host main)."""
-    maxd = source.constants(m)[1]
-    return (source.header(m, maxd, 1) + step.EXTRA_HEADER + step.step_header(m, max_contacts)
-            + tape.header(m, max_contacts) + header(m) + source.DEVICE + step.STEP_DEVICE + step.STEP_KERNEL
-            + adjoint_contact.source(m) + ADJ_DEVICE + ADJ_KERNEL)
+    (adj_launch_smem; no __global__ forward kernel, no host main). terrain: (TerrainConfig, robot geoms) for a terrain
+    build (nablaengine.terrain; step.step_header). Models outside the G1's structure get model_hooks' edits."""
+    maxd = source.max_depth(m)
+    adj = adjoint_contact.source(m) + ADJ_DEVICE + ADJ_KERNEL
+    if terrain is not None:
+        adj = step.apply_hooks(adj, ADJ_TERRAIN_HOOKS)
+        if terrain[0].mode == "native":
+            adj = step.apply_hooks(adj, ADJ_NATIVE_HOOKS)
+    return model_hooks.apply(source.header(m, maxd, 1) + step.EXTRA_HEADER + step.step_header(m, max_contacts, terrain)
+                             + tape.header(m, max_contacts, tape.kind(terrain)) + header(m) + source.DEVICE
+                             + step.terrain_source(step.STEP_DEVICE + step.STEP_KERNEL, terrain) + adj, m)
 
 
-def engine_constants(m, foot_pairs):
+def engine_constants(m, foot_pairs, terrain=None, com_body=None):
     """(constants as one float32 array, [(symbol, kind, count, width)] in packing order, sizes) for the host loader
-    (scripts/engine_step_check.py loader()), as engine_step_check packs them."""
-    c1, _ = source.constants(m)
-    c2 = step.pair_constants(m, foot_pairs)
+    (scripts/engine_step_check.py loader()), as engine_step_check packs them (terrain: as cuda_source; com_body:
+    source.constants')."""
+    c1, _ = source.constants(m, com_body)
+    c2 = step.pair_constants(m, foot_pairs, terrain)
     dofbody, mask = step.extra_constants(m)
     halves = np.stack([mask & 0xFFFF, mask >> 16], 1).ravel()
     consts = np.concatenate([c1, c2, dofbody.astype(np.float32), halves.astype(np.float32)])
     sizes = {"nb": m.nbody, "nv": m.nv, "one": 1, "nv2": 2 * m.nv}
-    lays = (list(source.CONST_LAYOUT) + [(s, k, n, 1) for s, k, n in step.const_layout(m)]
+    lays = (list(source.const_layout(m)) + [(s, k, n, 1) for s, k, n in step.const_layout(m, terrain)]
             + [("c_dofbody", "i", "nv", 1), ("c_ancmask", "u", "nb", 1)])
     return consts, lays, sizes

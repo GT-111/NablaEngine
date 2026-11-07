@@ -8,9 +8,9 @@ the mass matrix is taken about the root body's origin and includes the armature 
 
 constants(m) packs the model arrays the kernels read (global memory, see DKC; load order = CONST_LAYOUT) and
 asserts the model structure the kernels assume, among others: a free root at body 1, then one hinge per body at
-its origin, at most 32 bodies, nv <= 64 (the solves give lane l the dof rows l and l + 32; with nv < 32 the lanes
-past NV are masked: the Unitree H1, nv 25), position actuators in joint order
-(actuator a on dof 6 + a), and a body named torso_link.
+its origin, at most 32 bodies and MAX_CHILDREN children per body, nv >= MIN_NV (model_hooks.py adapts the kernels'
+text to nv < 32 and to more than 3 children per body), position actuators in joint order
+(actuator a on dof 6 + a), and the COM-offset body (default torso_link).
 """
 
 import mujoco
@@ -26,21 +26,63 @@ CONST_LAYOUT = (  # (symbol, kind, length in units of the body count or "nv", pe
 )
 
 
-def constants(m):
-    """Model arrays in CONST_LAYOUT order (float32), and the tree's maximum depth."""
+MAX_CHILDREN = 8  # children per body (c_child's width: child_width; model_hooks.py beyond 3)
+MIN_NV = 7  # a free root and at least one hinge (model_hooks.py below 32)
+
+
+def children_of(m):
+    """[[child body ids] per body]."""
+    children = [[] for _ in range(m.nbody)]
+    for b in range(1, m.nbody):
+        children[m.body_parentid[b]].append(b)
+    return children
+
+
+def child_width(m):
+    """c_child's entries per body: 3 (the G1's layout), or the model's most children per body."""
+    return max(3, max(len(c) for c in children_of(m)[1:]))
+
+
+def has_damping(m):
+    """True where a dof has joint damping (model_hooks.py: c_damp; the G1 has none)."""
+    return bool((m.dof_damping != 0).any())
+
+
+def const_layout(m):
+    """CONST_LAYOUT with c_child's width for model m, and c_damp for joint damping (CONST_LAYOUT itself for the G1)."""
+    w = child_width(m)
+    lay = tuple((sym, kind, n, w if sym == "c_child" else width) for sym, kind, n, width in CONST_LAYOUT)
+    return lay + ((("c_damp", "f", "nv", 1),) if has_damping(m) else ())
+
+
+COM_BODY = "torso_link"  # the body that takes the per-world COM offset by default (the G1's torso)
+
+
+def max_depth(m):
+    """The kinematic tree's maximum depth (constants' second result)."""
+    depth = [0] * m.nbody
+    for b in range(1, m.nbody):
+        depth[b] = depth[m.body_parentid[b]] + 1
+    return max(depth)
+
+
+def constants(m, com_body=None):
+    """Model arrays in const_layout(m) order (float32), and the tree's maximum depth; com_body: the name of the body
+    that takes the per-world COM offset (default COM_BODY)."""
     nb = m.nbody
-    depth, children = [0] * nb, [[] for _ in range(nb)]
+    depth, children = [0] * nb, children_of(m)
     for b in range(1, nb):
         depth[b] = depth[m.body_parentid[b]] + 1
-        children[m.body_parentid[b]].append(b)
-    assert nb <= 32 and max(len(c) for c in children[1:]) <= 3
+    assert nb <= 32 and max(len(c) for c in children[1:]) <= MAX_CHILDREN
     assert m.jnt_type[m.body_jntadr[1]] == mujoco.mjtJoint.mjJNT_FREE and m.body_jntnum[1] == 1
     qadr, dadr, axis = np.zeros(nb), np.zeros(nb), np.zeros((nb, 3))
     for b in range(2, nb):
         j = m.body_jntadr[b]
         assert m.body_jntnum[b] == 1 and m.jnt_type[j] == mujoco.mjtJoint.mjJNT_HINGE and not m.jnt_pos[j].any()
         qadr[b], dadr[b], axis[b] = m.jnt_qposadr[j], m.jnt_dofadr[j], m.jnt_axis[j]
-    child = np.zeros((nb, 3))
+    assert m.nv >= MIN_NV, f"nv = {m.nv}: a free root and at least one hinge"
+    # (nv < 32: the solves' lanes beyond the last dof repeat its row, model_hooks.py)
+    child = np.zeros((nb, child_width(m)))
     for b in range(1, nb):
         child[b, :len(children[b])] = children[b]
     nchild = np.array([len(children[b]) if b else 0 for b in range(nb)])
@@ -66,11 +108,14 @@ def constants(m):
         if m.jnt_actfrclimited[j]:
             frclim[dof] = m.jnt_actfrcrange[j, 1]
             assert m.jnt_actfrcrange[j, 0] == -m.jnt_actfrcrange[j, 1]
-    torso = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, "torso_link")
-    assert torso >= 1, 'no body named "torso_link": the per-world COM offset (com) is applied to that body'
+    com_body = com_body or COM_BODY
+    torso = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, com_body)
+    assert torso >= 1, f'no body named "{com_body}": the per-world COM offset (com) is applied to that body'
     parts = [m.body_parentid, depth, qadr, dadr, nchild, child, m.body_pos, m.body_quat, axis, m.body_ipos,
              m.body_iquat, m.body_mass, m.body_inertia, m.opt.gravity, m.dof_armature, nanc, anc, kp, kv, frclim,
              [m.opt.timestep, torso]]
+    if has_damping(m):
+        parts.append(m.dof_damping)
     return np.concatenate([np.asarray(x, np.float64).ravel() for x in parts]).astype(np.float32), max(depth)
 
 
@@ -359,22 +404,17 @@ __device__ __forceinline__ void chol_warp(float* A, int lane) {
 // before anything is written, so L may alias A), then x = A^-1 b in place (b: shared NV vector). Lane l holds rows l and
 // l + 32 (NV <= 64) in registers; the factorization is right-looking with column k broadcast by __shfl_sync, all loops
 // unrolled at compile time. L (packed lower triangle, with the true diagonal) is written to L for the back substitution
-// and for callers that keep it. With NV < 32 the lanes l >= NV hold no row (HAS0 false): their registers stay zero and
-// they neither read nor write A, L or b; for NV >= 32 HAS0 is the constant true (the code is that of the NV >= 32 build).
-#define HAS0(r0) (NV >= 32 || (r0) < NV)
+// and for callers that keep it.
 #ifndef CHOL_INLINE
 #define CHOL_INLINE __noinline__  // one copy of the (large, fully unrolled) code: -DCHOL_INLINE=__forceinline__ inlines it
 #endif
 __device__ CHOL_INLINE void chol_solve_reg(const float* A, float* L, float* b, int lane) {
   static_assert(NV <= 64, "two rows per lane");
   const int r0 = lane, r1 = lane + 32;
-  const bool has0 = HAS0(r0), has1 = r1 < NV;
+  const bool has1 = r1 < NV;
   float a0[NV], a1[NV], dinv[NV];
 #pragma unroll
-  for (int j = 0; j < NV; j++) {
-    a0[j] = has0 && j <= r0 ? A[TRI(r0, j)] : 0.f;
-    a1[j] = has1 && j <= r1 ? A[TRI(r1, j)] : 0.f;
-  }
+  for (int j = 0; j < NV; j++) { a0[j] = j <= r0 ? A[TRI(r0, j)] : 0.f; a1[j] = has1 && j <= r1 ? A[TRI(r1, j)] : 0.f; }
   __syncwarp();
 #pragma unroll
   for (int k = 0; k < NV; k++) {
@@ -393,8 +433,8 @@ __device__ CHOL_INLINE void chol_solve_reg(const float* A, float* L, float* b, i
     }
   }
 #pragma unroll
-  for (int j = 0; j < NV; j++) { if (has0 && j <= r0) L[TRI(r0, j)] = a0[j]; if (has1 && j <= r1) L[TRI(r1, j)] = a1[j]; }
-  float y0 = has0 ? b[r0] : 0.f, y1 = has1 ? b[r1] : 0.f;
+  for (int j = 0; j < NV; j++) { if (j <= r0) L[TRI(r0, j)] = a0[j]; if (has1 && j <= r1) L[TRI(r1, j)] = a1[j]; }
+  float y0 = b[r0], y1 = has1 ? b[r1] : 0.f;
 #pragma unroll
   for (int k = 0; k < NV; k++) {  // forward: L y = b, column-wise
     float yk = __shfl_sync(0xffffffffu, k < 32 ? y0 : y1, k & 31) * dinv[k];
@@ -409,7 +449,7 @@ __device__ CHOL_INLINE void chol_solve_reg(const float* A, float* L, float* b, i
     if (r0 == k) y0 = xk; else if (r0 < k) y0 -= L[TRI(k, r0)] * xk;
     if (r1 == k) y1 = xk; else if (r1 < k) y1 -= L[TRI(k, r1)] * xk;
   }
-  if (has0) b[r0] = y0;
+  b[r0] = y0;
   if (has1) b[r1] = y1;
   __syncwarp();
 }
@@ -422,13 +462,10 @@ __device__ CHOL_INLINE void chol_solve_reg(const float* A, float* L, float* b, i
 __device__ __noinline__ void chol_solve_compact(const float* A, float* L, float* b, int lane) {
   static_assert(NV <= 64, "two rows per lane");
   const int r0 = lane, r1 = lane + 32;
-  const bool has0 = HAS0(r0), has1 = r1 < NV;
+  const bool has1 = r1 < NV;
   float a0[NV], a1[NV];
 #pragma unroll
-  for (int j = 0; j < NV; j++) {
-    a0[j] = has0 && j <= r0 ? A[TRI(r0, j)] : 0.f;
-    a1[j] = has1 && j <= r1 ? A[TRI(r1, j)] : 0.f;
-  }
+  for (int j = 0; j < NV; j++) { a0[j] = j <= r0 ? A[TRI(r0, j)] : 0.f; a1[j] = has1 && j <= r1 ? A[TRI(r1, j)] : 0.f; }
   __syncwarp();
   for (int k = 0; k < NV; k++) {
     float dkk = fmaxf(__shfl_sync(0xffffffffu, k < 32 ? a0[0] : a1[0], k & 31), 1e-30f);
@@ -436,7 +473,7 @@ __device__ __noinline__ void chol_solve_compact(const float* A, float* L, float*
     inv = inv * (1.5f - 0.5f * dkk * inv * inv);
     float d = dkk * inv;
     float l0 = r0 > k ? a0[0] * inv : (r0 == k ? d : 0.f), l1 = r1 > k ? a1[0] * inv : (r1 == k ? d : 0.f);
-    if (has0 && r0 >= k) L[TRI(r0, k)] = l0;
+    if (r0 >= k) L[TRI(r0, k)] = l0;
     if (has1 && r1 >= k) L[TRI(r1, k)] = l1;
     if (r0 == k) l0 = 0.f;  // the pivot row takes no part in the trailing update
     if (r1 == k) l1 = 0.f;
@@ -453,10 +490,10 @@ __device__ __noinline__ void chol_solve_compact(const float* A, float* L, float*
     }
   }
   __syncwarp();
-  float y0 = has0 ? b[r0] : 0.f, y1 = has1 ? b[r1] : 0.f;
+  float y0 = b[r0], y1 = has1 ? b[r1] : 0.f;
   for (int k = 0; k < NV; k++) {  // forward: L y = b, column-wise
     float yk = __shfl_sync(0xffffffffu, k < 32 ? y0 : y1, k & 31) / L[TRI(k, k)];
-    if (r0 == k) y0 = yk; else if (has0 && r0 > k) y0 -= L[TRI(r0, k)] * yk;
+    if (r0 == k) y0 = yk; else if (r0 > k) y0 -= L[TRI(r0, k)] * yk;
     if (r1 == k) y1 = yk; else if (has1 && r1 > k) y1 -= L[TRI(r1, k)] * yk;
   }
   for (int k = NV - 1; k >= 0; k--) {  // backward: L^T x = y
@@ -464,7 +501,7 @@ __device__ __noinline__ void chol_solve_compact(const float* A, float* L, float*
     if (r0 == k) y0 = xk; else if (r0 < k) y0 -= L[TRI(k, r0)] * xk;
     if (r1 == k) y1 = xk; else if (has1 && r1 < k) y1 -= L[TRI(k, r1)] * xk;
   }
-  if (has0) b[r0] = y0;
+  b[r0] = y0;
   if (has1) b[r1] = y1;
   __syncwarp();
 }

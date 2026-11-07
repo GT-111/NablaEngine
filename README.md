@@ -1,18 +1,22 @@
 # NablaEngine
 
-**Fast, exact simulation gradients for the Unitree G1.**
+**Fast, exact simulation gradients for the Unitree G1 and other legged robots.**
 
 *Pronounced "Nabla Engine".*
 
-<p align="center"><img src="docs/assets/speed_rtx6000.png" alt="Time per control step: NablaEngine forward 1.21 ms, gradient of one step 1.78 ms" width="820"></p>
+<p align="center"><img src="docs/assets/speed_fwd.png" alt="Forward step: NablaEngine 1.21 ms per control step, against MuJoCo Warp, Genesis, Isaac Lab, MJX and MuJoCo C" width="820"></p>
+<p align="center"><img src="docs/assets/speed_bwd.png" alt="A step and its gradient: NablaEngine 1.78 ms, MuJoCo Warp with its adjoint pull request 20.5 ms" width="820"></p>
+<p align="center"><img src="docs/assets/speed_ppo.png" alt="Time per PPO iteration: NablaEngine 0.123 s, MuJoCo Warp 0.355 s" width="820"></p>
 
-<sub>Time per 20 ms control step for 4096 Unitree G1 worlds on one NVIDIA RTX PRO 6000: the forward step, and one
-step with its gradient from the input state. MuJoCo Warp and MJX simulate the same model (medians over 3 processes,
+<sub>One 20 ms control step for 4096 Unitree G1 worlds on one NVIDIA RTX PRO 6000 (forward, and forward with the
+gradient from the input state), and one PPO iteration (4096 environments x 24 steps, plus 20 gradient steps) with the
+same configuration. MuJoCo Warp and MJX simulate the same model (medians over 3 processes,
 `docs/results/paper_rtx6000/paper_bench.md`); Isaac Lab runs its own G1 asset with its task defaults (median over
-rounds, `docs/results/physx_rtx6000/physx_bench_results.md`).</sub>
+rounds, `docs/results/physx_rtx6000/physx_bench_results.md`). Other GPUs (H100, RTX 3090, V100): the
+[project page](https://sailab.ai/nablamimic/).</sub>
 
-NablaEngine is a differentiable GPU physics engine for the Unitree G1 humanoid. It simulates thousands of worlds per
-call with MuJoCo's physics and returns analytic gradients of every step with respect to the state and the actions,
+NablaEngine is a differentiable GPU physics engine for legged robots, built first for the Unitree G1 humanoid. It
+simulates thousands of worlds per call with MuJoCo's physics and returns analytic gradients of every step with respect to the state and the actions,
 for first-order policy learning, trajectory optimization and system identification. It plugs into JAX
 (`jax.jit`, `jax.grad`, `lax.scan`) and PyTorch (`torch.autograd`, CUDA graphs, `torch.compile`) as a differentiable
 function, with bitwise the same results in both.
@@ -31,12 +35,18 @@ the engine's simulation gradients.
 
 ## Scope
 
-NablaEngine is specialized for the Unitree G1 (the mjlab model), the first robot it supports: contacts between
-spheres, capsules and the floor, joint limits, PD position actuators, MuJoCo's Newton solver and implicitfast
-integration, in float32. Other models are rejected with an error that names the unsupported features.
-The Unitree H1 (`fixtures/h1`, converted from MuJoCo Menagerie the same way by `scripts/make_h1_model.py`) is the
-second: it is checked against float64 MuJoCo (`scripts/h1_check.py`: forward median relative error 3.6e-7, exact-mode
-gradients 1.5e-7 on contact-free states) but not yet benchmarked like the G1.
+NablaEngine is specialized for one class of robot models, with the Unitree G1 (the mjlab model) as the first:
+- a floating base with one hinge per body;
+- contacts between planes, spheres, capsules and boxes;
+- joint limits, PD position actuators;
+- MuJoCo's Newton solver and implicitfast integration, in float32.
+
+Beyond the G1 it is validated on the Unitree Go1, Go2, A1 and H1, ANYbotics ANYmal C, Boston Dynamics Spot,
+Booster T1, ROBOTIS OP3 and Berkeley Humanoid (`docs/robots.md`).
+
+Terrain builds add static boxes and heightfields with a height scan (`docs/terrain.md`).
+
+Other models are rejected with an error that names the unsupported features.
 
 Requirements: Linux x86_64, an NVIDIA GPU of compute capability 7.0 or newer (tested: V100, RTX 3090, H100, RTX PRO
 6000), Python 3.12, and a CUDA 12.x toolkit (nvcc) for the one-time build of the CUDA library (about 15 s, cached).
@@ -108,25 +118,13 @@ centre-of-mass offset `com (B, 3)` for domain randomization. Each world holds up
 rows; a world beyond them (e.g. deep interpenetration after a fall) drops the extra ones and is flagged and counted
 (`docs/api.md`, Diagnostics).
 
-## Example: trajectory optimization
-
-`examples/squat_trajopt.py` finds open-loop joint targets that make the G1 squat 15 cm and stand up again, by gradient
-descent through a 3 s rollout (`jax.grad` through `lax.scan` of `jax_ffi.step`): 400 Adam iterations, about 35 s on
-an RTX 4060 Laptop GPU. The naive targets (left) fall; the optimized ones (right) follow the reference pelvis height
-within 4 cm, and replayed open loop in float64 MuJoCo they give the same motion (qpos within 4e-5).
-
-<p align="center"><img src="docs/assets/squat_trajopt.gif" alt="Naive joint targets make the G1 fall; targets optimized with jax.grad squat and stand up" width="480"></p>
-
-```bash
-python examples/squat_trajopt.py --out runs/squat        # squat.mp4, squat.npz; --gif for the animation above
-python examples/squat_trajopt.py --robot h1 --out runs/squat_h1   # the same for the Unitree H1 (fixtures/h1)
-```
-
 ## Documentation
 
 - `docs/api.md`: the JAX interface: options, gradient modes, kinematics outputs, rollouts with `lax.scan` and
   `jax.checkpoint`, diagnostics.
 - `docs/api_torch.md`: the PyTorch interface: the build artifact, CUDA graphs, `torch.compile`, several GPUs.
+- `docs/robots.md`: other robots: exporting and checking a model, accuracy and timings.
+- `docs/terrain.md`: terrain builds: boxes, heightfields, the height scan.
 - `docs/verification.md`: what `scripts/verify.sh` checks, against which references.
 - `docs/configuration.md`: environment variables and build switches.
 - `benchmarks/README.md`, `scripts/paper_bench/README.md`: reproduce the accuracy tables and the timings.

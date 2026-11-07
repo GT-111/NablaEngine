@@ -45,7 +45,7 @@ On a V100 (sm_70) install a PyTorch build that still targets sm_70, e.g. the CUD
 
 | entry | as in jax_ffi | notes |
 |---|---|---|
-| `init(device=None, artifact=None, model_dir=None, model=None, foot_pairs=None)` | `init` | loads the artifact (building it if needed) and uploads the model constants to `device` (default: the current CUDA device); the first call on a device synchronizes it; one architecture per process |
+| `init(device=None, artifact=None, model_dir=None, model=None, foot_pairs=None, terrain=None, com_body=None)` | `init` | loads the artifact (building it if needed) and uploads the model constants to `device` (default: the current CUDA device); the first call on a device synchronizes it; one architecture per process |
 | `build(arch, ...)`, `python -m nablaengine.torch_ffi build` | | the artifact for an architecture (mujoco and nvcc needed) |
 | `step(qpos, qvel, warm, ctrl, friction, com, *, iterations=10, substeps=4, clamp_kv=0, normal=3, clamp_soft=None, grad_decay=1.0, kinematics=False)` | `step` | a `torch.autograd.Function`; the tape is written only when an input requires grad; `warm'` is not differentiable |
 | `kinematics(qpos, qvel, com)` | `kinematics` | differentiable in `qpos` and `qvel` |
@@ -54,6 +54,8 @@ On a V100 (sm_70) install a PyTorch build that still targets sm_70, e.g. the CUD
 | `diagnostics(device=None)`, `read_diagnostics(device=None, reset=True)` | `diagnostics`, `read_diagnostics` | the counters of `jax_ffi.DIAG`, kept per device (below) |
 | `set_diagnostics(enabled)` | | the counters on (default) or off; returns the previous setting |
 | `tape_bytes(nworld, substeps=4, steps=1)` | `tape_bytes` | |
+| `set_terrain(terrain, device=None, cell=1.0)` | `set_terrain` | uploads a `nablaengine.terrain.Terrain` for a terrain build (`init(terrain=TerrainConfig(...))`, `docs/terrain.md`) |
+| `grid_pattern(size, resolution, direction, device=None)`, `raycast(pos, rot, offsets, directions, alignment="base", max_distance=10.0)` | `grid_pattern`, `raycast` | the height scan of a terrain build (no gradient) |
 
 Every tensor is float32, contiguous and on one CUDA device, with the worlds as the leading dimension; another dtype,
 device, layout or shape raises `TypeError` (nothing is cast or copied). Every call runs on PyTorch's current CUDA

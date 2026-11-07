@@ -1,15 +1,26 @@
 # Changelog
 
-## Unreleased
+## 0.2.0
 
-- The Unitree H1 (`fixtures/h1`, nv 25), converted from MuJoCo Menagerie by `scripts/make_h1_model.py` after the mjlab
-  G1 recipe and checked against MuJoCo C in float64 by `scripts/h1_check.py` (in `scripts/verify.sh`).
-- Models with nv < 32: the Cholesky and triangular solves mask the lanes past NV; capability H3 is now a warning
-  (checked on the H1 only). The G1's builds are unchanged (identical PTX and SASS on sm_70, sm_86, sm_89, sm_90).
-- `nablaengine.fixtures.load_model(fixtures.H1)`: a fixtures directory holds `<prefix>_train.mjb` and
-  `<prefix>_meta.json`, prefix `g1` or `h1`.
-- `scripts/visualize_rollout.py` (a visual check against MuJoCo) and `examples/squat_trajopt.py` (trajectory
-  optimization through the engine's gradients; `--robot h1` for the H1).
+- **Other robots.** Models of the engine's class beyond the G1:
+  - 7 to 64 dofs (the G1 has 35) and up to 8 children per body (quadrupeds);
+  - joint damping and frictionloss;
+  - box-box contacts following MuJoCo Warp's general convex collision (GJK, EPA, multi-contact clipping), with an
+    exact adjoint;
+  - `init(com_body=...)` names the body of the per-world COM offset.
+
+  Validated against MuJoCo Warp and float64 MuJoCo on the Unitree Go1, Go2, A1 and H1, ANYbotics ANYmal C, Boston
+  Dynamics Spot, Booster T1, ROBOTIS OP3 and Berkeley Humanoid (`docs/robots.md`, `docs/api.md` Other robots).
+  `scripts/robots/` exports and checks a model. The G1's builds are unchanged (bitwise).
+  The Unitree H1 was first brought to the engine by @ShaoxiongYao in #1; 0.2.0's implementation supersedes it.
+- **Terrain.** Static boxes and heightfields shared by every world, uploaded at run time without recompiling:
+  - MuJoCo's closed-form box contacts;
+  - two heightfield contact modes (analytic sample points, or MuJoCo's prisms measured exactly);
+  - the adjoint;
+  - a height scan (`raycast`, as mjlab's `RayCastSensor`).
+
+  Available in PyTorch and JAX (`init(terrain=TerrainConfig(...))`, `set_terrain`; `docs/terrain.md`). Checked against
+  MuJoCo Warp with `scripts/terrain_check.py` on the committed scenes `fixtures/mjlab/g1_terrain_*.mjb`.
 
 ## 0.1.0
 

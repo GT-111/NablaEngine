@@ -1,0 +1,55 @@
+{
+ "description": "Time per control step of the G1 (4 substeps, 10 iterations; CUDA events, median of 30 after warm-up) at 4096 worlds, scripts/terrain_check.py time, states of each scene's reference tiled: flat (the floor build on the same states), and terrain builds with geoms='feet' in the analytic and native heightfield modes; the GPU otherwise idle.",
+ "provenance": {
+  "commit": null,
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition, driver 595.58.03",
+  "nvcc": "Build cuda_12.8.r12.8/compiler.35583870_0",
+  "torch": "2.13.0+cu129",
+  "date": "2026-11-06",
+  "commit_note": "a revision before this repository's history: not recorded"
+ },
+ "results": [
+  {
+   "mode": "flat",
+   "nworld": 4096,
+   "forward_ms": 0.986,
+   "forward_backward_ms": 1.627,
+   "scene": "test terrain (fixtures/mjlab/g1_terrain_feet.mjb)"
+  },
+  {
+   "mode": "analytic",
+   "nworld": 4096,
+   "forward_ms": 1.539,
+   "forward_backward_ms": 2.294,
+   "scene": "test terrain (fixtures/mjlab/g1_terrain_feet.mjb)"
+  },
+  {
+   "mode": "native",
+   "nworld": 4096,
+   "forward_ms": 2.183,
+   "forward_backward_ms": 3.105,
+   "scene": "test terrain (fixtures/mjlab/g1_terrain_feet.mjb)"
+  },
+  {
+   "mode": "flat",
+   "nworld": 4096,
+   "forward_ms": 1.088,
+   "forward_backward_ms": 1.743,
+   "scene": "mjlab ROUGH_TERRAINS_CFG"
+  },
+  {
+   "mode": "analytic",
+   "nworld": 4096,
+   "forward_ms": 1.513,
+   "forward_backward_ms": 2.253,
+   "scene": "mjlab ROUGH_TERRAINS_CFG"
+  },
+  {
+   "mode": "native",
+   "nworld": 4096,
+   "forward_ms": 2.091,
+   "forward_backward_ms": 2.963,
+   "scene": "mjlab ROUGH_TERRAINS_CFG"
+  }
+ ]
+}

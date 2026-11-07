@@ -1,0 +1,274 @@
+{
+ "description": "Terrain builds vs MuJoCo Warp (scripts/terrain_check.py): one control step (4 substeps, 10 iterations) of 1024 corpus states (mf_s0) placed on the test terrain of fixtures/mjlab/g1_terrain_{feet,body}.mjb; regions 0 stairs (boxes), 1 rotated box obstacle, 2 heightfield (41 x 41, 0.1 m grid, heights up to 0.06 m). MuJoCo Warp's heightfield contacts are its native convex ones; the engine's heightfield modes are its own (analytic: sample points; native: MuJoCo's prisms measured exactly), so region 2 differs by construction. grad: the engine's VJP against float32 central differences of the engine itself (flat: the floor build on the corpus states, the finite differences' own noise). rays: torch_ffi.raycast against MuJoCo Warp's rays. vjp_torch_vs_jax: the same step and ctrl VJP through both interfaces.",
+ "provenance": {
+  "commit": null,
+  "gpu": "Tesla V100-SXM2-16GB, 550.90.07",
+  "mujoco": "3.17.0",
+  "mujoco_warp": "3.17.0",
+  "warp": "1.18.0+cu12",
+  "date": "2026-11-06",
+  "commit_note": "a revision before this repository's history: not recorded"
+ },
+ "check": {
+  "feet_analytic": {
+   "nworld": 1024,
+   "geoms": "feet",
+   "boxes": 8,
+   "hfields": 1,
+   "qvel_rel_median": 1.2401646927173715e-06,
+   "qvel_rel_p99": 0.4678072929382324,
+   "qvel_rel_max": 0.8522149324417114,
+   "qpos_abs_median": 1.3851968105882406e-07,
+   "qpos_abs_max": 0.13392728567123413,
+   "ncon_equal": 0.8115234375,
+   "ncon_mean": 4.4404296875,
+   "overflow": 0,
+   "region0_qvel_rel_median": 8.440991337010928e-07,
+   "region0_ncon_equal": 1.0,
+   "region1_qvel_rel_median": 1.1524373348947847e-06,
+   "region1_ncon_equal": 1.0,
+   "region2_qvel_rel_median": 0.06410779058933258,
+   "region2_ncon_equal": 0.438953488372093,
+   "nocontact_worlds": 251,
+   "nocontact_qvel_rel_median": 3.1288931268136366e-07
+  },
+  "feet_native": {
+   "nworld": 1024,
+   "geoms": "feet",
+   "boxes": 8,
+   "hfields": 1,
+   "qvel_rel_median": 1.2401646927173715e-06,
+   "qvel_rel_p99": 0.4553675651550293,
+   "qvel_rel_max": 0.8407315015792847,
+   "qpos_abs_median": 1.3851968105882406e-07,
+   "qpos_abs_max": 0.13362115621566772,
+   "ncon_equal": 0.810546875,
+   "ncon_mean": 4.517578125,
+   "overflow": 0,
+   "region0_qvel_rel_median": 8.440991337010928e-07,
+   "region0_ncon_equal": 1.0,
+   "region1_qvel_rel_median": 1.1524373348947847e-06,
+   "region1_ncon_equal": 1.0,
+   "region2_qvel_rel_median": 0.058469511568546295,
+   "region2_ncon_equal": 0.436046511627907,
+   "nocontact_worlds": 251,
+   "nocontact_qvel_rel_median": 3.1288931268136366e-07
+  },
+  "body_analytic": {
+   "nworld": 1024,
+   "geoms": "body",
+   "boxes": 8,
+   "hfields": 1,
+   "qvel_rel_median": 1.2515462231021957e-06,
+   "qvel_rel_p99": 0.5032638311386108,
+   "qvel_rel_max": 0.852215051651001,
+   "qpos_abs_median": 1.4435499906539917e-07,
+   "qpos_abs_max": 0.13392728567123413,
+   "ncon_equal": 0.8115234375,
+   "ncon_mean": 4.455078125,
+   "overflow": 0,
+   "region0_qvel_rel_median": 8.692299502399692e-07,
+   "region0_ncon_equal": 1.0,
+   "region1_qvel_rel_median": 1.1952693057537545e-06,
+   "region1_ncon_equal": 1.0,
+   "region2_qvel_rel_median": 0.06410779803991318,
+   "region2_ncon_equal": 0.438953488372093,
+   "nocontact_worlds": 251,
+   "nocontact_qvel_rel_median": 3.1288931268136366e-07
+  },
+  "body_native": {
+   "nworld": 1024,
+   "geoms": "body",
+   "boxes": 8,
+   "hfields": 1,
+   "qvel_rel_median": 1.2515462231021957e-06,
+   "qvel_rel_p99": 0.46009308099746704,
+   "qvel_rel_max": 0.8407315015792847,
+   "qpos_abs_median": 1.471489667892456e-07,
+   "qpos_abs_max": 0.13362115621566772,
+   "ncon_equal": 0.8125,
+   "ncon_mean": 4.5322265625,
+   "overflow": 0,
+   "region0_qvel_rel_median": 8.767027566136676e-07,
+   "region0_ncon_equal": 1.0,
+   "region1_qvel_rel_median": 1.1952693057537545e-06,
+   "region1_ncon_equal": 1.0,
+   "region2_qvel_rel_median": 0.058166276663541794,
+   "region2_ncon_equal": 0.4418604651162791,
+   "nocontact_worlds": 251,
+   "nocontact_qvel_rel_median": 3.1288931268136366e-07
+  }
+ },
+ "grad": {
+  "analytic": {
+   "nworld": 1024,
+   "flat": false,
+   "geoms": "feet",
+   "qpos": {
+    "rel_median": 0.004875591217562255,
+    "rel_p90": 0.377230693177514,
+    "same_contacts": 0.93359375,
+    "region0_rel_median": 0.007405859831095972,
+    "region1_rel_median": 0.00413921070115691,
+    "region2_rel_median": 0.004640788198254086
+   },
+   "qvel": {
+    "rel_median": 0.006213281079904202,
+    "rel_p90": 0.06122071851013271,
+    "same_contacts": 0.9951171875,
+    "region0_rel_median": 0.00712557646804066,
+    "region1_rel_median": 0.005233039342580638,
+    "region2_rel_median": 0.00621188883827394
+   },
+   "ctrl": {
+    "rel_median": 0.0005354049397758396,
+    "rel_p90": 0.007423286422722044,
+    "same_contacts": 0.994140625,
+    "region0_rel_median": 0.0007159149660898391,
+    "region1_rel_median": 0.0005532657200811359,
+    "region2_rel_median": 0.0004395163142437604
+   }
+  },
+  "native": {
+   "nworld": 1024,
+   "flat": false,
+   "geoms": "feet",
+   "qpos": {
+    "rel_median": 0.006658131497053565,
+    "rel_p90": 0.8280609886734833,
+    "same_contacts": 0.9326171875,
+    "region0_rel_median": 0.007405859831095972,
+    "region1_rel_median": 0.00413921070115691,
+    "region2_rel_median": 0.01094069487411417
+   },
+   "qvel": {
+    "rel_median": 0.007373958154407905,
+    "rel_p90": 0.11447182995952367,
+    "same_contacts": 0.994140625,
+    "region0_rel_median": 0.007230552782064083,
+    "region1_rel_median": 0.005233039342580638,
+    "region2_rel_median": 0.013034855769230769
+   },
+   "ctrl": {
+    "rel_median": 0.0006744463695010066,
+    "rel_p90": 0.012575407810532858,
+    "same_contacts": 0.9931640625,
+    "region0_rel_median": 0.0007159149660898391,
+    "region1_rel_median": 0.0005532657200811359,
+    "region2_rel_median": 0.0009108472826487722
+   }
+  },
+  "flat": {
+   "nworld": 1024,
+   "flat": true,
+   "geoms": null,
+   "qpos": {
+    "rel_median": 0.004734891949955769,
+    "rel_p90": 0.9685128126557001,
+    "same_contacts": 0.8720703125
+   },
+   "qvel": {
+    "rel_median": 0.004769542729099754,
+    "rel_p90": 0.03466935773574558,
+    "same_contacts": 0.986328125
+   },
+   "ctrl": {
+    "rel_median": 0.0006252944076244728,
+    "rel_p90": 0.00729085649120936,
+    "same_contacts": 0.9931640625
+   }
+  }
+ },
+ "rays": {
+  "down_yaw": {
+   "rays": 191488,
+   "hit_agree": 1.0,
+   "hit_share": 1.0,
+   "dist_abs_median": 0.0,
+   "dist_abs_max": 2.384185791015625e-07,
+   "normal_abs_max": 1.1920928955078125e-07,
+   "dist_abs_gt_1e4": 0,
+   "normal_abs_gt_1e3": 0
+  },
+  "slant_base": {
+   "rays": 123904,
+   "hit_agree": 1.0,
+   "hit_share": 0.9832935175619835,
+   "dist_abs_median": 0.0,
+   "dist_abs_max": 5.7220458984375e-06,
+   "normal_abs_max": 1.1920928955078125e-07,
+   "dist_abs_gt_1e4": 0,
+   "normal_abs_gt_1e3": 0
+  }
+ },
+ "vjp_torch_vs_jax": {
+  "q1": "bitwise",
+  "v1": "bitwise",
+  "ctrl_grad": "bitwise",
+  "ray_distance_max_abs": 2.98e-07,
+  "ray_normal": "bitwise"
+ },
+ "mjlab_rough": {
+  "note": "mjlab's ROUGH_TERRAINS_CFG terrain (10 x 20 sub-terrains of 7 types; 2319 boxes and 69 heightfields, generated with mjlab, not committed), the same G1 and corpus, states placed at random sub-terrain origins (regions: the sub-terrain type index), feet, against MuJoCo Warp 3.17.0",
+  "analytic": {
+   "nworld": 1024,
+   "geoms": "feet",
+   "boxes": 2319,
+   "hfields": 69,
+   "qvel_rel_median": 1.9706144485098775e-06,
+   "qvel_rel_p99": 0.39164116978645325,
+   "qvel_rel_max": 1.2055084705352783,
+   "qpos_abs_median": 1.7881393432617188e-07,
+   "qpos_abs_max": 0.335659384727478,
+   "ncon_equal": 0.853515625,
+   "ncon_mean": 4.40234375,
+   "overflow": 0,
+   "region0_qvel_rel_median": 2.428632797091268e-06,
+   "region0_ncon_equal": 0.8520408163265306,
+   "region1_qvel_rel_median": 1.7145675883512013e-06,
+   "region1_ncon_equal": 0.8238341968911918,
+   "region2_qvel_rel_median": 1.8397814756099251e-06,
+   "region2_ncon_equal": 0.8316831683168316,
+   "region3_qvel_rel_median": 2.268969637952978e-06,
+   "region3_ncon_equal": 0.8220338983050848,
+   "region4_qvel_rel_median": 1.4733517446074984e-06,
+   "region4_ncon_equal": 0.9130434782608695,
+   "region5_qvel_rel_median": 1.8173909666074906e-06,
+   "region5_ncon_equal": 0.9381443298969072,
+   "region6_qvel_rel_median": 2.265065859319293e-06,
+   "region6_ncon_equal": 0.8446601941747572,
+   "nocontact_worlds": 291,
+   "nocontact_qvel_rel_median": 8.695798783264763e-07
+  },
+  "native": {
+   "nworld": 1024,
+   "geoms": "feet",
+   "boxes": 2319,
+   "hfields": 69,
+   "qvel_rel_median": 1.9706144485098775e-06,
+   "qvel_rel_p99": 0.3794799745082855,
+   "qvel_rel_max": 1.2055084705352783,
+   "qpos_abs_median": 1.7881393432617188e-07,
+   "qpos_abs_max": 0.432565838098526,
+   "ncon_equal": 0.857421875,
+   "ncon_mean": 4.162109375,
+   "overflow": 0,
+   "region0_qvel_rel_median": 2.417757968942169e-06,
+   "region0_ncon_equal": 0.8673469387755102,
+   "region1_qvel_rel_median": 1.6798966271380777e-06,
+   "region1_ncon_equal": 0.7979274611398963,
+   "region2_qvel_rel_median": 1.8397814756099251e-06,
+   "region2_ncon_equal": 0.8415841584158416,
+   "region3_qvel_rel_median": 2.268969637952978e-06,
+   "region3_ncon_equal": 0.847457627118644,
+   "region4_qvel_rel_median": 1.4733517446074984e-06,
+   "region4_ncon_equal": 0.9130434782608695,
+   "region5_qvel_rel_median": 1.8173909666074906e-06,
+   "region5_ncon_equal": 0.9381443298969072,
+   "region6_qvel_rel_median": 2.265065859319293e-06,
+   "region6_ncon_equal": 0.8543689320388349,
+   "nocontact_worlds": 291,
+   "nocontact_qvel_rel_median": 8.695798783264763e-07
+  }
+ }
+}

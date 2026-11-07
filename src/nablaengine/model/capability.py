@@ -13,7 +13,7 @@ assumption into a finding with a code:
   info   a documented semantic difference (H11c: the engine does not clamp ctrl to ctrlrange)
 
 Codes: H1-H31 the requirements on the model's structure and physics (H7b, H11b-e, H14b-d, H26a / b subdivide a code),
-U1-U7 the untested code paths, I1 a recorded value, F0 a field this classification does not know (a newer MuJoCo);
+U1-U10 the untested code paths, I1 a recorded value, F0 a field this classification does not know (a newer MuJoCo);
 every finding states its requirement (what) and the model's value. Besides the explicit checks, every MjModel field of
 kind "default" (nablaengine.model.fields: physics the engine does not model, e.g. actuator_damping, actuator_armature,
 actuator_delay, dof_dampingpoly, geom_fluid) must equal MuJoCo's compile default, else an error under the field's
@@ -225,8 +225,7 @@ def check(m, foot_pairs=None, com_body=COM_BODY, scope="engine"):
         ("forward", "kinematics"))
     add("H2", nb <= 31, "error", "at most 31 bodies in the adjoint (lanes 0 and 31 carry root rotation dofs)", nb,
         ("adjoint",))
-    add("H3", nv >= 32, "warn", "nv >= 32 (the Cholesky / triangular solves give lane l dof row l; with nv < 32 the "
-        "lanes past NV are masked, a path checked on the Unitree H1 only, nv 25: scripts/h1_check.py)", nv)
+    add("H3", nv >= 7, "error", "nv >= 7 (a free root and at least one hinge)", nv)
     add("H4", nv <= 64, "error", "nv <= 64 (two rows per lane)", nv)
     add("H5", 33 <= nv <= 35, "warn", "33 <= nv <= 35: the tuned CHOL_BCAST / NEWTON_REUSE / blocked triangular solve "
         "(else the register Cholesky fallback: untested on a corpus, slower)", nv, ("forward", "adjoint"))
@@ -250,7 +249,7 @@ def check(m, foot_pairs=None, com_body=COM_BODY, scope="engine"):
         {_name(m, mujoco.mjtObj.mjOBJ_JOINT, j): float(m.qpos0[m.jnt_qposadr[j]]) for j in q0[:8]},
         ("forward", "kinematics"))
     nch = max((len(c) for c in children[1:]), default=0)
-    add("H9", nch <= 3, "error", "at most 3 children per body (c_child)", nch)
+    add("H9", nch <= 8, "error", "at most 8 children per body (c_child; model_hooks.py beyond 3)", nch)
 
     def nanc(b):
         k, n = parent[b], 0
@@ -298,9 +297,11 @@ def check(m, foot_pairs=None, com_body=COM_BODY, scope="engine"):
     tnames = sorted({mujoco.mjtGeom(int(m.geom_type[g])).name for g in cg})
     add("H14a", types <= FORWARD_TYPES, "error", "contact pair geoms are planes, spheres, capsules or boxes", tnames)
     planes_off_world = [g for g in cg if m.geom_type[g] == G.mjGEOM_PLANE and m.geom_bodyid[g] != 0]
-    add("H14b", types <= ADJOINT_TYPES and not planes_off_world, "error", "contact pair geoms are planes (on the world "
-        "body), spheres or capsules in the adjoint", dict(types=tnames, planes_off_world=planes_off_world[:4]),
-        ("adjoint",))
+    box_ok = all(0 in _pair_codes(m, p) or _pair_codes(m, p) == (3, 3) for p in range(m.npair)
+                 if 3 in _pair_codes(m, p))  # plane-box and box-box (model_hooks.py)
+    add("H14b", (types <= ADJOINT_TYPES or (types <= ADJOINT_TYPES | {3} and box_ok)) and not planes_off_world, "error",
+        "contact pair geoms are planes (on the world body), spheres or capsules in the adjoint, and boxes in pairs "
+        "with planes (model_hooks.py)", dict(types=tnames, planes_off_world=planes_off_world[:4]), ("adjoint",))
     combos = sorted({_pair_codes(m, p) for p in range(m.npair)} - DISPATCHED)
     add("H14c", not combos, "error", "every pair's type combination is one the forward collides (not plane-plane, "
         "sphere-box)", combos)
@@ -338,8 +339,8 @@ def check(m, foot_pairs=None, com_body=COM_BODY, scope="engine"):
     add("H20", bool(uni and not m.jnt_margin.any() and dof_uni and not lim_free), "error",
         "one solref / solimp for every joint limit and every dof, jnt_margin 0, only hinge limits",
         dict(limited_non_hinge=lim_free[:4]))
-    add("H21", not (m.dof_frictionloss > 0).any(), "error", "no frictionloss in the adjoint (the forward has it)",
-        int((m.dof_frictionloss > 0).sum()), ("adjoint",))
+    add("U10", not (m.dof_frictionloss > 0).any(), "warn", "no frictionloss rows (the G1's; their adjoint, "
+        "model_hooks.py, is untested on a held-out corpus)", int((m.dof_frictionloss > 0).sum()), ("adjoint",))
 
     # ---- passive forces, integrator, solver, options
     medium = dict(density=float(m.opt.density), viscosity=float(m.opt.viscosity), wind=[float(x) for x in m.opt.wind])
@@ -388,6 +389,10 @@ def check(m, foot_pairs=None, com_body=COM_BODY, scope="engine"):
         ("kinematics",))
 
     # ---- untested code paths
+    add("U8", nv >= 32, "warn", "nv >= 32 (the G1's; below, the solves' spare lanes repeat the last row: model_hooks.py, "
+        "untested on a held-out corpus)", nv)
+    add("U9", nch <= 3, "warn", "at most 3 children per body (the G1's; beyond, model_hooks.py widens c_child: untested "
+        "on a held-out corpus)", nch)
     add("U1", not (33 <= nv <= 34), "warn", "CHOL_BCAST's tail of nv - 32 rows: only the G1's 3-row tail (nv 35) ran on "
         "a corpus", nv, ("forward", "adjoint"))
     add("U2", not gen or kdof == 16, "warn", "KDOF = 16 (the G1's): otherwise DK_JV_VEC's 128-bit con_jv loads are off and the "

@@ -173,7 +173,8 @@ import numpy as np
 import nablaengine
 from nablaengine import cuda, fixtures, provenance
 from nablaengine.model import capability
-from nablaengine.g1_engine import adjoint, host, kinematics as g1_kin, step as g1_step, tape as g1_tape
+from nablaengine import engines
+from nablaengine.g1_engine import adjoint, kinematics as g1_kin
 
 ITERATIONS, SUBSTEPS, CLAMP_KV, NORMAL = 10, 4, 0, 3  # the interface defaults
 CLAMP_SOFT, GRAD_DECAY = 0.2, 1.0  # clamp_kv=2's default delta; the default gradient decay factor (no decay)
@@ -796,6 +797,26 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(DkLast, last_impl,
                                   .Ret<ffi::Buffer<ffi::U32>>());
 """
 
+# terrain builds (nablaengine.terrain): the height scan's FFI handler, rays against the terrain (raycast)
+FFI_TERRAIN = r"""
+extern "C" int @FWD@_terrain_rays(cudaStream_t, int, const float*, const float*, float, float*, float*);
+static ffi::Error rays_impl(cudaStream_t st, BufF pnt, BufF vec, float maxd, RetF dist, RetF nrm) {
+  auto d = pnt.dimensions();
+  if (d.size() != 3 || d[2] != 3) return bad("ray origins must be (B, N, 3) float32");
+  const int64_t B = d[0], N = d[1];
+  if (!dims_are(vec, {B, N, 3}) || !dims_are(*dist, {B, N}) || !dims_are(*nrm, {B, N, 3}))
+    return bad("shapes: origins, directions (B, N, 3), distances (B, N), normals (B, N, 3)");
+  if (B * N > INT_MAX) return bad("too many rays");
+  if (B * N == 0) return ffi::Error::Success();
+  int rc = @FWD@_terrain_rays(st, (int)(B * N), pnt.typed_data(), vec.typed_data(), maxd, dist->typed_data(),
+                              nrm->typed_data());
+  return rc ? cuda_error((cudaError_t)rc, "k_terrain_rays launch") : ffi::Error::Success();
+}
+XLA_FFI_DEFINE_HANDLER_SYMBOL(DkTerrainRays, rays_impl,
+                              ffi::Ffi::Bind().Ctx<ffi::PlatformStream<cudaStream_t>>() F32ARG F32ARG
+                                  .Attr<float>("max_distance") F32RET F32RET);
+"""
+
 _LOCK = threading.Lock()
 _STATE = {}  # the loaded library (init)
 STATS = dict(builds=0, build_seconds=0.0, loads=0)  # this process: nvcc builds (cache misses) and library loads
@@ -805,28 +826,36 @@ def _tag(v):
     return f"dk_kv{v[0]}_n{v[1]}"
 
 
-def _model(model_dir=None, model=None, foot_pairs=None):
-    """(MjModel, foot_pairs): the given model, else the fixtures directory (model_dir, else fixtures.fixtures_dir():
-    $DK_FIXTURES, else fixtures/mjlab)."""
+def _model(model_dir=None, model=None, foot_pairs=None, com_body=None):
+    """(MjModel, foot_pairs, COM-offset body name): the given model, else the fixtures directory (model_dir, else
+    fixtures.fixtures_dir(): $DK_FIXTURES, else fixtures/mjlab; its meta's torso_body)."""
     if model is not None:
         assert foot_pairs is not None, "init(model=...) needs foot_pairs (the foot-floor pair indices)"
-        return model, [int(p) for p in foot_pairs]
+        return model, [int(p) for p in foot_pairs], com_body or capability.COM_BODY
     d = model_dir or fixtures.fixtures_dir()
     m, mt = fixtures.load_model(d, check=None)  # init checks the engine scope next
-    return m, mt["foot_pairs"]
+    return m, mt["foot_pairs"], com_body or mt.get("torso_body", capability.COM_BODY)
 
 
-def library_sources(m, foot_pairs, forward_unit=False, target=None):
+def library_sources(m, foot_pairs, forward_unit=False, target=None, terrain=None, com_body=None):
     """({file name: CUDA source} of the library's translation units, the packed constants, the per-unit -D options).
     forward_unit: the forward and kinematics kernels in a unit of their own, FWD_UNIT.cu (the text of FWD_VARIANT's unit,
     built with other architecture flags: cuda.arch_flags('forward')), every adjoint variant's unit without them. target:
     the build target (default cuda.arch()), whose forward-unit -D options (cuda.unit_defines: the register caps on
-    sm_90) the unit with the forward kernels gets."""
-    consts, lays, sizes = adjoint.engine_constants(m, foot_pairs)
+    sm_90) the unit with the forward kernels gets. terrain: a nablaengine.terrain.TerrainConfig (a terrain build: every
+    unit gets <unit>_set_terrain; the PyTorch interface's library only). com_body: the COM-offset body."""
+    E = engines.modules(m)  # the model's engine (g1_engine for the G1 class: the text unchanged)
+    adjoint, host, model_hooks, g1_kin, g1_step, g1_tape = E.adjoint, E.host, E.model_hooks, E.kinematics, E.step, E.tape
+    ter = None
+    if terrain is not None:
+        from nablaengine import terrain as _terrain
+        ter = (terrain, _terrain.robot_terrain_geoms(m, foot_pairs, terrain.geoms))
+    consts, lays, sizes = adjoint.engine_constants(m, foot_pairs, ter, com_body)
     load = host.loader(lays, sizes)
     load = re.sub(r"cudaMemcpyToSymbol\(([^;]*)\);", r"cudaMemcpyToSymbolAsync(\1, 0, cudaMemcpyHostToDevice, st);", load)
     assert "cudaMemcpyToSymbol(" not in load
-    engine = adjoint.cuda_source(m)
+    mc = terrain.maxcon if terrain is not None and terrain.maxcon else g1_step.maxcon(m)
+    engine = adjoint.cuda_source(m, terrain.maxcon if terrain is not None else None, ter)
     assert engine.count("#include <cuda_runtime.h>\n") == 1 and engine.count("#include") == 1, \
         "the engine source may only include cuda_runtime.h (it is wrapped in a namespace)"
     engine = engine.replace("#include <cuda_runtime.h>\n", "")
@@ -838,7 +867,17 @@ def library_sources(m, foot_pairs, forward_unit=False, target=None):
                                       "(int)sizeof(Sim));" if fwd else "")
                .replace("@PFX@", pfx).replace("@MAX_DEVICES@", str(MAX_DEVICES))
                .replace("@UPLOAD_ERR_SMEM@", str(UPLOAD_ERR_SMEM)).replace("@LOAD_CONSTS@", load)
-               .replace("@ENGINE@", engine + (host.KERNEL + g1_kin.KIN_DEVICE if fwd else "")))  # last: never scanned
+               .replace("@ENGINE@", engine + (host.KERNEL + model_hooks.apply(g1_kin.KIN_DEVICE, m, "kinematics")
+                                              if fwd else "")))  # last: never scanned
+        if ter is not None:  # the terrain's device pointers (nablaengine.terrain; set per device after the upload)
+            src += (f'extern "C" int {pfx}_set_terrain(int dev, const void* p) {{\n'
+                    f'  int old = 0;\n  cudaGetDevice(&old);\n  cudaError_t e = cudaSetDevice(dev);\n'
+                    f'  if (e == cudaSuccess) e = cudaMemcpyToSymbol(g_ter, p, sizeof(TerrainPtrs));\n'
+                    f'  cudaSetDevice(old);\n  return (int)e;\n}}\n'
+                    f'extern "C" int {pfx}_terrain_rays(cudaStream_t st, int n, const float* pnt, const float* vec, '
+                    f'float maxd, float* dist, float* nrm) {{\n'
+                    f'  if (n > 0) k_terrain_rays<<<(n + 127) / 128, 128, 0, st>>>(n, pnt, vec, maxd, dist, nrm);\n'
+                    f'  return (int)cudaGetLastError();\n}}\n')
         units[f"{pfx}.cu"] = src
         defines[f"{pfx}.cu"] = [f"-DDK_ADJ_CLAMP_KV={v[0]}", f"-DDK_ADJ_NORMAL={v[1]}"]
 
@@ -849,8 +888,8 @@ def library_sources(m, foot_pairs, forward_unit=False, target=None):
     fp = FWD_UNIT if forward_unit else _tag(FWD_VARIANT)  # the unit with the forward and kinematics entries
     defines[f"{fp}.cu"] += cuda.unit_defines("forward", target, defines[f"{fp}.cu"])  # sm_90: the register caps
     defs = [f"#define {k} {val}" for k, val in (
-        ("NQ", m.nq), ("NV", m.nv), ("NU", m.nu), ("NB", m.nbody), ("MAXCON", g1_step.maxcon(m)),
-        ("REC_WORDS", g1_tape.rec_words(m)),
+        ("NQ", m.nq), ("NV", m.nv), ("NU", m.nu), ("NB", m.nbody), ("MAXCON", mc),
+        ("REC_WORDS", g1_tape.rec_words(m, mc, g1_tape.kind(ter))),
         ("OFF_FLAGS", g1_tape.layout(m)["flags"][0]), ("TAPE_REFACT", f"{g1_tape.FLAG_REFACT}u"),
         ("TAPE_NONCONV", f"{g1_tape.FLAG_NONCONV}u"), ("TAPE_SINGULAR", f"{g1_tape.FLAG_SINGULAR}u"),
         ("ADJ_REPLAY_MISMATCH", adjoint.ADJ_REPLAY_MISMATCH), ("NONFINITE_QPOS", NONFINITE_QPOS),
@@ -896,11 +935,13 @@ def library_sources(m, foot_pairs, forward_unit=False, target=None):
     decls.append(f"static const ForwardFn kForward = {fp}_forward;")
     decls.append(f"static long long (*const kWorkBytes)(int) = {fp}_work_bytes;")
     units["dk_ffi.cu"] = FFI_UNIT.replace("@DEFINES@", "\n".join(defs)).replace("@DECLS@", "\n".join(decls))
+    if ter is not None:  # the height scan's handler (raycast)
+        units["dk_ffi.cu"] += FFI_TERRAIN.replace("@FWD@", fp)
     defines["dk_ffi.cu"] = []
     return units, consts, defines
 
 
-def build_plan(m, foot_pairs, arch):
+def build_plan(m, foot_pairs, arch, terrain=None, com_body=None):
     """How init() builds the library for build target arch: dict(units, consts, defines (library_sources), unit_arch
     ({unit: architecture flags} where they are not -arch=<arch>: every unit on sm_120 by default, the forward unit only
     with $DK_SM120_FRONTEND=split; cuda.arch_flags), arch_flags (forward, adjoint), split (the forward / kinematics
@@ -910,7 +951,8 @@ def build_plan(m, foot_pairs, arch):
     fwd_flags = cuda.arch_flags("forward", arch)  # the forward / kinematics unit's (NVVM 7 on sm_120)
     adj_flags = cuda.arch_flags(None, arch)  # the adjoint units' and the FFI unit's (NVVM 7 on sm_120 with n7)
     split = fwd_flags != adj_flags
-    units, consts, defines = library_sources(m, foot_pairs, forward_unit=split, target=arch)
+    units, consts, defines = library_sources(m, foot_pairs, forward_unit=split, target=arch, terrain=terrain,
+                                              com_body=com_body)
     fu = FWD_UNIT if split else _tag(FWD_VARIANT)
     fwd_defines = [d for d in defines[f"{fu}.cu"]
                    if not d.startswith(("-DDK_ADJ_CLAMP_KV=", "-DDK_ADJ_NORMAL="))]  # (the register caps)
@@ -1017,7 +1059,7 @@ def _build(units, defines, arch, include, consts, unit_arch=None, prefix="libdk_
     return out, True, key
 
 
-def init(model_dir=None, model=None, foot_pairs=None):
+def init(model_dir=None, model=None, foot_pairs=None, terrain=None, com_body=None):
     """Load the library for the model (build it on first use), hand it the model constants and register the FFI
     targets; idempotent (later calls return the loaded library; a different model raises). model_dir: a fixtures
     directory (default $DK_FIXTURES, else fixtures/mjlab); model, foot_pairs: an MjModel instead (e.g. the same mjlab
@@ -1029,23 +1071,28 @@ def init(model_dir=None, model=None, foot_pairs=None):
     (path, key, arch, rec_words, sizes per variant, built, arch_flags {forward, adjoint}, forward_defines: the -D options
     the forward unit gets for the target, e.g. sm_90's register caps, [] elsewhere; forward_unit: the prefix of the
     library's forward / kinematics entries, <forward_unit>_forward / _kinematics / _kinematics_vjp: dk_fwd where that
-    unit has flags of its own, else FWD_VARIANT's unit dk_kv0_n3)."""
+    unit has flags of its own, else FWD_VARIANT's unit dk_kv0_n3). terrain: a nablaengine.terrain.TerrainConfig for a
+    terrain build (work in progress; set_terrain() uploads the terrain, raycast() measures it). com_body: the body that
+    takes the per-world COM offset (default torso_link, or a fixtures directory's torso_body)."""
     import jax
     with _LOCK:
-        if _STATE and model_dir is None and model is None:  # every traced call comes here: no model reload
+        if _STATE and model_dir is None and model is None and terrain is None:  # every traced call: no model reload
             return _STATE["info"]
-        m, fp = _model(model_dir, model, foot_pairs)
+        m, fp, com = _model(model_dir, model, foot_pairs, com_body)
         # the model must be one the engine supports (nablaengine.model.capability), checked before anything is built
-        capability.require(m, fp, capability.COM_BODY, "engine", "jax_ffi.init")
+        capability.require(m, fp, com, "engine", "jax_ffi.init")
+        E = engines.modules(m)
+        g1_kin, g1_step, g1_tape = E.kinematics, E.step, E.tape
         arch = _arch()
-        plan = build_plan(m, fp, arch)
+        plan = build_plan(m, fp, arch, terrain, com)
         units, consts, defines, unit_arch = plan["units"], plan["consts"], plan["defines"], plan["unit_arch"]
         fwd_flags, adj_flags, split = plan["arch_flags"]["forward"], plan["arch_flags"]["adjoint"], plan["split"]
         fwd_defines = plan["forward_defines"]
         chash = hashlib.sha256(consts.tobytes()).hexdigest()
         if _STATE:
-            if _STATE["consts_hash"] != chash:
-                raise RuntimeError("nablaengine.jax_ffi: already initialised with another model (one per process)")
+            if _STATE["consts_hash"] != chash or _STATE["info"].get("terrain") != (terrain.key() if terrain else None):
+                raise RuntimeError("nablaengine.jax_ffi: already initialised with another model or terrain build "
+                                   "(one per process)")
             return _STATE["info"]
         path, built, key = _build(units, defines, arch, jax.ffi.include_dir(), consts, unit_arch or None)
         lib = ctypes.cdll.LoadLibrary(str(path))
@@ -1058,10 +1105,10 @@ def init(model_dir=None, model=None, foot_pairs=None):
         sz = np.zeros(9 * len(VARIANTS), np.int64)
         lib.dk_sizes(ctypes.c_void_p(sz.ctypes.data))
         sz = sz.reshape(len(VARIANTS), 9)
-        rec = g1_tape.rec_words(m)
+        mc = terrain.maxcon if terrain is not None and terrain.maxcon else g1_step.maxcon(m)
+        rec = g1_tape.rec_words(m, mc, g1_tape.kind(terrain))
         for v, row in zip(VARIANTS, sz):
-            assert tuple(row[2:9]) == (rec, m.nq, m.nv, g1_step.maxcon(m), v[0], v[1], g1_tape.layout(m)["flags"][0]), \
-                (v, row)
+            assert tuple(row[2:9]) == (rec, m.nq, m.nv, mc, v[0], v[1], g1_tape.layout(m)["flags"][0]), (v, row)
         lib.dk_launch_info.argtypes = [ctypes.c_int, ctypes.c_void_p]
         lib.dk_last_slots.argtypes = [ctypes.c_void_p]
         targets = {}
@@ -1071,7 +1118,13 @@ def init(model_dir=None, model=None, foot_pairs=None):
                           ("kin_bwd", "DkKinBwd")):
             targets[kind] = f"dk_{kind}_{key[:8]}"
             jax.ffi.register_ffi_target(targets[kind], jax.ffi.pycapsule(getattr(lib, sym)), platform="CUDA")
-        torso = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, "torso_link")  # as source.constants
+        if terrain is not None:
+            targets["rays"] = f"dk_rays_{key[:8]}"
+            jax.ffi.register_ffi_target(targets["rays"], jax.ffi.pycapsule(lib.DkTerrainRays), platform="CUDA")
+            lib_units = [_tag(v) for v in VARIANTS] + ([FWD_UNIT] if split else [])
+            for u in lib_units:
+                getattr(lib, f"{u}_set_terrain").argtypes = [ctypes.c_int, ctypes.c_void_p]
+        torso = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, com) if com else -1  # as source.constants
         try:  # the kinematics outputs' assumptions (kinematics.check_model); the kinematics entries raise without them
             g1_kin.check_model(m)
             kin_error = None
@@ -1081,7 +1134,9 @@ def init(model_dir=None, model=None, foot_pairs=None):
         commit, dirty = provenance.source_commit()
         info = dict(path=str(path), key=key, arch=arch, built=built, version=nablaengine.__version__, commit=commit,
                     dirty=dirty, rec_words=rec, nq=m.nq, nv=m.nv, nu=m.nu,
-                    nbody=m.nbody, kinematics_error=kin_error, maxcon=g1_step.maxcon(m), nefc=g1_step.NEFC,
+                    nbody=m.nbody, kinematics_error=kin_error, maxcon=mc, nefc=g1_step.NEFC,
+                    terrain=terrain.key() if terrain is not None else None,
+                    terrain_units=lib_units if terrain is not None else None,
                     sizeof_sim=int(sz[0, 0]), sizeof_adj={_tag(v): int(r[1]) for v, r in zip(VARIANTS, sz)},
                     variants=[list(v) for v in VARIANTS], timestep=float(m.opt.timestep), torso_id=int(torso),
                     foot_pairs=[int(p) for p in fp], consts_sha256=chash,
@@ -1095,6 +1150,96 @@ def init(model_dir=None, model=None, foot_pairs=None):
         atexit.register(_exit_report)  # with set_overflow_warnings(True): the counts nobody read, reported at exit
         return info
 
+
+
+# ---- terrain (nablaengine.terrain; work in progress) -----------------------------------------------------------------
+_TERRAIN = {}  # device id -> the terrain's device arrays (kept alive)
+
+
+def set_terrain(terrain, devices=None, cell=1.0):
+    """Upload a nablaengine.terrain.Terrain for a terrain build (init(terrain=...)) to the given JAX GPU devices
+    (default all); replaces the previous one. cell: the broad-phase grid's cell size in metres."""
+    import jax
+    import jax.numpy as jnp
+    init()
+    if not _STATE["info"].get("terrain"):
+        raise RuntimeError("nablaengine.jax_ffi: set_terrain needs a terrain build: init(terrain=TerrainConfig(...))")
+    packed = terrain.pack(cell)
+    order = ("boxes", "hf_head", "hf_int", "hf_data", "grid", "cell_start", "cell_items", "elem_cell")
+    for d in devices or [d for d in jax.devices() if d.platform == "gpu"]:
+        arrs = []
+        for k in order:
+            x = np.ascontiguousarray(packed[k]).reshape(-1)
+            if x.size == 0:  # never a null pointer (the kernels check only grid)
+                x = np.zeros(1, x.dtype)
+            arrs.append(jax.device_put(jnp.asarray(x), d))
+        for x in arrs:
+            x.block_until_ready()
+        ptrs = (ctypes.c_void_p * 8)(*[x.unsafe_buffer_pointer() for x in arrs])
+        for u in _STATE["info"]["terrain_units"]:
+            rc = getattr(_STATE["lib"], f"{u}_set_terrain")(int(d.local_hardware_id), ctypes.cast(ptrs, ctypes.c_void_p))
+            if rc:
+                raise RuntimeError(f"nablaengine.jax_ffi: the terrain upload failed ({rc})")
+        _TERRAIN[d.id] = arrs
+
+
+def _yaw_rotation(rot):
+    """mjlab RayCastSensor._extract_yaw_rotation (as torch_ffi._yaw_rotation)."""
+    import jax.numpy as jnp
+    x = rot[:, :, 0].at[:, 2].set(0.0)
+    xn = jnp.linalg.norm(x, axis=1)
+    y = rot[:, :, 1].at[:, 2].set(0.0)
+    y = y / jnp.maximum(jnp.linalg.norm(y, axis=1), 1e-6)[:, None]
+    sing = xn < 0.1
+    xy = jnp.stack([y[:, 1], -y[:, 0], jnp.zeros_like(y[:, 0])], 1)
+    x = jnp.where(sing[:, None], xy, x)
+    xn = jnp.where(sing, 1.0, xn)
+    x = x / jnp.maximum(xn, 1e-6)[:, None]
+    z = jnp.zeros_like(x[:, 0])
+    return jnp.stack([jnp.stack([x[:, 0], -x[:, 1], z], 1), jnp.stack([x[:, 1], x[:, 0], z], 1),
+                      jnp.stack([z, z, jnp.ones_like(z)], 1)], 1)
+
+
+def grid_pattern(size=(1.0, 1.0), resolution=0.1, direction=(0.0, 0.0, -1.0)):
+    """(offsets (N, 3), directions (N, 3)) as mjlab's GridPatternCfg (NumPy float32; torch_ffi.grid_pattern)."""
+    x = np.arange(-size[0] / 2, size[0] / 2 + resolution * 0.5, resolution, dtype=np.float32)
+    y = np.arange(-size[1] / 2, size[1] / 2 + resolution * 0.5, resolution, dtype=np.float32)
+    gx, gy = np.meshgrid(x, y, indexing="xy")
+    off = np.zeros((gx.size, 3), np.float32)
+    off[:, 0], off[:, 1] = gx.ravel(), gy.ravel()
+    d = np.asarray(direction, np.float32)
+    return off, np.broadcast_to(d / np.linalg.norm(d), off.shape).copy()
+
+
+def raycast(pos, rot, offsets, directions, alignment="base", max_distance=10.0):
+    """Height scan / depth rays against the terrain, as torch_ffi.raycast (mjlab's RayCastSensor): pos (B, 3), rot
+    (B, 3, 3), offsets / directions (N, 3); returns dict(distances (B, N), normals_w (B, N, 3), hit_pos_w (B, N, 3)).
+    Traceable (jax.jit); not differentiable."""
+    import jax
+    import jax.numpy as jnp
+    init()
+    if "rays" not in _STATE["targets"]:
+        raise RuntimeError("nablaengine.jax_ffi: raycast needs a terrain build: init(terrain=TerrainConfig(...))")
+    pos, rot = jnp.asarray(pos, jnp.float32), jnp.asarray(rot, jnp.float32)
+    offsets, directions = jnp.asarray(offsets, jnp.float32), jnp.asarray(directions, jnp.float32)
+    if alignment == "base":
+        R = rot
+    elif alignment == "yaw":
+        R = _yaw_rotation(rot)
+    elif alignment == "world":
+        R = jnp.broadcast_to(jnp.eye(3, dtype=jnp.float32), rot.shape)
+    else:
+        raise ValueError(f"alignment {alignment!r}: 'base', 'yaw' or 'world'")
+    origins = pos[:, None] + jnp.einsum("bij,nj->bni", R, offsets)
+    rays = jnp.einsum("bij,nj->bni", R, directions)
+    B, N = origins.shape[:2]
+    dist, nrm = jax.ffi.ffi_call(_STATE["targets"]["rays"],
+                                 (jax.ShapeDtypeStruct((B, N), jnp.float32), jax.ShapeDtypeStruct((B, N, 3), jnp.float32)))(
+        origins, rays, max_distance=np.float32(max_distance))
+    dist, nrm = jax.lax.stop_gradient(dist), jax.lax.stop_gradient(nrm)
+    hit = dist >= 0
+    hit_pos = jnp.where(hit[..., None], origins + rays * jnp.maximum(dist, 0.0)[..., None], origins)
+    return dict(distances=dist, normals_w=nrm, hit_pos_w=hit_pos)
 
 def rec_words():
     """Words (float32) per tape record (one world, one substep): 1472 for the mjlab model."""
@@ -1147,7 +1292,8 @@ def forward(qpos, qvel, warm, ctrl, friction, com, *, iterations=ITERATIONS, sub
         _check(name, x, shape)
     f32 = jnp.float32
     outs = [jax.ShapeDtypeStruct((B, nq), f32), jax.ShapeDtypeStruct((B, nv), f32), jax.ShapeDtypeStruct((B, nv), f32),
-            jax.ShapeDtypeStruct((B, 4), jnp.int32), jax.ShapeDtypeStruct((B, lib["maxcon"] * 8), f32)]  # + contacts
+            jax.ShapeDtypeStruct((B, 4), jnp.int32),
+            jax.ShapeDtypeStruct((B, lib["maxcon"] * 8), f32)]  # + contacts
     if tape:
         outs.append(jax.ShapeDtypeStruct((B, substeps * lib["rec_words"]), f32))
     if kinematics:

@@ -11,8 +11,7 @@ sources, the model constants, the flags, the nvcc version and XLA's FFI headers.
 
 ## Shapes and units
 
-For the mjlab Unitree G1 (`fixtures/mjlab/g1_train.mjb`): `nq = 36`, `nv = 35`, `nu = 29`; for the Unitree H1
-(`fixtures/h1/h1_train.mjb`, `jax_ffi.init(model=m, foot_pairs=meta["foot_pairs"])`): `nq = 26`, `nv = 25`, `nu = 19`. B, the number of worlds, is
+For the mjlab Unitree G1 (`fixtures/mjlab/g1_train.mjb`): `nq = 36`, `nv = 35`, `nu = 29`. B, the number of worlds, is
 read from the arrays at run time: one library serves every batch size, and JAX traces once per shape.
 
 | argument | shape | meaning |
@@ -21,21 +20,23 @@ read from the arrays at run time: one library serves every batch size, and JAX t
 | `qvel` | (B, 35) | joint velocities |
 | `warm` | (B, 35) | the Newton warm start (`qacc_warmstart`); the step returns the next one |
 | `ctrl` | (B, 29) | position targets of the 29 actuators, held over the control step |
-| `friction` | (B,) | per-world friction of the foot-floor contact pairs (domain randomisation) |
-| `com` | (B, 3) | per-world offset of the torso body's centre of mass (domain randomisation) |
+| `friction` | (B,) | per-world friction of the foot-floor contact pairs (domain randomisation); it replaces those pairs' own friction, so pass the model's value where it is not randomised |
+| `com` | (B, 3) | per-world offset of the centre of mass of one body (domain randomisation): the torso, `torso_link`, unless `init(com_body=...)` names another |
 
 A control step is `substeps` engine substeps of the model's timestep (4 x 5 ms by default).
 
 ## `init`
 
 ```python
-info = jax_ffi.init(model_dir=None, model=None, foot_pairs=None)
+info = jax_ffi.init(model_dir=None, model=None, foot_pairs=None, com_body=None)
 ```
 
 Loads the library for the model (building it on first use), hands it the model constants and registers the FFI
 targets. Idempotent; every traced call goes through it, so an explicit call is optional. `model_dir` is a fixtures
 directory (default `$DK_FIXTURES`, else `fixtures/mjlab` of the checkout); `model` / `foot_pairs` pass an `MjModel`
-and its foot-floor pair indices instead (for an installed package without the fixtures). The returned dict holds the
+and its foot-floor pair indices instead (for an installed package without the fixtures, or another robot: below),
+`com_body` the name of the body that takes the per-world COM offset `com` (default `torso_link`, or the fixtures'
+`torso_body`). The returned dict holds the
 library path and cache key, the architecture and its flags (`arch`, `arch_flags`, `forward_defines`), the tape record
 size and whether the library was built now (`built`); log it with results.
 
@@ -67,7 +68,10 @@ and zeros for `warm`, `friction` and `com`; the cotangent of `warm'` is ignored.
 | `kinematics` | False | also return the kinematics outputs of the output state (below), computed in the same call, their cotangents in the same VJP |
 
 `clamp_kv=1, normal=0` is the exact derivative of the forward ("exact mode", the one compared with finite
-differences); `clamp_kv=0, normal=3` are the interface defaults. The forward does not depend on `clamp_kv`,
+differences); `clamp_kv=0, normal=3` are the interface defaults. The defaults differ from the exact derivative only
+on dofs whose actuator force is at its limit (and on near-singular self contacts): negligible for the G1, but a robot
+whose actuators often saturate (e.g. MuJoCo Playground's H1, kp 800 against limits of 18-40 N m) sees median errors
+of 1-4% against finite differences in the default mode and about 1e-6 in exact mode. The forward does not depend on `clamp_kv`,
 `normal`, `clamp_soft` or `grad_decay`: one tape serves every adjoint variant, and the forward outputs are bitwise
 the same in every mode.
 
@@ -180,7 +184,7 @@ ignored.
 
 ## Unsupported models
 
-The engine supports one model, the mjlab G1. `init`, `check_model`, `EnginePhysics` and the scripts' model loading
+The engine supports the mjlab G1 and the robots of its class (below). `init`, `check_model`, `EnginePhysics` and the scripts' model loading
 run the capability checker (`nablaengine.model.capability`) first. A model outside its scope raises
 `nablaengine.model.capability.UnsupportedModel` (a subclass of `ValueError` and `AssertionError`) before anything is
 built, with the failing checks' codes and values; it never simulates other physics silently. `check_model(mjm,
@@ -193,3 +197,43 @@ warnings for experiments; results of such a build are not comparable with the ch
 Errors at call time: the FFI handlers check the rank and dimensions of every buffer before they read or write any
 and raise `InvalidArgument` (a `JaxRuntimeError`) on a mismatch; `make_step` raises `ValueError` for an adjoint
 variant that does not exist or a non-finite `grad_decay`.
+
+## Other robots
+
+The engine generates its code from the model. It supports one class of robot models (`nablaengine.model.capability`):
+- a floating base followed by one hinge per body, 7 <= nv <= 64, at most 31 bodies and 8 children per body;
+- one position servo per hinge, joint damping, armature and frictionloss, joint limits;
+- explicit contact pairs between planes, spheres, capsules and boxes. Box-box pairs follow MuJoCo Warp's general
+  convex collision (GJK, EPA and multi-contact polygon clipping, `src/nablaengine/ccd.py`), with an exact adjoint;
+- MuJoCo's Newton solver, a pyramidal friction cone, and implicitfast integration.
+
+A model outside the class is rejected with the failing checks. Pass a supported model as
+`init(model=m, foot_pairs=[...], com_body=...)`, set its `friction` input to the model's foot friction unless it is
+randomised, and set `substeps` to its control step.
+
+Validated robots (`docs/results/robots_check_v100.json`, V100). Forward: one control step of about 4000 states
+against MuJoCo Warp 3.17.0, with the qvel relative error at the 99th percentile and the share of worlds with the same
+contact count. Gradients: against float64 central differences of MuJoCo C, median relative error of the qvel
+gradient, on the worlds whose forward agrees with MuJoCo C (MuJoCo C's box-box collision and frictionloss differ from
+MuJoCo Warp's).
+
+| robot | model | nv | contacts | forward qvel p99 | same contact count | qvel gradient |
+|---|---|---|---|---|---|---|
+| Unitree G1 | mjlab (the fixture) | 35 | plane-sphere / capsule, capsule-capsule | `docs/verification.md` | | 1.0e-5 |
+| Unitree Go1 | mjlab | 18 | plane-sphere / capsule / box | 5.7e-6 | 99.97 % | 7.3e-7 |
+| Unitree Go2 | MuJoCo Menagerie | 18 | plane-sphere | 2.1e-5 | 99.97 % | 1.5e-6 |
+| Unitree A1 | MuJoCo Menagerie | 18 | plane-sphere | 1.7e-5 | 100 % | 1.8e-6 |
+| ANYbotics ANYmal C | MuJoCo Menagerie | 18 | plane-sphere | 2.1e-4 | 100 % | 2.3e-6 |
+| Boston Dynamics Spot | MuJoCo Playground | 18 | plane-sphere | 1.2e-5 | 100 % | 3.3e-6 |
+| Unitree H1 | MuJoCo Playground | 25 | plane-capsule | 6.4e-6 | 100 % | 5.7e-7 |
+| Booster T1 | MuJoCo Playground | 29 | plane-sphere, box-box | 5.7e-5 | 99.8 % | 4.7e-6 |
+| ROBOTIS OP3 | MuJoCo Playground | 26 | plane-box, box-box | 1.2e-4 | 99.97 % | 1.2e-6 |
+| Berkeley Humanoid | MuJoCo Playground | 18 | plane-box, box-box | 5.7e-5 | 99.9 % | 6.0e-6 |
+
+Notes on the models:
+- MuJoCo Playground's are its feet-only collision scenes.
+- MuJoCo Menagerie's are its `scene.xml` with feet-only collision and the usual locomotion contact settings: pyramidal
+  cone, condim 3 (Menagerie's files use an elliptic cone and condim 6).
+- The Go2's torque motors are replaced by position servos (kp 35, kd 0.5).
+
+Exporting and checking a robot, and the time per control step of each: `docs/robots.md`. Terrain: `docs/terrain.md`.

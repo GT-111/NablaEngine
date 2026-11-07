@@ -45,12 +45,33 @@ _FIELDS = (
 )
 
 
-def _table(m, max_contacts=None):
+# terrain builds (nablaengine.terrain): the contact table's entries are pair | slot << 10 (the terrain's virtual pairs
+# follow the model's), and a second table holds each contact's terrain element (u16; 0 for the model's pairs)
+_TERRAIN_FIELDS = (("telem", "OFF_TELEM", lambda nq, nv, ntri, nc: -(-nc // 2)),)
+# native heightfield builds: also each contact's candidate id (u32; step.py HfCand.pid, 0 for other contacts)
+_NATIVE_FIELDS = (("taux", "OFF_TAUX", lambda nq, nv, ntri, nc: nc),)
+
+
+def kind(terrain):
+    """The record kind of a build: None (no terrain), "analytic" or "native" (terrain: (TerrainConfig, geoms), a
+    TerrainConfig, or None)."""
+    if terrain is None:
+        return None
+    cfg = terrain[0] if isinstance(terrain, tuple) else terrain
+    return cfg.mode
+
+
+def _table(m, max_contacts=None, terrain=False):
     nc = max_contacts or step.maxcon(m)
     nv, ntri = m.nv, m.nv * (m.nv + 1) // 2
-    assert nv <= 64 and m.npair <= 512 and nc <= 255 and step.NEFC <= 255, "field widths (clamp u64, pair 9 bits, u8)"
+    npmax = 1024 if terrain else 512
+    assert nv <= 64 and m.npair < npmax and nc <= 255 and step.NEFC <= 255, "field widths (clamp u64, pair bits, u8)"
+    fields = _FIELDS
+    if terrain:
+        i = [f[0] for f in _FIELDS].index("con") + 1
+        fields = _FIELDS[:i] + _TERRAIN_FIELDS + (_NATIVE_FIELDS if terrain == "native" else ()) + _FIELDS[i:]
     out, off = [], 0
-    for name, define, n in _FIELDS:
+    for name, define, n in fields:
         if name is None:
             off = -(-off // n) * n
             continue
@@ -60,19 +81,20 @@ def _table(m, max_contacts=None):
     return out, off
 
 
-def layout(m, max_contacts=None):
-    """{name: (offset, length)} of a record in 32-bit words (mjlab model: L_H at 192, L_Q at 832, 1472 words)."""
-    return {name: (off, n) for name, _, off, n in _table(m, max_contacts)[0]}
+def layout(m, max_contacts=None, terrain=False):
+    """{name: (offset, length)} of a record in 32-bit words (mjlab model: L_H at 192, L_Q at 832, 1472 words).
+    terrain: a terrain build's record kind (kind(): "analytic" or "native"; _TERRAIN_FIELDS, _NATIVE_FIELDS)."""
+    return {name: (off, n) for name, _, off, n in _table(m, max_contacts, terrain)[0]}
 
 
-def rec_words(m, max_contacts=None):
+def rec_words(m, max_contacts=None, terrain=False):
     """Record length in words (a multiple of ALIGN)."""
-    return _table(m, max_contacts)[1]
+    return _table(m, max_contacts, terrain)[1]
 
 
-def header(m, max_contacts=None):
+def header(m, max_contacts=None, terrain=False):
     """#define OFF_* / REC_WORDS / TAPE_* for the engine's CUDA code (step.py)."""
-    tab, total = _table(m, max_contacts)
+    tab, total = _table(m, max_contacts, terrain)
     lines = [f"#define REC_WORDS {total}  // tape record (tape.py): words per world and substep"]
     lines += [f"#define {define} {off}  // {name}, {n} words" for name, define, off, n in tab]
     lines += [f"#define TAPE_REFACT {FLAG_REFACT}u", f"#define TAPE_NONCONV {FLAG_NONCONV}u",
@@ -90,15 +112,16 @@ def tri_unpack(packed, n):
     return out
 
 
-def decode(arr, m, max_contacts=None):
+def decode(arr, m, max_contacts=None, terrain=False):
     """Records (..., REC_WORDS) float32 -> dict of arrays (leading shape kept): ncon, nefc, nlim, niter, flags (and
     unsupported / refact / nonconv / singular / verify_diff), min_nu, clamp (u64 dof mask) and clamp_dof (bool, nv),
-    zone (bool, NEFC), pair / slot (int, maxcon; pair -1 past ncon), qpos, qvel, qacc, qacc_adv, L_H, L_Q (packed)."""
+    zone (bool, NEFC), pair / slot (int, maxcon; pair -1 past ncon), qpos, qvel, qacc, qacc_adv, L_H, L_Q (packed);
+    terrain: a terrain build's record, with elem (the contact's terrain element)."""
     a = np.ascontiguousarray(arr, np.float32)
-    nw = rec_words(m, max_contacts)
+    nw = rec_words(m, max_contacts, terrain)
     assert a.shape[-1] == nw, (a.shape, nw)
     u = a.view(np.uint32)
-    lay = layout(m, max_contacts)
+    lay = layout(m, max_contacts, terrain)
     sl = lambda name: slice(lay[name][0], lay[name][0] + lay[name][1])  # noqa: E731
     hdr, flags = u[..., lay["hdr"][0]].astype(np.int64), u[..., lay["flags"][0]].astype(np.int64)
     out = dict(ncon=hdr & 255, nefc=(hdr >> 8) & 255, nlim=(hdr >> 16) & 255, niter=hdr >> 24, flags=flags,
@@ -115,7 +138,11 @@ def decode(arr, m, max_contacts=None):
     nc = max_contacts or step.maxcon(m)
     e = np.ascontiguousarray(u[..., sl("con")]).view(np.uint16)[..., :nc].astype(np.int64)  # little endian: low half first
     past = np.arange(nc) >= out["ncon"][..., None]
-    out["pair"], out["slot"] = np.where(past, -1, e & 511), np.where(past, -1, e >> 9)
+    pb = 10 if terrain else 9
+    out["pair"], out["slot"] = np.where(past, -1, e & ((1 << pb) - 1)), np.where(past, -1, e >> pb)
+    if terrain:
+        x = np.ascontiguousarray(u[..., sl("telem")]).view(np.uint16)[..., :nc].astype(np.int64)
+        out["elem"] = np.where(past, -1, x)
     for name in ("qpos", "qvel", "qacc", "qacc_adv", "L_H", "L_Q"):
         out[name] = a[..., sl(name)]
     return out

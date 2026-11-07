@@ -1,0 +1,93 @@
+{
+ "description": "Time per control step (CUDA events, median of 30 after warm-up) of the forward and of the forward with the backward, scripts/robots/robot_check.py time (the G1: --g1), 4096 worlds, 10 iterations, the model's substeps (20 ms control steps), states from each robot's reference corpus; the GPU otherwise idle.",
+ "provenance": {
+  "commit": null,
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition, driver 595.58.03",
+  "nvcc": "Build cuda_12.8.r12.8/compiler.35583870_0",
+  "torch": "2.13.0+cu129",
+  "date": "2026-11-06",
+  "commit_note": "a revision before this repository's history: not recorded"
+ },
+ "results": [
+  {
+   "robot": "g1",
+   "nworld": 4096,
+   "substeps": 4,
+   "iterations": 10,
+   "forward_ms": 1.296,
+   "forward_backward_ms": 1.945
+  },
+  {
+   "robot": "go1",
+   "nworld": 4096,
+   "substeps": 4,
+   "iterations": 10,
+   "forward_ms": 0.684,
+   "forward_backward_ms": 1.014
+  },
+  {
+   "robot": "h1",
+   "nworld": 4096,
+   "substeps": 5,
+   "iterations": 10,
+   "forward_ms": 0.852,
+   "forward_backward_ms": 1.316
+  },
+  {
+   "robot": "t1",
+   "nworld": 4096,
+   "substeps": 10,
+   "iterations": 10,
+   "forward_ms": 3.931,
+   "forward_backward_ms": 6.285
+  },
+  {
+   "robot": "spot",
+   "nworld": 4096,
+   "substeps": 5,
+   "iterations": 10,
+   "forward_ms": 0.946,
+   "forward_backward_ms": 1.304
+  },
+  {
+   "robot": "op3",
+   "nworld": 4096,
+   "substeps": 5,
+   "iterations": 10,
+   "forward_ms": 1.871,
+   "forward_backward_ms": 3.48
+  },
+  {
+   "robot": "berkeley_humanoid",
+   "nworld": 4096,
+   "substeps": 10,
+   "iterations": 10,
+   "forward_ms": 2.867,
+   "forward_backward_ms": 4.83
+  },
+  {
+   "robot": "a1",
+   "nworld": 4096,
+   "substeps": 10,
+   "iterations": 10,
+   "forward_ms": 1.898,
+   "forward_backward_ms": 2.598
+  },
+  {
+   "robot": "go2",
+   "nworld": 4096,
+   "substeps": 10,
+   "iterations": 10,
+   "forward_ms": 1.956,
+   "forward_backward_ms": 2.661
+  },
+  {
+   "robot": "anymal_c",
+   "nworld": 4096,
+   "substeps": 10,
+   "iterations": 10,
+   "forward_ms": 1.861,
+   "forward_backward_ms": 2.563
+  }
+ ]
+}

@@ -64,7 +64,8 @@ VARIANTS = tuple((kv, n) for kv in (0, 1, 2) for n in (0, 1, 2, 3))  # adjoint b
 FWD_UNIT = "dk_fwd"
 ARTIFACT_VERSION = 1
 # the package files the library is generated from: an artifact records their hash, a different hash means stale
-SOURCES = ("cuda.py", "jax_ffi.py", "torch_ffi.py", "fixtures.py", "g1_engine/*.py", "model/*.py")
+SOURCES = ("cuda.py", "jax_ffi.py", "torch_ffi.py", "fixtures.py", "engines.py", "ccd.py", "terrain.py", "g1_engine/*.py",
+           "model/*.py")
 
 
 def _tag(v):
@@ -156,11 +157,14 @@ extern "C" int dk_torch_diag_bwd(cudaStream_t st, unsigned long long* d, int nw,
 """
 
 
-def _torch_unit(m):
-    """The torch library's own unit dk_torch.cu (TORCH_UNIT with the model's sizes and jax_ffi's constants)."""
-    from nablaengine.g1_engine import adjoint as g1_adjoint, tape as g1_tape
+def _torch_unit(m, rec_words=None):
+    """The torch library's own unit dk_torch.cu (TORCH_UNIT with the model's sizes and jax_ffi's constants; rec_words:
+    the tape record's length, default the model's)."""
+    from nablaengine import engines
+    E = engines.modules(m)
+    g1_adjoint, g1_tape = E.adjoint, E.tape
     defs = [f"#define {k} {v}" for k, v in (
-        ("NQ", m.nq), ("NV", m.nv), ("NU", m.nu), ("REC_WORDS", g1_tape.rec_words(m)),
+        ("NQ", m.nq), ("NV", m.nv), ("NU", m.nu), ("REC_WORDS", rec_words or g1_tape.rec_words(m)),
         ("OFF_FLAGS", g1_tape.layout(m)["flags"][0]), ("TAPE_REFACT", f"{g1_tape.FLAG_REFACT}u"),
         ("TAPE_NONCONV", f"{g1_tape.FLAG_NONCONV}u"), ("TAPE_SINGULAR", f"{g1_tape.FLAG_SINGULAR}u"),
         ("ADJ_REPLAY_MISMATCH", g1_adjoint.ADJ_REPLAY_MISMATCH), ("NONFINITE_QPOS", NONFINITE_QPOS),
@@ -192,23 +196,33 @@ def sources_sha256():
     return h.hexdigest()
 
 
-def build(arch, model_dir=None, model=None, foot_pairs=None, set_current=True):
+def build(arch, model_dir=None, model=None, foot_pairs=None, set_current=True, terrain=None, com_body=None):
     """Generate and compile the library for the model and architecture arch (sm_XY) and write its artifact into the
     cache directory: the library libdk_g1_torch_<arch>_<key>.so (the CUDA runtime linked statically), the packed model
     constants (.npy) and the model facts (.json); returns the .json's path. Needs mujoco 3.17 and nvcc (CUDA 12.x), no
     torch and no JAX; cached (the same sources reuse the library). set_current: make it the architecture's artifact
-    that init() loads by default (torch_<arch>_current.json); False for another model's, loaded by its path."""
+    that init() loads by default (torch_<arch>_current.json); False for another model's, loaded by its path. terrain:
+    a nablaengine.terrain.TerrainConfig for a terrain build (never made current; set_terrain() uploads the terrain).
+    com_body: the body that takes the per-world COM offset (as jax_ffi.init)."""
     import nablaengine
     from nablaengine import jax_ffi
-    from nablaengine.g1_engine import kinematics as g1_kin, step as g1_step, tape as g1_tape
+    from nablaengine import engines
     from nablaengine.model import capability
-    m, fp = jax_ffi._model(model_dir, model, foot_pairs)
-    capability.require(m, fp, capability.COM_BODY, "engine", "torch_ffi.build")
-    plan = jax_ffi.build_plan(m, fp, arch)
+    m, fp, com = jax_ffi._model(model_dir, model, foot_pairs, com_body)
+    capability.require(m, fp, com, "engine", "torch_ffi.build")
+    E = engines.modules(m)
+    g1_kin, g1_step, g1_tape = E.kinematics, E.step, E.tape
+    plan = jax_ffi.build_plan(m, fp, arch, terrain, com)
+    if terrain is not None:
+        from nablaengine import terrain as _terrain
+        set_current = False
+        tgeoms = [[int(g), int(p), int(f)] for g, p, f in _terrain.robot_terrain_geoms(m, fp, terrain.geoms)]
     units = {k: v for k, v in plan["units"].items() if k != "dk_ffi.cu"}
     defines = {k: v for k, v in plan["defines"].items() if k in units}
     unit_arch = {k: v for k, v in (plan["unit_arch"] or {}).items() if k in units}
-    units["dk_torch.cu"], defines["dk_torch.cu"] = _torch_unit(m), []  # the device-side diagnostic counters
+    mc = terrain.maxcon if terrain is not None and terrain.maxcon else g1_step.maxcon(m)
+    rec = g1_tape.rec_words(m, mc, g1_tape.kind(terrain))
+    units["dk_torch.cu"], defines["dk_torch.cu"] = _torch_unit(m, rec), []  # the device-side diagnostic counters
     if unit_arch:  # the adjoint units' architecture flags (sm_120: every unit through NVVM 7 by default)
         adj = unit_arch.get(f"{_tag(VARIANTS[0])}.cu")
         if adj:
@@ -222,10 +236,13 @@ def build(arch, model_dir=None, model=None, foot_pairs=None, set_current=True):
         kin_error = f"the model does not meet the kinematics outputs' assumptions ({e!r})"
     stem = path.with_suffix("")
     np.save(stem.with_suffix(".npy"), consts)
-    meta = dict(artifact_version=ARTIFACT_VERSION, library=path.name, consts=stem.with_suffix(".npy").name, key=key,
+    meta = dict(artifact_version=ARTIFACT_VERSION, com_body=com, library=path.name, consts=stem.with_suffix(".npy").name, key=key,
                 arch=arch, version=nablaengine.__version__, sources_sha256=sources_sha256(),
-                consts_sha256=hashlib.sha256(consts.tobytes()).hexdigest(), rec_words=g1_tape.rec_words(m),
-                nq=m.nq, nv=m.nv, nu=m.nu, nbody=m.nbody, maxcon=g1_step.maxcon(m),
+                terrain=terrain.key() if terrain is not None else None,
+                terrain_geoms=tgeoms if terrain is not None else None,
+                consts_sha256=hashlib.sha256(consts.tobytes()).hexdigest(), rec_words=rec,
+                nq=m.nq, nv=m.nv, nu=m.nu, nbody=m.nbody,
+                maxcon=mc,
                 off_flags=int(g1_tape.layout(m)["flags"][0]), forward_unit=plan["forward_unit"],
                 variants=[list(v) for v in VARIANTS], kinematics_error=kin_error, timestep=float(m.opt.timestep),
                 foot_pairs=[int(p) for p in fp], arch_flags=plan["arch_flags"],
@@ -265,7 +282,7 @@ def _stale(js, arch):
     return None
 
 
-def init(device=None, artifact=None, model_dir=None, model=None, foot_pairs=None):
+def init(device=None, artifact=None, model_dir=None, model=None, foot_pairs=None, terrain=None, com_body=None):
     """Load the library and upload the model constants to device (default torch's current CUDA device); idempotent
     per device, one library per process. The library comes from an artifact (build()): artifact (a .json path),
     else $DK_TORCH_ARTIFACT, else the cache's current artifact for the GPU's architecture. Loading an artifact needs
@@ -273,13 +290,14 @@ def init(device=None, artifact=None, model_dir=None, model=None, foot_pairs=None
     package sources), init() builds one first (mujoco and nvcc needed then). model_dir / model / foot_pairs: another
     model than the default (as jax_ffi.init): built (or found in the cache) for it, not made current. Returns the
     artifact's facts (path, key, arch, sizes, ...). The first call on a device synchronizes it once: call this
-    before capturing a CUDA graph."""
+    before capturing a CUDA graph. terrain: a nablaengine.terrain.TerrainConfig: a terrain build (in progress;
+    set_terrain() uploads the terrain data; raycast() measures it)."""
     import torch
     dev = _device_index(device)
     with _LOCK:
         if not _STATE:
-            _load(torch, dev, artifact, model_dir, model, foot_pairs)
-        elif artifact is not None or model_dir is not None or model is not None:
+            _load(torch, dev, artifact, model_dir, model, foot_pairs, terrain, com_body)
+        elif artifact is not None or model_dir is not None or model is not None or terrain is not None:
             raise _err("init(artifact / model ...) after the library is loaded: one library per process", RuntimeError)
         cc = torch.cuda.get_device_capability(dev)
         if f"sm_{cc[0]}{cc[1]}" != _STATE["info"]["arch"]:
@@ -290,11 +308,11 @@ def init(device=None, artifact=None, model_dir=None, model=None, foot_pairs=None
         return _STATE["info"]
 
 
-def _load(torch, dev, artifact, model_dir, model, foot_pairs):
+def _load(torch, dev, artifact, model_dir, model, foot_pairs, terrain=None, com_body=None):
     cc = torch.cuda.get_device_capability(dev)
     arch = os.environ.get("DK_ARCH") or f"sm_{cc[0]}{cc[1]}"
-    if model_dir is not None or model is not None:
-        js = build(arch, model_dir, model, foot_pairs, set_current=False)
+    if model_dir is not None or model is not None or terrain is not None:
+        js = build(arch, model_dir, model, foot_pairs, set_current=False, terrain=terrain, com_body=com_body)
     else:
         js = _artifact_path(arch, artifact)
         why = _stale(js, arch)
@@ -319,6 +337,103 @@ def _load(torch, dev, artifact, model_dir, model, foot_pairs):
     atexit.register(_exit_report)  # with set_overflow_warnings(True): the counts nobody read, reported at exit
     _custom_ops()  # defined here, outside any torch.compile trace (defining them inside one is not traceable)
 
+
+_TERRAIN = {}  # device index -> the terrain's device tensors (kept alive)
+
+
+def set_terrain(terrain, device=None, cell=1.0):
+    """Upload a nablaengine.terrain.Terrain to device (default the current one) for a terrain build (init(terrain=));
+    replaces the previous one on that device. cell: the broad-phase grid's cell size in metres."""
+    import torch
+    dev = _device_index(device)
+    init(dev)
+    if "set_terrain" not in _STATE["fns"]:
+        raise _err("set_terrain needs a terrain build: init(terrain=TerrainConfig(...))", RuntimeError)
+    packed = terrain.pack(cell)
+    order = ("boxes", "hf_head", "hf_int", "hf_data", "grid", "cell_start", "cell_items", "elem_cell")
+    with torch.cuda.device(dev):
+        tens = {k: torch.from_numpy(np.ascontiguousarray(packed[k]).reshape(-1)).to(f"cuda:{dev}") for k in order}
+        for k in order:  # never a null pointer (the kernel checks only grid)
+            if tens[k].numel() == 0:
+                tens[k] = torch.zeros(1, dtype=tens[k].dtype, device=f"cuda:{dev}")
+        ptrs = (ctypes.c_void_p * 8)(*[tens[k].data_ptr() for k in order])
+        for f in _STATE["fns"]["set_terrain"]:
+            _rc(f(dev, ctypes.cast(ptrs, ctypes.c_void_p)), "the terrain upload")
+        torch.cuda.synchronize(dev)
+    _TERRAIN[dev] = tens
+
+
+
+# ---- height scan: rays against the terrain (mjlab's RayCastSensor on MuJoCo Warp's rays) ------------------------------
+
+def grid_pattern(size=(1.0, 1.0), resolution=0.1, direction=(0.0, 0.0, -1.0), device=None):
+    """(offsets (N, 3), directions (N, 3)) of a grid of parallel rays in the frame, as mjlab's
+    GridPatternCfg(size, resolution, direction).generate_rays."""
+    import torch
+    x = torch.arange(-size[0] / 2, size[0] / 2 + resolution * 0.5, resolution, device=device, dtype=torch.float32)
+    y = torch.arange(-size[1] / 2, size[1] / 2 + resolution * 0.5, resolution, device=device, dtype=torch.float32)
+    gx, gy = torch.meshgrid(x, y, indexing="xy")
+    off = torch.zeros((gx.numel(), 3), device=device, dtype=torch.float32)
+    off[:, 0], off[:, 1] = gx.flatten(), gy.flatten()
+    d = torch.tensor(direction, device=device, dtype=torch.float32)
+    return off, (d / d.norm()).unsqueeze(0).expand(gx.numel(), 3).clone()
+
+
+def _yaw_rotation(rot):
+    """mjlab RayCastSensor._extract_yaw_rotation: the rotation about z of the frame's x axis (its y axis where x is
+    within 0.1 of vertical)."""
+    import torch
+    x = rot[:, :, 0].clone()
+    x[:, 2] = 0
+    xn = x.norm(dim=1)
+    sing = xn < 0.1
+    if sing.any():
+        y = rot[:, :, 1].clone()
+        y[:, 2] = 0
+        y = y / y.norm(dim=1).clamp(min=1e-6).unsqueeze(-1)
+        xy = torch.zeros_like(y)
+        xy[:, 0], xy[:, 1] = y[:, 1], -y[:, 0]
+        x[sing] = xy[sing]
+        xn[sing] = 1.0
+    x = x / xn.clamp(min=1e-6).unsqueeze(-1)
+    out = torch.zeros((rot.shape[0], 3, 3), device=rot.device, dtype=rot.dtype)
+    out[:, 0, 0], out[:, 1, 0], out[:, 0, 1], out[:, 1, 1], out[:, 2, 2] = x[:, 0], x[:, 1], -x[:, 1], x[:, 0], 1
+    return out
+
+
+def raycast(pos, rot, offsets, directions, alignment="base", max_distance=10.0):
+    """Height scan / depth rays against the terrain of a terrain build (set_terrain), as mjlab's RayCastSensor: rays
+    from the frame at pos (B, 3) with rotation rot (B, 3, 3; e.g. a body's from kinematics()), pattern offsets and unit
+    directions (N, 3) in the frame (grid_pattern), alignment "base" (the frame's rotation), "yaw" (its yaw only) or
+    "world" (none). Returns dict(distances (B, N): to the nearest terrain hit, -1 for none or beyond max_distance,
+    normals_w (B, N, 3): its world normal (0 for none), hit_pos_w (B, N, 3): the hit (the ray origin for none)).
+    Only the terrain is hit (not the robot's geoms); forward only (no gradient). Intersections are MuJoCo Warp's
+    ray_box / ray_hfield."""
+    import torch
+    dev = _device_index(pos.device)
+    init(dev)
+    if "terrain_rays" not in _STATE["fns"]:
+        raise _err("raycast needs a terrain build: init(terrain=TerrainConfig(...)) and set_terrain()", RuntimeError)
+    if alignment == "base":
+        R = rot
+    elif alignment == "yaw":
+        R = _yaw_rotation(rot)
+    elif alignment == "world":
+        R = torch.eye(3, device=rot.device, dtype=rot.dtype).unsqueeze(0).expand(rot.shape[0], -1, -1)
+    else:
+        raise ValueError(f"alignment {alignment!r}: 'base', 'yaw' or 'world'")
+    B, N = pos.shape[0], offsets.shape[0]
+    origins = (pos.unsqueeze(1) + torch.einsum("bij,nj->bni", R, offsets)).contiguous()
+    rays = torch.einsum("bij,nj->bni", R, directions).contiguous()
+    dist = torch.empty((B, N), dtype=torch.float32, device=pos.device)
+    nrm = torch.empty((B, N, 3), dtype=torch.float32, device=pos.device)
+    with torch.cuda.device(dev):
+        st = torch.cuda.current_stream(dev).cuda_stream
+        _rc(_STATE["fns"]["terrain_rays"](st, B * N, origins.data_ptr(), rays.data_ptr(), float(max_distance),
+                                          dist.data_ptr(), nrm.data_ptr()), "the terrain rays")
+    hit = dist >= 0
+    hit_pos = torch.where(hit.unsqueeze(-1), origins + rays * dist.clamp(min=0).unsqueeze(-1), origins)
+    return dict(distances=dist, normals_w=nrm, hit_pos_w=hit_pos)
 
 def _device_index(device):
     import torch
@@ -359,6 +474,14 @@ def _bind(lib, info):
         f = getattr(lib, f"{u}_upload")
         f.argtypes = [vp, vp]
         fns["upload"].append((u, f))
+    if info.get("terrain"):
+        fns["set_terrain"] = []
+        for u in units:
+            f = getattr(lib, f"{u}_set_terrain")
+            f.argtypes = [i32, vp]
+            fns["set_terrain"].append(f)
+        fns["terrain_rays"] = getattr(lib, f"{units[0]}_terrain_rays")
+        fns["terrain_rays"].argtypes = [vp, i32, vp, vp, f32, vp, vp]
     for name in ("dk_torch_diag_fwd", "dk_torch_diag_bwd"):
         fns[name] = getattr(lib, name)
     fns["dk_torch_diag_fwd"].argtypes = [vp, vp, i32, i32, i32, vp, vp]
@@ -446,6 +569,26 @@ def _soft(clamp_kv, clamp_soft):
     return d
 
 
+_LAST_CON = {}  # device -> the contact table of the last forward on it
+
+
+def last_contacts(device=None):
+    """The contacts of the last substep of the most recent forward / step on device (default the current one), as a
+    dict of tensors over (B, maxcon): valid (pair >= 0), pair (the model's contact pair index; -1 past the world's
+    contacts), dist, pos (world), normal (world, the contact frame's first axis). Overwritten by the next
+    forward on the device; not differentiable. None before any forward."""
+    import torch
+    dev = _device_index(device)
+    con = _LAST_CON.get(dev)
+    if con is None:
+        return None
+    B, mc = con.shape[0], int(_STATE["info"]["maxcon"])
+    c = con.view(B, mc, 8)
+    out = dict(pair=c[..., 0].to(torch.int32), dist=c[..., 1], pos=c[..., 2:5], normal=c[..., 5:8])
+    out["valid"] = out["pair"] >= 0
+    return out
+
+
 def _sizes():
     i = _STATE["info"]
     return i["nq"], i["nv"], i["nu"], i["nbody"], i["rec_words"]
@@ -479,7 +622,8 @@ def _forward_impl(qpos, qvel, warm, ctrl, friction, com, iterations, substeps, t
     if B == 0:
         return [q1, v1, w1, info, tp] + kin
     fns = _STATE["fns"]
-    con = torch.empty((B, _STATE["info"]["maxcon"] * 8), **kw)  # the last substep's contacts (unused, as jax_ffi)
+    con = torch.empty((B, _STATE["info"]["maxcon"] * 8), **kw)  # the last substep's contacts (last_contacts())
+    _LAST_CON[dev] = con
     work = torch.empty((max(int(fns["work_bytes"](B)), 1),), dtype=torch.uint8, device=qpos.device)
     st = torch.cuda.current_stream(dev).cuda_stream
     _rc(fns["forward"](st, B, *map(_ptr, (qpos, qvel, warm, ctrl, friction, com)), iterations, substeps, _ptr(q1),

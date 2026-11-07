@@ -9,7 +9,7 @@ abstract: >-
   PyTorch interfaces. The engine is checked against MuJoCo and MuJoCo Warp.
 authors:
   - name: "The NablaEngine Authors"
-version: 0.1.0
+version: 0.2.0
 license: Apache-2.0
 repository-code: "https://github.com/OamIcs/NablaEngine"
 keywords:

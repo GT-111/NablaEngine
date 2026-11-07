@@ -110,19 +110,23 @@ def pair_param_sets(m):
     return np.asarray(list(keys), np.float64).reshape(len(keys), PSET_WIDTH), index
 
 
-def const_layout(m):
-    """[(symbol, kind, length)] of pair_constants(m, ...) in packing order."""
-    ng = len(collision_geoms(m))
+def const_layout(m, terrain=None):
+    """[(symbol, kind, length)] of pair_constants(m, ..., terrain) in packing order (terrain: (TerrainConfig, the
+    robot geoms of terrain.robot_terrain_geoms): NTG more pairs and one more geom, the terrain's pseudo geom)."""
+    ng = len(collision_geoms(m)) + (1 if terrain else 0)
+    npair = m.npair + (len(terrain[1]) if terrain else 0)
     sizes = {"nb": m.nbody, "nv": m.nv, "nv2": 2 * m.nv}
     npset = len(pair_param_sets(m)[0])
-    return ([(s, k, m.npair * w) for s, k, w in PAIR_LAYOUT] + [("c_pset", "f", npset * PSET_WIDTH)]
+    return ([(s, k, npair * w) for s, k, w in PAIR_LAYOUT] + [("c_pset", "f", npset * PSET_WIDTH)]
             + [(s, k, ng * w) for s, k, w in GEOM_LAYOUT]
             + [(s, k, sizes[w] if isinstance(w, str) else w) for s, k, w in SOLVER_LAYOUT])
 
 
-def pair_constants(m, foot_pairs):
+def pair_constants(m, foot_pairs, terrain=None):
     """Contact-pair arrays (geoms ordered by type, as MuJoCo's collision table expects), the collision-geom table and
-    the solver constants, as one float32 array in const_layout(m) order."""
+    the solver constants, as one float32 array in const_layout(m, terrain) order. terrain: (TerrainConfig, [(robot
+    geom, floor pair, foot)]): after the model's pairs, one virtual pair per such geom (g1 = the terrain's pseudo geom
+    on the world body, the last geom table row; the floor pair's parameter set, condim and foot flag)."""
     geoms = collision_geoms(m)
     gid = {g: i for i, g in enumerate(geoms)}
     sets, words = pair_param_sets(m), []
@@ -135,10 +139,19 @@ def pair_constants(m, foot_pairs):
         assert m.pair_margin[i] == 0 and m.pair_gap[i] == 0 and m.pair_friction[i, 0] == m.pair_friction[i, 1]
         words.append(pair_word(gid[g1], gid[g2], sets[1][i], int(m.pair_dim[i]), int(i in foot),
                                int(GEOM_TYPE[int(m.geom_type[g1])] == 0)))
+    if terrain:
+        tg = len(geoms)  # the terrain's pseudo geom
+        for g, p, ft in terrain[1]:
+            words.append(pair_word(tg, gid[g], sets[1][p], int(m.pair_dim[p]), ft, 0))
     words = np.asarray(words, np.int64)
     out = [np.stack([words & 0xFFFF, words >> 16], 1).ravel(), np.asarray(sets[0], np.float64).ravel()]
-    out += [m.geom_bodyid[geoms], [GEOM_TYPE[int(m.geom_type[g])] for g in geoms], m.geom_size[geoms],
+    gtab = [m.geom_bodyid[geoms], [GEOM_TYPE[int(m.geom_type[g])] for g in geoms], m.geom_size[geoms],
             m.geom_pos[geoms], m.geom_quat[geoms], m.geom_rbound[geoms]]
+    if terrain:  # body 0, type 4 (terrain), at the origin
+        extra = [[0], [4], [[0.0, 0.0, 0.0]], [[0.0, 0.0, 0.0]], [[1.0, 0.0, 0.0, 0.0]], [0.0]]
+        gtab = [np.concatenate([np.asarray(a, np.float64).reshape(len(geoms), -1),
+                                np.asarray(b, np.float64).reshape(1, -1)]) for a, b in zip(gtab, extra)]
+    out += gtab
     jr = np.zeros((m.nv, 2))
     jlim = np.zeros(m.nv)
     for j in range(1, m.njnt):
@@ -195,11 +208,19 @@ def dof_body_root6(m):
     return m.nv >= 6 and bool((d[:6] == 1).all() and (d[6:] == np.arange(6, m.nv) - 4).all())
 
 
-def step_header(m, max_contacts=None):
+def step_header(m, max_contacts=None, terrain=None):
     p, g, kdof = m.npair, len(collision_geoms(m)), max_support(m)
     hs = hess_columns(kdof)
     hcol = [a | b << 8 | thr << 16 for _, _, tab in hs for row in tab for a, b, thr in row]
-    return f"""
+    ter, pt = "", p
+    if terrain:  # nablaengine.terrain: NTG virtual pairs after the model's, the pseudo geom as the last geom row
+        cfg, tg = terrain
+        ter = (f"#define HAS_TERRAIN 1\n#define NTG {len(tg)}  // robot geoms that collide with the terrain\n"
+               f"#define TERRAIN_FLOOR {int(cfg.floor)}  // keep the model's floor plane pairs\n"
+               f"#define TERRAIN_CAP_PTS {int(cfg.cap_points)}  // heightfield samples per capsule\n"
+               f"#define TERRAIN_HF_NATIVE {int(cfg.mode == 'native')}  // heightfield contacts per prism\n")
+        pt, g = p + len(tg), g + 1
+    return ter + f"""
 #define NPAIR {p}
 #define NGEOMC {g}
 #define MAXCON {max_contacts or maxcon(m)}
@@ -214,7 +235,7 @@ __device__ const unsigned c_hcol[{len(hcol)}] = {{{", ".join(map(str, hcol))}}};
 #define NFLOSS {int((m.dof_frictionloss > 0).sum())}  // dofs with a frictionloss row (the first rows)
 #define SOLIMP_POW2 {int(solimp_pow2(m))}  // every solimp power of the model is 2 (kbimp without the general powers)
 #define NPROF {len(PROF_PHASES)}
-DKC unsigned int c_pword[{p}];  // pair_word(): g1 | g2 << 8 | pset << 16 | dim << 24 | foot << 28 | plane << 29
+DKC unsigned int c_pword[{pt}];  // pair_word(): g1 | g2 << 8 | pset << 16 | dim << 24 | foot << 28 | plane << 29
 DKC float c_pset[{len(pair_param_sets(m)[0]) * PSET_WIDTH}];  // per parameter set: mu, solref[2], solimp[5]
 #define PG1(pr) ((int)(c_pword[pr] & 255u))
 #define PG2(pr) ((int)((c_pword[pr] >> 8) & 255u))
@@ -2283,6 +2304,909 @@ struct SimP {  // substep_pre: smooth dynamics, qacc_smooth, collision, contact 
 """
 
 
+
+# ---- terrain builds (nablaengine.terrain; work in progress): terrain_source() inserts TERRAIN_DEVICE and the hooks
+# below into STEP_DEVICE + STEP_KERNEL. A build without terrain compiles the unchanged text (the G1 identity gate).
+TERRAIN_DEVICE = r"""
+// ---- terrain (nablaengine.terrain): static boxes and heightfields in global memory, shared by every world ----
+// set by <unit>_set_terrain (terrain.pack's arrays on the device); grid == nullptr: no terrain uploaded
+struct TerrainPtrs {
+  const float* box;    // (nbox, 15): pos, rot (row major), half sizes
+  const float* hfh;    // (nhf, 16): pos, rot, MuJoCo hfield_size (x, y radius, z scale, z bottom)
+  const int* hfi;      // (nhf, 4): nrow, ncol, data address, 0
+  const float* hfd;    // heights, MuJoCo's normalised data (times hfield_size z)
+  const float* grid;   // x0, y0, 1 / cell, nx, ny, nbox
+  const int* cstart;   // (nx ny + 1) cell offsets into citems
+  const int* citems;   // element indices: box i, or nbox + heightfield j
+  const int* ecell;    // (n, 2) each element's first cell
+};
+__device__ TerrainPtrs g_ter;
+// box e of the terrain
+__device__ __forceinline__ const float* ter_box(int e) { return g_ter.box + 15 * e; }
+
+// height and upward unit normal of the heightfield triangle below local (x, y) (cells split along MuJoCo's
+// (c, r+1)-(c+1, r) diagonal); false outside the grid
+__device__ __forceinline__ bool hfield_surface(const float* hs, const float* hd, int nrow, int ncol, float x, float y,
+                                               float* h, float* n) {
+  float dx = 2.f * hs[0] / float(ncol - 1), dy = 2.f * hs[1] / float(nrow - 1);
+  float fc = (x + hs[0]) / dx, fr = (y + hs[1]) / dy;
+  if (fc < 0.f || fr < 0.f || fc > float(ncol - 1) || fr > float(nrow - 1)) return false;
+  int c0 = min(int(floorf(fc)), ncol - 2), r0 = min(int(floorf(fr)), nrow - 2);
+  float u = fc - float(c0), v = fr - float(r0);
+  float h00 = hd[r0 * ncol + c0] * hs[2], h10 = hd[r0 * ncol + c0 + 1] * hs[2];
+  float h01 = hd[(r0 + 1) * ncol + c0] * hs[2], h11 = hd[(r0 + 1) * ncol + c0 + 1] * hs[2];
+  float t[3];
+  if (u + v <= 1.f) {
+    *h = h00 + u * (h10 - h00) + v * (h01 - h00);
+    t[0] = -dy * (h10 - h00); t[1] = -dx * (h01 - h00); t[2] = dx * dy;
+  } else {
+    *h = h11 + (1.f - u) * (h01 - h11) + (1.f - v) * (h10 - h11);
+    t[0] = dy * (h01 - h11); t[1] = dx * (h10 - h11); t[2] = dx * dy;
+  }
+  float il = rsqrtf(t[0] * t[0] + t[1] * t[1] + t[2] * t[2]);
+  for (int k = 0; k < 3; k++) n[k] = t[k] * il;
+  return true;
+}
+
+// The terrain contacts' geometry, shared by the forward and the adjoint's replay (adjoint_contact.TERRAIN_DEVICE):
+// one __noinline__ copy of each, so the replay computes the forward's bits. A contact's tape slot is k | element << 8
+// (k: capsule_box's candidate, or the heightfield sample point; element: box i, or nbox + heightfield j)
+
+// sphere (centre sp, radius r) against terrain box b (15 words): sphere_box with the normal from the box towards the
+// sphere
+__device__ __noinline__ void terrain_sphere_box(const float* sp, float r, const float* b, float* dist, float* pos,
+                                                float* n) {
+  sphere_box(sp, r, b, b + 3, b + 12, dist, pos, n);
+  for (int k = 0; k < 3; k++) n[k] = -n[k];
+}
+
+// centre of capsule_box's candidate sphere at segment parameter seg (capbox_segs), as capsule_box computes it
+__device__ __noinline__ void capbox_point(const float* cp, const float* axisw, float hl, const float* b, float seg,
+                                          float* ce) {
+  const float *bp = b, *R = b + 3;
+  float d[3] = {cp[0] - bp[0], cp[1] - bp[1], cp[2] - bp[2]}, pos[3], axis[3], lc[3], t[3];
+  mtv3(R, d, pos);
+  mtv3(R, axisw, axis);
+  for (int k = 0; k < 3; k++) lc[k] = pos[k] + axis[k] * hl * seg;
+  mv3(R, lc, t);
+  for (int k = 0; k < 3; k++) ce[k] = bp[k] + t[k];
+}
+
+// capsule_box's candidate spheres for a terrain box b (capbox_segs) with a fast path for the common case, a capsule
+// resting on a box's top: both ends above the box's local +z face and inside its footprint by more than 1 mm. There
+// capsule_box's search ends with the lower end (the -1 end on a tie) against that face (no edge is nearer: they are
+// at least 1 mm away horizontally), and the second candidate is the other end (its exits from the face's footprint
+// lie beyond the segment): segs = (lower, other), the same values as capbox_segs without its edge search
+__device__ __noinline__ int terrain_capbox_segs(const float* cp, const float* axisw, float hl, const float* b,
+                                                float* segs) {
+  const float *bp = b, *R = b + 3, *bs = b + 12;
+  float d[3] = {cp[0] - bp[0], cp[1] - bp[1], cp[2] - bp[2]}, pos[3], axis[3], dz[2];
+  mtv3(R, d, pos);
+  mtv3(R, axisw, axis);
+  bool fast = true;
+  for (int e = 0; e < 2 && fast; e++) {
+    float tip[3];
+    for (int j = 0; j < 3; j++) tip[j] = pos[j] + float(2 * e - 1) * (axis[j] * hl);
+    fast = fabsf(tip[0]) <= bs[0] - 1e-3f && fabsf(tip[1]) <= bs[1] - 1e-3f && tip[2] > bs[2];
+    dz[e] = (bs[2] - tip[2]) * (bs[2] - tip[2]);
+  }
+  if (!fast) return capbox_segs(cp, axisw, hl, bp, R, bs, segs);
+  segs[0] = dz[1] < dz[0] ? 1.f : -1.f;
+  segs[1] = -segs[0];
+  return 2;
+}
+
+// robot geom g (sphere or capsule, pose gx / gq) against terrain box e
+template <class S>
+__device__ void terrain_box(S& s, int pair, int g, int e) {
+  const float* b = ter_box(e);
+  const float* p = s.gx[g];
+  float d[3] = {p[0] - b[0], p[1] - b[1], p[2] - b[2]};
+  float rb = c_grbound[g] + sqrtf(b[12] * b[12] + b[13] * b[13] + b[14] * b[14]);
+  if (dot3(d, d) > rb * rb) return;
+  const float* sz = c_gsize + 3 * g;
+  float dist, pos[3], n[3], fr[9];
+  if (c_gtype[g] == 1) {
+    terrain_sphere_box(p, sz[0], b, &dist, pos, n);
+    if (dist < 0.f) { make_frame(n, fr); add_contact(s, pair, e << 8, dist, pos, fr); }
+  } else if (c_gtype[g] == 2) {
+    float axis[3], segs[2], ce[3];
+    zaxis_rn(s.gq[g], axis);
+    const int ns = terrain_capbox_segs(p, axis, sz[1], b, segs);
+    for (int k = 0; k < ns; k++) {
+      capbox_point(p, axis, sz[1], b, segs[k], ce);
+      terrain_sphere_box(ce, sz[0], b, &dist, pos, n);
+      if (dist < 0.f) { make_frame(n, fr); add_contact(s, pair, k | e << 8, dist, pos, fr); }
+    }
+  }
+}
+
+// sample point k of robot geom g (type gt, size sz, pose gp / gq) against terrain heightfield j: (sphere: the centre;
+// capsule: TERRAIN_CAP_PTS points w = -1 .. 1 along the axis) against the plane of the heightfield triangle below it
+// (the analytic mode): dist = n_z (q_z - h) - r, pos = q - (r + dist / 2) n, normal nw (world,
+// from the terrain towards the geom); false outside the grid
+__device__ __noinline__ bool terrain_hfield_point(int j, int gt, const float* sz, const float* gp, const float* gq,
+                                                  int k, float* dist, float* pos, float* nw) {
+  const float* hh = g_ter.hfh + 16 * j;
+  const int* hi = g_ter.hfi + 4 * j;
+  const float* R = hh + 3;
+  float d[3] = {gp[0] - hh[0], gp[1] - hh[1], gp[2] - hh[2]}, q[3], al[3] = {0.f, 0.f, 0.f}, w = 0.f;
+  mtv3(R, d, q);  // the geom centre in the heightfield's frame
+  if (gt == 2) {
+    float axis[3];
+    zaxis_rn(gq, axis);
+    mtv3(R, axis, al);
+    w = TERRAIN_CAP_PTS > 1 ? -1.f + float(k) * 2.f / float(TERRAIN_CAP_PTS - 1) : 0.f;
+  }
+  for (int i = 0; i < 3; i++) q[i] += w * sz[1] * al[i];
+  float h, n[3];
+  if (!hfield_surface(hh + 12, g_ter.hfd + hi[2], hi[0], hi[1], q[0], q[1], &h, n)) return false;
+  *dist = (q[2] - h) * n[2] - sz[0];
+  float posl[3];
+  for (int i = 0; i < 3; i++) posl[i] = q[i] - (sz[0] + 0.5f * (*dist)) * n[i];
+  mv3(R, posl, pos);
+  for (int i = 0; i < 3; i++) pos[i] += hh[i];
+  mv3(R, n, nw);
+  return true;
+}
+
+#if TERRAIN_HF_NATIVE
+// ---- native heightfield contacts (TerrainConfig.mode = "native"): MuJoCo's prisms (mjc_ConvexHField / MuJoCo Warp's
+// ccd_hfield_kernel: the cells under the geom's bounding box, two triangular prisms per cell from the triangle down to
+// the heightfield's bottom), each measured exactly in closed form instead of GJK / EPA, and MuJoCo's choice of at most 4
+// contacts per geom and heightfield (the deepest, the farthest from it, the farthest from their line, the fourth)
+// among the penetrating candidates. Per prism, the geom's core (sphere: its centre; capsule: its axis segment):
+//  - disjoint from the prism: for every prism face whose face region the core's points project into, the two ends of
+//    that part of the core (each one's exact distance to the prism is its height above the face); and the closest
+//    pair when it lies on a prism edge or vertex (point-to-point normal);
+//  - intersecting the prism: the minimum translation by the separating axes (face normals, axis x edge directions),
+//    at the core's deepest point along it (the middle of the core where the core is parallel to the face).
+// On a flat heightfield this gives the plane's contacts (a capsule: its two ends). Contact types for the adjoint:
+// HF_FACE (constant normal), HF_POINT (normal from a fixed prism point q to the core point), HF_DEEP (constant normal)
+#define HF_MAXCAND 24
+#define HF_FACE 0
+#define HF_POINT 1
+#define HF_DEEP 2
+#define HF_MIN_NEXT 1e-3f  // MuJoCo Warp's MIN_DIST_TO_NEXT_CONTACT (here a candidate below it is never taken)
+
+struct HfCand {  // a candidate (hfield frame): the core point x = a + t d, its prism point x - (dist + r) n
+  float dist, n[3], t;  // t: the core parameter (0 .. 1 from axis end -1 to +1)
+  int type;
+  unsigned pid;  // ((cell r ncol + c) << 1 | triangle) << 4 | the candidate's index in its prism (hf_prism's sub)
+};
+struct HfCon {  // a chosen contact (hfield frame): pos midway between the prism point q and the geom's surface
+  float dist, pos[3], n[3], q[3], t;
+  int type;
+  unsigned pid;
+};
+
+// segment p1 + s d1 against segment p2 + t d2 (s, t in [0, 1]; Ericson, Real-Time Collision Detection 5.1.9)
+__device__ __forceinline__ void hf_segseg(const float* p1, const float* d1, const float* p2, const float* d2, float* s,
+                                          float* t) {
+  float r[3] = {p1[0] - p2[0], p1[1] - p2[1], p1[2] - p2[2]};
+  float a = dot3(d1, d1), e = dot3(d2, d2), f = dot3(d2, r);
+  if (a <= 1e-20f) { *s = 0.f; *t = e > 1e-20f ? fminf(fmaxf(f / e, 0.f), 1.f) : 0.f; return; }
+  float c = dot3(d1, r);
+  if (e <= 1e-20f) { *t = 0.f; *s = fminf(fmaxf(-c / a, 0.f), 1.f); return; }
+  float b = dot3(d1, d2), den = a * e - b * b;
+  *s = den > 0.f ? fminf(fmaxf((b * f - c * e) / den, 0.f), 1.f) : 0.f;
+  *t = (b * (*s) + f) / e;
+  if (*t < 0.f) { *t = 0.f; *s = fminf(fmaxf(-c / a, 0.f), 1.f); }
+  else if (*t > 1.f) { *t = 1.f; *s = fminf(fmaxf((b - c) / a, 0.f), 1.f); }
+}
+
+__device__ __forceinline__ void hf_add(HfCand* cand, int* nc, int type, float dist, const float* n, float t,
+                                       int* over, int sub) {
+  if (*nc >= HF_MAXCAND) { *over = 1; return; }
+  HfCand& c = cand[(*nc)++];
+  c.dist = dist; c.t = t; c.type = type; c.pid = (unsigned)sub;
+  for (int k = 0; k < 3; k++) c.n[k] = n[k];
+}
+
+// a candidate's contact position (hfield frame): midway between its prism point and the geom's surface
+__device__ __forceinline__ void hf_pos(const HfCand& c, const float* a, const float* d, float r, float* pos) {
+  for (int k = 0; k < 3; k++) pos[k] = a[k] + c.t * d[k] - (r + 0.5f * c.dist) * c.n[k];
+}
+
+// the candidates of the core a + t d (t in [0, 1]; d = 0: a sphere) with radius r against the prism of top vertices
+// v[0..2] (counterclockwise from above) and bottom zb, hfield frame; each with its index in the prism (pid's sub:
+// 2 face + end, 10 the edge / vertex pair, 11 the intersection). One copy (the adjoint's replay calls it as well)
+__device__ __noinline__ void hf_prism(const float (*v)[3], float zb, const float* a, const float* d, float r, HfCand* cand, int* nc,
+                         int* over) {
+  float P[6][3];  // 0..2 top, 3..5 bottom
+  for (int i = 0; i < 3; i++)
+    for (int k = 0; k < 3; k++) { P[i][k] = v[i][k]; P[3 + i][k] = k == 2 ? zb : v[i][k]; }
+  // faces: 0 top (P0 P1 P2), 1 bottom (P3 P5 P4), 2..4 sides (Pi Pj P3+j P3+i), outward normals
+  const int fv[5][4] = {{0, 1, 2, -1}, {3, 5, 4, -1}, {0, 3, 4, 1}, {1, 4, 5, 2}, {2, 5, 3, 0}};
+  float fn[5][3], hA[5], hd[5];  // normal; h(t) = hA + t hd
+  for (int f = 0; f < 5; f++) {
+    const float *p0 = P[fv[f][0]], *p1 = P[fv[f][1]], *p2 = P[fv[f][2]];
+    float e1[3] = {p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]}, e2[3] = {p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]};
+    cross(e1, e2, fn[f]);
+    float il = rsqrtf(dot3(fn[f], fn[f]));
+    for (int k = 0; k < 3; k++) fn[f][k] *= il;
+    float w[3] = {a[0] - p0[0], a[1] - p0[1], a[2] - p0[2]};
+    hA[f] = dot3(fn[f], w); hd[f] = dot3(fn[f], d);
+  }
+  // inside test of the core's ends and pierced faces: intersection -> separating axes
+  bool inA = true, inB = true;
+  for (int f = 0; f < 5; f++) { inA = inA && hA[f] < 0.f; inB = inB && hA[f] + hd[f] < 0.f; }
+  bool hit = inA || inB;
+  float ti0[5], ti1[5];  // each face's region interval of the core
+  for (int f = 0; f < 5; f++) {
+    float t0 = 0.f, t1 = 1.f;
+    const int nv = fv[f][3] < 0 ? 3 : 4;
+    for (int k = 0; k < nv && t0 <= t1; k++) {
+      const float *q0 = P[fv[f][k]], *q1 = P[fv[f][(k + 1) % nv]];
+      float e[3] = {q1[0] - q0[0], q1[1] - q0[1], q1[2] - q0[2]}, m[3], w[3] = {a[0] - q0[0], a[1] - q0[1], a[2] - q0[2]};
+      cross(e, fn[f], m);  // outward in the face plane
+      float g0 = dot3(m, w), g1 = dot3(m, d);  // inside: g0 + t g1 <= 0
+      if (fabsf(g1) <= 1e-20f) { if (g0 > 0.f) t1 = -1.f; }
+      else if (g1 > 0.f) t1 = fminf(t1, -g0 / g1);
+      else t0 = fmaxf(t0, -g0 / g1);
+    }
+    ti0[f] = t0; ti1[f] = t1;
+    if (t0 <= t1 && (hA[f] + t0 * hd[f]) * (hA[f] + t1 * hd[f]) < 0.f) hit = true;  // the core pierces face f
+  }
+  if (hit) {  // minimum translation: axes fn (faces) and normalize(d x edge); push the core out along +u
+    const int ev[9][2] = {{0, 1}, {1, 2}, {2, 0}, {3, 4}, {4, 5}, {5, 3}, {0, 3}, {1, 4}, {2, 5}};
+    float best = 3.4e38f, bu[3] = {0.f, 0.f, 1.f};
+    for (int ax = 0; ax < 14; ax++) {
+      float u[3];
+      if (ax < 5) { for (int k = 0; k < 3; k++) u[k] = fn[ax][k]; }
+      else {
+        const float *q0 = P[ev[ax - 5][0]], *q1 = P[ev[ax - 5][1]];
+        float e[3] = {q1[0] - q0[0], q1[1] - q0[1], q1[2] - q0[2]};
+        cross(d, e, u);
+        float l2 = dot3(u, u);
+        if (l2 <= 1e-12f * dot3(d, d) * dot3(e, e) || l2 <= 1e-30f) continue;
+        float il = rsqrtf(l2);
+        for (int k = 0; k < 3; k++) u[k] *= il;
+      }
+      float pmax = -3.4e38f, pmin = 3.4e38f;
+      for (int i = 0; i < 6; i++) { float x = dot3(u, P[i]); pmax = fmaxf(pmax, x); pmin = fminf(pmin, x); }
+      float sa = dot3(u, a), sb = sa + dot3(u, d), smin = fminf(sa, sb), smax = fmaxf(sa, sb);
+      float pp = pmax - smin, pm = smax - pmin;  // translation along +u, along -u
+      if (pp < best) { best = pp; for (int k = 0; k < 3; k++) bu[k] = u[k]; }
+      if (ax >= 5 && pm < best) { best = pm; for (int k = 0; k < 3; k++) bu[k] = -u[k]; }
+    }
+    float ud = dot3(bu, d), t = ud > 1e-7f * sqrtf(dot3(d, d)) ? 0.f : (ud < -1e-7f * sqrtf(dot3(d, d)) ? 1.f : 0.5f);
+    hf_add(cand, nc, HF_DEEP, -best - r, bu, t, over, 11);
+    return;
+  }
+  // disjoint: the face-region ends in front of their face (exact distances), then the closest edge pair if it is closer
+  float dmin = 3.4e38f;
+  for (int f = 0; f < 5; f++) {
+    if (ti0[f] > ti1[f]) continue;
+    float h0 = hA[f] + ti0[f] * hd[f], h1 = hA[f] + ti1[f] * hd[f];
+    if (h0 < 0.f) continue;  // behind the face (then the whole region part is: no pierce)
+    for (int e = 0; e < (ti1[f] > ti0[f] ? 2 : 1); e++) {
+      float t = e ? ti1[f] : ti0[f], h = e ? h1 : h0;
+      dmin = fminf(dmin, h);
+      if (h - r >= 0.f) continue;
+      hf_add(cand, nc, HF_FACE, h - r, fn[f], t, over, 2 * f + e);
+    }
+  }
+  const int ev[9][2] = {{0, 1}, {1, 2}, {2, 0}, {3, 4}, {4, 5}, {5, 3}, {0, 3}, {1, 4}, {2, 5}};
+  float bd = 3.4e38f, bx[3], bq[3], bt = 0.f;
+  for (int i = 0; i < 9; i++) {
+    const float *q0 = P[ev[i][0]], *q1 = P[ev[i][1]];
+    float e[3] = {q1[0] - q0[0], q1[1] - q0[1], q1[2] - q0[2]}, s, t;
+    hf_segseg(a, d, q0, e, &s, &t);
+    float x[3], q[3], w[3];
+    for (int k = 0; k < 3; k++) { x[k] = a[k] + s * d[k]; q[k] = q0[k] + t * e[k]; w[k] = x[k] - q[k]; }
+    float dd = dot3(w, w);
+    if (dd < bd) { bd = dd; bt = s; for (int k = 0; k < 3; k++) { bx[k] = x[k]; bq[k] = q[k]; } }
+  }
+  bd = sqrtf(bd);
+  if (bd < dmin && bd - r < 0.f && bd > 0.f) {
+    float n[3] = {(bx[0] - bq[0]) / bd, (bx[1] - bq[1]) / bd, (bx[2] - bq[2]) / bd};
+    hf_add(cand, nc, HF_POINT, bd - r, n, bt, over, 10);
+  }
+}
+
+// distance from p to triangle (a, b, c) (Ericson, Real-Time Collision Detection 5.1.5)
+__device__ float hf_pt_tri(const float* p, const float* a, const float* b, const float* c);
+
+// distance from p to the heightfield surface where it is below reach: the top triangles of cells rmin .. rmax - 1,
+// cmin .. cmax - 1 (cell (r, c) between columns c, c + 1) within reach of p horizontally (a triangle nearer than reach
+// is in one of them; the others are not visited), hfield frame; >= reach if none is nearer
+__device__ float hf_surf_dist(const float* p, float reach, int rmin, int rmax, int cmin, int cmax, float dx, float dy,
+                              const float* hs, const float* hd, int ncol) {
+  float best = 3.4e38f;
+  const float pad = reach + 1e-4f;
+  const int c0 = max(cmin, int(floorf((p[0] - pad + hs[0]) / dx))), c1 = min(cmax - 1, int(floorf((p[0] + pad + hs[0]) / dx)));
+  const int r0 = max(rmin, int(floorf((p[1] - pad + hs[1]) / dy))), r1 = min(rmax - 1, int(floorf((p[1] + pad + hs[1]) / dy)));
+  for (int rr = r0; rr <= r1; rr++)
+    for (int cc = c0; cc <= c1; cc++) {
+      float v00[3] = {dx * float(cc) - hs[0], dy * float(rr) - hs[1], hd[rr * ncol + cc] * hs[2]};
+      float v01[3] = {v00[0], dy * float(rr + 1) - hs[1], hd[(rr + 1) * ncol + cc] * hs[2]};
+      float v10[3] = {dx * float(cc + 1) - hs[0], v00[1], hd[rr * ncol + cc + 1] * hs[2]};
+      float v11[3] = {v10[0], v01[1], hd[(rr + 1) * ncol + cc + 1] * hs[2]};
+      best = fminf(best, fminf(hf_pt_tri(p, v00, v01, v10), hf_pt_tri(p, v01, v10, v11)));
+    }
+  return best;
+}
+
+__device__ float hf_pt_tri(const float* p, const float* a, const float* b, const float* c) {
+  float ab[3], ac[3], ap[3], q[3];
+  for (int k = 0; k < 3; k++) { ab[k] = b[k] - a[k]; ac[k] = c[k] - a[k]; ap[k] = p[k] - a[k]; }
+  float d1 = dot3(ab, ap), d2 = dot3(ac, ap);
+  if (d1 <= 0.f && d2 <= 0.f) { for (int k = 0; k < 3; k++) q[k] = a[k]; }
+  else {
+    float bp[3] = {p[0] - b[0], p[1] - b[1], p[2] - b[2]}, d3 = dot3(ab, bp), d4 = dot3(ac, bp);
+    float cp[3] = {p[0] - c[0], p[1] - c[1], p[2] - c[2]}, d5 = dot3(ab, cp), d6 = dot3(ac, cp);
+    float vc = d1 * d4 - d3 * d2, vb = d5 * d2 - d1 * d6, va = d3 * d6 - d5 * d4;
+    if (d3 >= 0.f && d4 <= d3) { for (int k = 0; k < 3; k++) q[k] = b[k]; }
+    else if (d6 >= 0.f && d5 <= d6) { for (int k = 0; k < 3; k++) q[k] = c[k]; }
+    else if (vc <= 0.f && d1 >= 0.f && d3 <= 0.f) { float v = d1 / (d1 - d3); for (int k = 0; k < 3; k++) q[k] = a[k] + v * ab[k]; }
+    else if (vb <= 0.f && d2 >= 0.f && d6 <= 0.f) { float w = d2 / (d2 - d6); for (int k = 0; k < 3; k++) q[k] = a[k] + w * ac[k]; }
+    else if (va <= 0.f && (d4 - d3) >= 0.f && (d5 - d6) >= 0.f) {
+      float w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+      for (int k = 0; k < 3; k++) q[k] = b[k] + w * (c[k] - b[k]);
+    } else {
+      float den = 1.f / (va + vb + vc), v = vb * den, w = vc * den;
+      for (int k = 0; k < 3; k++) q[k] = a[k] + v * ab[k] + w * ac[k];
+    }
+  }
+  float w[3] = {p[0] - q[0], p[1] - q[1], p[2] - q[2]};
+  return sqrtf(dot3(w, w));
+}
+
+// add_contact (step.py) returning the contact's index (-1 beyond MAXCON): the native contacts tape their candidate
+template <class S>
+__device__ __forceinline__ int add_contact_aux(S& s, int pair, int slot, float dist, const float* pos,
+                                               const float* frame) {
+  int c = atomicAdd(&s.ncon, 1);
+  if (c >= MAXCON) return -1;
+  s.con_pair[c] = pair;
+  s.con_slot[c] = (unsigned char)(slot & 255);
+  s.con_elem[c] = (unsigned short)(slot >> 8);
+  s.con_dim[c] = PDIM(pair);
+  s.con_dist[c] = dist;
+  for (int k = 0; k < 3; k++) s.con_pos[c][k] = pos[k];
+  for (int k = 0; k < 9; k++) s.con_frame[c][k] = frame[k];
+  s.con_mu[c] = PFOOT(pair) ? s.fric : PMU(pair);
+  return c;
+}
+
+// the geom's core in the frame of heightfield j: a + t d (t in [0, 1]), and its bounding box lo .. hi (with the radius)
+__device__ __noinline__ void hf_core(int j, int gt, const float* sz, const float* gp, const float* gq, float* a,
+                                     float* d, float* lo, float* hi) {
+  const float* hh = g_ter.hfh + 16 * j;
+  float dw[3] = {gp[0] - hh[0], gp[1] - hh[1], gp[2] - hh[2]}, c[3], ax[3] = {0.f, 0.f, 0.f};
+  mtv3(hh + 3, dw, c);
+  const float r = sz[0], hl = gt == 2 ? sz[1] : 0.f;
+  if (gt == 2) { float aw[3]; zaxis_rn(gq, aw); mtv3(hh + 3, aw, ax); }
+  for (int k = 0; k < 3; k++) {
+    float e = fabsf(ax[k]) * hl + r;
+    lo[k] = c[k] - e; hi[k] = c[k] + e;
+    a[k] = c[k] - hl * ax[k]; d[k] = 2.f * hl * ax[k];
+  }
+}
+
+// top vertices of prism (cell rr, cc: columns cc - 1 .. cc; triangle i) of heightfield j, counterclockwise from above
+// (MuJoCo Warp's strip: (cc-1, rr) (cc-1, rr+1) (cc, rr), then (cc-1, rr+1) (cc, rr) (cc, rr+1)); false where the
+// prism is below zmin (MuJoCo's prism height test)
+__device__ __noinline__ bool hf_prism_verts(int j, int rr, int cc, int i, float zmin, float (*v)[3]) {
+  const float* hs = g_ter.hfh + 16 * j + 12;
+  const int* hi = g_ter.hfi + 4 * j;
+  const float* hd = g_ter.hfd + hi[2];
+  const int nrow = hi[0], ncol = hi[1];
+  const float dx = 2.f * hs[0] / float(ncol - 1), dy = 2.f * hs[1] / float(nrow - 1);
+  const int pc[2][3] = {{cc - 1, cc - 1, cc}, {cc - 1, cc, cc}}, pr[2][3] = {{rr, rr + 1, rr}, {rr + 1, rr, rr + 1}};
+  for (int k = 0; k < 3; k++) {
+    v[k][0] = dx * float(pc[i][k]) - hs[0];
+    v[k][1] = dy * float(pr[i][k]) - hs[1];
+    v[k][2] = hd[pr[i][k] * ncol + pc[i][k]] * hs[2];
+  }
+  if (v[0][2] < zmin && v[1][2] < zmin && v[2][2] < zmin) return false;
+  float e1[3] = {v[1][0] - v[0][0], v[1][1] - v[0][1], 0.f}, e2[3] = {v[2][0] - v[0][0], v[2][1] - v[0][1], 0.f};
+  if (e1[0] * e2[1] - e1[1] * e2[0] < 0.f)
+    for (int k = 0; k < 3; k++) { float t = v[1][k]; v[1][k] = v[2][k]; v[2][k] = t; }
+  return true;
+}
+
+// a chosen candidate as a contact (hfield frame)
+__device__ __noinline__ void hf_con_of(const HfCand& c, const float* a, const float* d, float r, HfCon* o) {
+  o->dist = c.dist; o->t = c.t; o->type = c.type; o->pid = c.pid;
+  hf_pos(c, a, d, r, o->pos);
+  for (int q = 0; q < 3; q++) { o->n[q] = c.n[q]; o->q[q] = a[q] + c.t * d[q] - (c.dist + r) * c.n[q]; }
+}
+
+// the native contacts of robot geom (type gt, size sz, pose gp / gq) and heightfield j: out[0..n-1] in MuJoCo's order
+// (deepest, farthest, ...; hfield frame), returns n (0..4); *over: candidates beyond HF_MAXCAND were dropped
+__device__ __noinline__ int hfield_native(int j, int gt, const float* sz, const float* gp, const float* gq,
+                                          HfCon* out, int* over) {
+  const float* hh = g_ter.hfh + 16 * j;
+  const int* hi = g_ter.hfi + 4 * j;
+  const float *hs = hh + 12, *hd = g_ter.hfd + hi[2];
+  const int nrow = hi[0], ncol = hi[1];
+  const float r = sz[0];
+  float a[3], d[3], lo[3], hi3[3];
+  hf_core(j, gt, sz, gp, gq, a, d, lo, hi3);
+  *over = 0;
+  if (lo[0] > hs[0] || hi3[0] < -hs[0] || lo[1] > hs[1] || hi3[1] < -hs[1] || lo[2] > hs[2] || hi3[2] < -hs[3])
+    return 0;
+  const float xs = 0.5f * float(ncol - 1) / hs[0], ys = 0.5f * float(nrow - 1) / hs[1];
+  const int cmin = max(0, int(floorf((lo[0] + hs[0]) * xs))), cmax = min(ncol - 1, int(ceilf((hi3[0] + hs[0]) * xs)));
+  const int rmin = max(0, int(floorf((lo[1] + hs[1]) * ys))), rmax = min(nrow - 1, int(ceilf((hi3[1] + hs[1]) * ys)));
+  const float dx = 2.f * hs[0] / float(ncol - 1), dy = 2.f * hs[1] / float(nrow - 1);
+  HfCand cand[HF_MAXCAND];
+  int nc = 0;
+  for (int rr = rmin; rr < rmax; rr++)
+    for (int cc = cmin + 1; cc <= cmax; cc++)
+      for (int i = 0; i < 2; i++) {
+        float v[3][3];
+        if (!hf_prism_verts(j, rr, cc, i, lo[2], v)) continue;
+        const int nc0 = nc;
+        hf_prism(v, -hs[3], a, d, r, cand, &nc, over);
+        for (int q = nc0; q < nc; q++) cand[q].pid |= (unsigned)((rr * ncol + cc) << 1 | i) << 4;
+      }
+  // keep the candidates whose prism point is a closest point of the heightfield surface (the prisms' top triangles):
+  // a prism's own edge next to a neighbouring triangle (an edge inside a flat or concave part of the surface) gives a
+  // farther point than that triangle and is dropped; convex ridges and peaks stay. A candidate inside the core
+  // (0 < t < 1: a face-region end at a triangle boundary, an edge point) stays only where the core's distance to the
+  // surface has a
+  // local minimum: the surface 0.5 mm along the core on either side is not closer (a ridge under the core; on a plane
+  // only the core's ends stay, as the plane's contacts). Penetrating cores (HF_DEEP) stay
+  const float dl = sqrtf(dot3(d, d));
+  int nk = 0;
+  for (int i = 0; i < nc; i++) {
+    const HfCand& ci = cand[i];
+    bool keep = true;
+    if (ci.type != HF_DEEP) {
+      float x[3], h = ci.dist + r;  // the core point and its distance to the candidate's prism
+      for (int k = 0; k < 3; k++) x[k] = a[k] + ci.t * d[k];
+      keep = hf_surf_dist(x, h, rmin, rmax, cmin, cmax, dx, dy, hs, hd, ncol) >= h - 1e-6f;
+      if (keep && ci.t > 0.f && ci.t < 1.f)  // inside the core: a local minimum of the distance along it
+        for (int sg = -1; sg <= 1 && keep; sg += 2) {
+          float tb = fminf(fmaxf(ci.t + float(sg) * 5e-4f / fmaxf(dl, 1e-6f), 0.f), 1.f), xb[3];
+          for (int k = 0; k < 3; k++) xb[k] = a[k] + tb * d[k];
+          keep = hf_surf_dist(xb, h, rmin, rmax, cmin, cmax, dx, dy, hs, hd, ncol) >= h - 1e-8f;
+        }
+    }
+    if (keep) cand[nk++] = cand[i];
+  }
+  nc = nk;
+  if (nc == 0) return 0;
+  // MuJoCo's choice (ccd_hfield_kernel): the deepest, the farthest from it, the farthest from their line, the fourth
+  int id0 = 0;
+  for (int i = 1; i < nc; i++) if (cand[i].dist < cand[id0].dist) id0 = i;
+  float p0[3], p1[3], p2[3], pi[3];
+  hf_pos(cand[id0], a, d, r, p0);
+  int ids[4] = {id0, -1, -1, -1}, n = 1;
+  float best = -1.f;
+  for (int i = 0; i < nc; i++) {
+    if (i == id0) continue;
+    hf_pos(cand[i], a, d, r, pi);
+    float w[3] = {pi[0] - p0[0], pi[1] - p0[1], pi[2] - p0[2]}, l = sqrtf(dot3(w, w));
+    if (l > best) { best = l; ids[1] = i; }
+  }
+  if (ids[1] >= 0 && best >= HF_MIN_NEXT) {
+    n = 2;
+    hf_pos(cand[ids[1]], a, d, r, p1);
+    const float* n0 = cand[id0].n;
+    float l01[3], w01[3] = {p0[0] - p1[0], p0[1] - p1[1], p0[2] - p1[2]};
+    cross(n0, w01, l01);
+    best = -1.f;
+    for (int i = 0; i < nc; i++) {
+      if (i == id0 || i == ids[1]) continue;
+      hf_pos(cand[i], a, d, r, pi);
+      float w[3] = {pi[0] - p0[0], pi[1] - p0[1], pi[2] - p0[2]}, l = fabsf(dot3(w, l01));
+      if (l > best) { best = l; ids[2] = i; }
+    }
+    if (ids[2] >= 0 && best >= HF_MIN_NEXT) {
+      n = 3;
+      hf_pos(cand[ids[2]], a, d, r, p2);
+      float m2[3], m12[3], w02[3] = {p0[0] - p2[0], p0[1] - p2[1], p0[2] - p2[2]},
+                           w12[3] = {p1[0] - p2[0], p1[1] - p2[1], p1[2] - p2[2]};
+      cross(n0, w02, m2);
+      cross(n0, w12, m12);
+      best = -1.f;
+      for (int i = 0; i < nc; i++) {
+        if (i == id0 || i == ids[1] || i == ids[2]) continue;
+        hf_pos(cand[i], a, d, r, pi);
+        float w[3] = {pi[0] - p0[0], pi[1] - p0[1], pi[2] - p0[2]};
+        float u[3] = {p1[0] - pi[0], p1[1] - pi[1], p1[2] - pi[2]};
+        float l = fabsf(dot3(w, m2)) + fabsf(dot3(u, m12));
+        if (l > best) { best = l; ids[3] = i; }
+      }
+      if (ids[3] >= 0 && best >= HF_MIN_NEXT) n = 4;
+    }
+  }
+  for (int k = 0; k < n; k++) hf_con_of(cand[ids[k]], a, d, r, out + k);
+  return n;
+}
+
+// the adjoint's replay of a native contact: the candidate pid of geom (gt, sz, gp, gq) and heightfield j, recomputed
+// from its prism alone (the forward's bits: the same functions)
+__device__ __noinline__ bool hfield_native_one(int j, int gt, const float* sz, const float* gp, const float* gq,
+                                               unsigned pid, HfCon* o) {
+  const float* hh = g_ter.hfh + 16 * j;
+  const int ncol = g_ter.hfi[4 * j + 1];
+  float a[3], d[3], lo[3], hi3[3], v[3][3];
+  hf_core(j, gt, sz, gp, gq, a, d, lo, hi3);
+  const int cell = (int)(pid >> 5), rr = cell / ncol, cc = cell - rr * ncol, i = (int)((pid >> 4) & 1u);
+  if (!hf_prism_verts(j, rr, cc, i, lo[2], v)) return false;
+  HfCand cand[12];
+  int nc = 0, over = 0;
+  hf_prism(v, -hh[15], a, d, sz[0], cand, &nc, &over);
+  for (int q = 0; q < nc; q++)
+    if (cand[q].pid == (pid & 15u)) {
+      cand[q].pid = pid;
+      hf_con_of(cand[q], a, d, sz[0], o);
+      return true;
+    }
+  return false;
+}
+#endif  // TERRAIN_HF_NATIVE
+
+// ---- height scan (torch_ffi.raycast): rays against the terrain, MuJoCo Warp's ray_box / ray_hfield (ray.py) ----
+#define TR_MINVAL 1e-15f  // mjMINVAL
+__device__ __forceinline__ float tr_div(float x, float y) { return x / (y != 0.f ? y : TR_MINVAL); }
+
+// _ray_quad: the first non-negative solution of a x^2 + 2 b x + c = 0, else -1
+__device__ __forceinline__ float tr_quad(float a, float b, float c) {
+  float det = b * b - a * c;
+  if (det < TR_MINVAL) return -1.f;
+  det = sqrtf(det);
+  const float den = tr_div(1.f, a), x0 = (-b - det) * den, x1 = (-b + det) * den;
+  return x0 >= 0.f ? x0 : (x1 >= 0.f ? x1 : -1.f);
+}
+
+// ray_box: box at pos with rotation R (row major) and half sizes sz; all[6]: per side solutions (or -1), nrm: world
+__device__ float tr_box(const float* pos, const float* R, const float* sz, const float* pnt, const float* vec, float* all,
+                        float* nrm) {
+  for (int i = 0; i < 6; i++) all[i] = -1.f;
+  for (int k = 0; k < 3; k++) nrm[k] = 0.f;
+  float dif[3] = {pnt[0] - pos[0], pnt[1] - pos[1], pnt[2] - pos[2]};
+  if (tr_quad(dot3(vec, vec), dot3(vec, dif), dot3(dif, dif) - dot3(sz, sz)) < 0.f) return -1.f;  // bounding sphere
+  float lp[3], lv[3];
+  mtv3(R, dif, lp);
+  mtv3(R, vec, lv);
+  float x = -1.f;
+  int fa = -1, fs = -1;
+  for (int i = 0; i < 3; i++) {
+    if (!(fabsf(lv[i]) > TR_MINVAL)) continue;
+    for (int side = -1; side < 2; side += 2) {
+      const float sol = (float(side) * sz[i] - lp[i]) / lv[i];
+      if (sol >= 0.f) {
+        const int i0 = i == 0 ? 1 : 0, i1 = i == 2 ? 1 : 2;
+        const float p0 = lp[i0] + sol * lv[i0], p1 = lp[i1] + sol * lv[i1];
+        if (fabsf(p0) <= sz[i0] && fabsf(p1) <= sz[i1]) {
+          if (x < 0.f || sol < x) { x = sol; fa = i; fs = side; }
+          all[2 * i + (side + 1) / 2] = sol;
+        }
+      }
+    }
+  }
+  if (x >= 0.f) {
+    float nl[3] = {0.f, 0.f, 0.f};
+    nl[fa] = float(fs);
+    mv3(R, nl, nrm);
+  }
+  return x;
+}
+
+// _ray_triangle (local frame; b0, b1: _orthogonal_basis of the ray direction)
+__device__ float tr_tri(const float* v0, const float* v1, const float* v2, const float* pnt, const float* vec,
+                        const float* b0, const float* b1, float* nrm) {
+  float d0[3], d1[3], d2[3];
+  for (int k = 0; k < 3; k++) { d0[k] = v0[k] - pnt[k]; d1[k] = v1[k] - pnt[k]; d2[k] = v2[k] - pnt[k]; }
+  const float p00 = dot3(d0, b0), p01 = dot3(d0, b1), p10 = dot3(d1, b0), p11 = dot3(d1, b1), p20 = dot3(d2, b0),
+              p21 = dot3(d2, b1);
+  if ((p00 > 0.f && p10 > 0.f && p20 > 0.f) || (p00 < 0.f && p10 < 0.f && p20 < 0.f) ||
+      (p01 > 0.f && p11 > 0.f && p21 > 0.f) || (p01 < 0.f && p11 < 0.f && p21 < 0.f))
+    return -1.f;
+  const float A00 = p00 - p20, A10 = p10 - p20, A01 = p01 - p21, A11 = p11 - p21, bb0 = -p20, bb1 = -p21;
+  const float det = A00 * A11 - A10 * A01;
+  if (fabsf(det) < TR_MINVAL) return -1.f;
+  const float t0 = (A11 * bb0 - A10 * bb1) / det, t1 = (-A01 * bb0 + A00 * bb1) / det;
+  if (t0 < 0.f || t1 < 0.f || t0 + t1 > 1.f) return -1.f;
+  float e0[3], e1[3], e2[3], n[3];
+  for (int k = 0; k < 3; k++) { e0[k] = v0[k] - v2[k]; e1[k] = v1[k] - v2[k]; e2[k] = pnt[k] - v2[k]; }
+  cross(e0, e1, n);
+  const float den = dot3(vec, n);
+  if (fabsf(den) < TR_MINVAL) return -1.f;
+  const float dist = -dot3(e2, n) / den, il = rsqrtf(dot3(n, n));
+  for (int k = 0; k < 3; k++) nrm[k] = n[k] * il;
+  return dist >= 0.f ? dist : -1.f;
+}
+
+// ray_hfield: terrain heightfield j (the base box, the top box, the triangles under the ray's part in the top box,
+// split along the (c, r)-(c+1, r+1) diagonal as MuJoCo Warp's rays, and the top box's sides under the boundary heights)
+__device__ float tr_hfield(int j, const float* pnt, const float* vec, float* nrm) {
+  const float* hh = g_ter.hfh + 16 * j;
+  const int* hi = g_ter.hfi + 4 * j;
+  const float *pos = hh, *R = hh + 3, *size = hh + 12, *hd = g_ter.hfd + hi[2];
+  const int nrow = hi[0], ncol = hi[1];
+  const float col[3] = {R[2], R[5], R[8]};
+  const float bs = size[3] * 0.5f, ts = size[2] * 0.5f;
+  float bsz[3] = {size[0], size[1], bs}, tsz[3] = {size[0], size[1], ts}, bpos[3], tpos[3], allb[6], all[6], nb[3],
+        nt[3];
+  for (int k = 0; k < 3; k++) { bpos[k] = pos[k] - col[k] * bs; tpos[k] = pos[k] + col[k] * ts; }
+  float x = tr_box(bpos, R, bsz, pnt, vec, allb, nb);
+  const float top = tr_box(tpos, R, tsz, pnt, vec, all, nt);
+  if (top < 0.f) { for (int k = 0; k < 3; k++) nrm[k] = nb[k]; return x; }
+  float dif[3] = {pnt[0] - pos[0], pnt[1] - pos[1], pnt[2] - pos[2]}, lp[3], lv[3];
+  mtv3(R, dif, lp);
+  mtv3(R, vec, lv);
+  const float sg = lv[2] >= 0.f ? 1.f : -1.f, a = -1.f / (sg + lv[2]), b = lv[0] * lv[1] * a;
+  const float b0[3] = {1.f + sg * lv[0] * lv[0] * a, sg * b, -sg * lv[0]}, b1[3] = {b, sg + lv[1] * lv[1] * a, -lv[1]};
+  float s0 = 0.f, s1 = top;
+  for (int i = 0; i < 6; i++)
+    if (all[i] > s1) { s0 = top; s1 = all[i]; }
+  const float dx = tr_div(2.f * size[0], float(ncol - 1)), dy = tr_div(2.f * size[1], float(nrow - 1));
+  const float SX0 = tr_div(lp[0] + s0 * lv[0] + size[0], dx), SX1 = tr_div(lp[0] + s1 * lv[0] + size[0], dx);
+  const float SY0 = tr_div(lp[1] + s0 * lv[1] + size[1], dy), SY1 = tr_div(lp[1] + s1 * lv[1] + size[1], dy);
+  const int cmin = max(0, int(floorf(fminf(SX0, SX1)) - 1.f)), cmax = min(ncol - 1, int(ceilf(fmaxf(SX0, SX1)) + 1.f));
+  const int rmin = max(0, int(floorf(fminf(SY0, SY1)) - 1.f)), rmax = min(nrow - 1, int(ceilf(fmaxf(SY0, SY1)) + 1.f));
+  float nl[3] = {0.f, 0.f, 0.f};
+  if (x >= 0.f) mtv3(R, nb, nl);
+  for (int r = rmin; r < rmax; r++)
+    for (int c = cmin; c < cmax; c++) {
+      const float x0 = dx * float(c) - size[0], x1 = dx * float(c + 1) - size[0];
+      const float y0 = dy * float(r) - size[1], y1 = dy * float(r + 1) - size[1];
+      const float h00 = hd[r * ncol + c] * size[2], h10 = hd[r * ncol + c + 1] * size[2];
+      const float h11 = hd[(r + 1) * ncol + c + 1] * size[2], h01 = hd[(r + 1) * ncol + c] * size[2];
+      const float va[3] = {x0, y0, h00}, vb[3] = {x1, y0, h10}, vc[3] = {x1, y1, h11}, vd[3] = {x0, y1, h01};
+      float nt2[3];
+      float sol = tr_tri(va, vb, vc, lp, lv, b0, b1, nt2);
+      if (sol >= 0.f && (x < 0.f || sol < x)) { x = sol; for (int k = 0; k < 3; k++) nl[k] = nt2[k]; }
+      sol = tr_tri(va, vc, vd, lp, lv, b0, b1, nt2);
+      if (sol >= 0.f && (x < 0.f || sol < x)) { x = sol; for (int k = 0; k < 3; k++) nl[k] = nt2[k]; }
+    }
+  for (int i = 0; i < 4; i++) {
+    if (!(all[i] >= 0.f && (all[i] < x || x < 0.f))) continue;
+    const float z = tr_div(lp[2] + all[i] * lv[2], size[2]);
+    float y, y0, z0, z1;
+    if (i < 2) {
+      y = tr_div(lp[1] + all[i] * lv[1] + size[1], dy);
+      y0 = fmaxf(0.f, fminf(float(nrow - 2), floorf(y)));
+      const int k0 = int(rintf(y0)), k1 = int(rintf(y0 + 1.f));
+      z0 = i == 1 ? hd[k0 * ncol + ncol - 1] : hd[k0 * ncol];
+      z1 = i == 1 ? hd[k1 * ncol + ncol - 1] : hd[k1 * ncol];
+    } else {
+      y = tr_div(lp[0] + all[i] * lv[0] + size[0], dx);
+      y0 = fmaxf(0.f, fminf(float(ncol - 2), floorf(y)));
+      const int k0 = int(rintf(y0)), k1 = int(rintf(y0 + 1.f));
+      z0 = i == 3 ? hd[k0 + (nrow - 1) * ncol] : hd[k0];
+      z1 = i == 3 ? hd[k1 + (nrow - 1) * ncol] : hd[k1];
+    }
+    if (z < z0 * (y0 + 1.f - y) + z1 * (y - y0)) {
+      x = all[i];
+      nl[0] = float(i == 1) - float(i == 0); nl[1] = float(i == 3) - float(i == 2); nl[2] = 0.f;
+    }
+  }
+  if (x >= 0.f) mv3(R, nl, nrm);
+  else for (int k = 0; k < 3; k++) nrm[k] = 0.f;
+  return x;
+}
+
+// n rays (origins pnt, unit directions vec, world, 3 floats each) against the terrain: dist (the nearest hit; -1 for
+// none or beyond maxd) and nrm (its world normal, 0 for none); the elements in the grid cells under the segment
+// pnt .. pnt + maxd vec
+__global__ void k_terrain_rays(int n, const float* pnt, const float* vec, float maxd, float* dist, float* nrm) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const float *p = pnt + 3 * i, *v = vec + 3 * i;
+  float best = -1.f, bn[3] = {0.f, 0.f, 0.f};
+  if (g_ter.grid != nullptr) {
+    const float x0 = g_ter.grid[0], y0 = g_ter.grid[1], ic = g_ter.grid[2];
+    const int nx = int(g_ter.grid[3]), ny = int(g_ter.grid[4]), nbox = int(g_ter.grid[5]);
+    const float ex = p[0] + maxd * v[0], ey = p[1] + maxd * v[1];
+    int c0 = max(0, int(floorf((fminf(p[0], ex) - x0) * ic))), c1 = min(nx - 1, int(floorf((fmaxf(p[0], ex) - x0) * ic)));
+    int r0 = max(0, int(floorf((fminf(p[1], ey) - y0) * ic))), r1 = min(ny - 1, int(floorf((fmaxf(p[1], ey) - y0) * ic)));
+    for (int r = r0; r <= r1; r++)
+      for (int c = c0; c <= c1; c++)
+        for (int k = g_ter.cstart[r * nx + c]; k < g_ter.cstart[r * nx + c + 1]; k++) {
+          const int e = g_ter.citems[k];
+          float all[6], nn[3], d;
+          if (e < nbox) { const float* b = g_ter.box + 15 * e; d = tr_box(b, b + 3, b + 12, p, v, all, nn); }
+          else d = tr_hfield(e - nbox, p, v, nn);
+          if (d >= 0.f && (best < 0.f || d < best)) { best = d; for (int q = 0; q < 3; q++) bn[q] = nn[q]; }
+        }
+  }
+  if (best > maxd) best = -1.f;
+  dist[i] = best;
+  for (int q = 0; q < 3; q++) nrm[3 * i + q] = best >= 0.f ? bn[q] : 0.f;
+}
+
+// robot geom g against terrain heightfield j (element nbox + j)
+template <class S>
+__device__ void terrain_hfield(S& s, int pair, int g, int j, int nbox) {
+  const float* hh = g_ter.hfh + 16 * j;
+  float d[3] = {s.gx[g][0] - hh[0], s.gx[g][1] - hh[1], s.gx[g][2] - hh[2]}, pl[3];
+  mtv3(hh + 3, d, pl);
+  if (pl[2] - c_grbound[g] > hh[14]) return;  // above the heightfield's top
+#if TERRAIN_HF_NATIVE
+  HfCon con[4];
+  int over;
+  const int nn = hfield_native(j, c_gtype[g], c_gsize + 3 * g, s.gx[g], s.gq[g], con, &over);
+  if (over) atomicOr(&s.unsupported, 4);  // candidates dropped (counted as a contact overflow)
+  for (int k = 0; k < nn; k++) {
+    float pos[3], nw[3], fr[9];
+    mv3(hh + 3, con[k].pos, pos);
+    for (int i = 0; i < 3; i++) pos[i] += hh[i];
+    mv3(hh + 3, con[k].n, nw);
+    make_frame(nw, fr);
+    const int c = add_contact_aux(s, pair, k | (nbox + j) << 8, con[k].dist, pos, fr);
+    if (c >= 0) s.con_aux[c] = con[k].pid;  // the tape's taux: the adjoint replays this prism candidate only
+  }
+  return;
+#endif
+  const int gt = c_gtype[g], npts = gt == 2 ? TERRAIN_CAP_PTS : 1;
+  for (int k = 0; k < npts; k++) {
+    float dist, pos[3], nw[3], fr[9];
+    if (!terrain_hfield_point(j, gt, c_gsize + 3 * g, s.gx[g], s.gq[g], k, &dist, pos, nw) || dist >= 0.f) continue;
+    make_frame(nw, fr);
+    add_contact(s, pair, k | (nbox + j) << 8, dist, pos, fr);
+  }
+}
+
+// the terrain's contacts of the robot geoms (virtual pairs NPAIR .. NPAIR + NTG - 1), one geom per lane
+template <class S>
+__device__ void collide_terrain(S& s, int lane) {
+  if (g_ter.grid == nullptr) return;
+  const float x0 = g_ter.grid[0], y0 = g_ter.grid[1], ic = g_ter.grid[2];
+  const int nx = int(g_ter.grid[3]), ny = int(g_ter.grid[4]), nbox = int(g_ter.grid[5]);
+  for (int t = lane; t < NTG; t += 32) {
+    int pair = NPAIR + t, g = PG2(pair);
+    const float* p = s.gx[g];
+    float rb = c_grbound[g];
+    int c0 = int(floorf((p[0] - rb - x0) * ic)), c1 = int(floorf((p[0] + rb - x0) * ic));
+    int r0 = int(floorf((p[1] - rb - y0) * ic)), r1 = int(floorf((p[1] + rb - y0) * ic));
+    if (c1 < 0 || r1 < 0 || c0 >= nx || r0 >= ny) continue;
+    c0 = max(c0, 0); r0 = max(r0, 0); c1 = min(c1, nx - 1); r1 = min(r1, ny - 1);
+    for (int r = r0; r <= r1; r++)
+      for (int c = c0; c <= c1; c++)
+        for (int k = g_ter.cstart[r * nx + c]; k < g_ter.cstart[r * nx + c + 1]; k++) {
+          int e = g_ter.citems[k];
+          if (c != max(c0, g_ter.ecell[2 * e]) || r != max(r0, g_ter.ecell[2 * e + 1])) continue;  // once per element
+          if (e < nbox) terrain_box(s, pair, g, e);
+          else terrain_hfield(s, pair, g, e - nbox, nbox);
+        }
+  }
+}
+"""
+
+# (anchor, replacement): each anchor occurs once in STEP_DEVICE + STEP_KERNEL
+TERRAIN_HOOKS = (
+    # the terrain's device code, before collide_pair
+    ("""template <class S>
+__device__ DK_INL_COLLIDE void collide_pair(S& s, int pair) {""",
+     None),  # TERRAIN_DEVICE with capbox_segs (terrain_source)
+    # each contact's terrain element (the tape's telem table): add_contact's slot >> 8
+    ("""  unsigned char con_slot[MAXCON];  // which contact of its pair (tape): plane-capsule end, parallel capsule-capsule candidate
+""",
+     """  unsigned char con_slot[MAXCON];  // which contact of its pair (tape): plane-capsule end, parallel capsule-capsule candidate
+  unsigned short con_elem[MAXCON];  // terrain builds: the contact's terrain element (add_contact's slot >> 8)
+"""),
+    ("""  float con_mu[MAXCON];
+  unsigned char con_slot[MAXCON];
+  float *con_dist""",
+     """  float con_mu[MAXCON];
+  unsigned char con_slot[MAXCON];
+  unsigned short con_elem[MAXCON];
+  float *con_dist"""),
+    ("""  s.con_slot[c] = (unsigned char)slot;
+""",
+     """  s.con_slot[c] = (unsigned char)slot;
+  s.con_elem[c] = (unsigned short)(slot >> 8);
+"""),
+    # the tape's contact tables: pair | slot << 10 (the virtual pairs need 10 bits), and the elements
+    ("""      unsigned e0 = 2 * i < ncon ? (unsigned)s.con_pair[2 * i] | (unsigned)s.con_slot[2 * i] << 9 : TAPE_CON_NONE;
+      unsigned e1 = 2 * i + 1 < ncon ? (unsigned)s.con_pair[2 * i + 1] | (unsigned)s.con_slot[2 * i + 1] << 9
+                                     : TAPE_CON_NONE;
+      __stcs(rec + OFF_CON + i, __uint_as_float(e0 | e1 << 16));""",
+     """      unsigned e0 = 2 * i < ncon ? (unsigned)s.con_pair[2 * i] | (unsigned)s.con_slot[2 * i] << 10 : TAPE_CON_NONE;
+      unsigned e1 = 2 * i + 1 < ncon ? (unsigned)s.con_pair[2 * i + 1] | (unsigned)s.con_slot[2 * i + 1] << 10
+                                     : TAPE_CON_NONE;
+      __stcs(rec + OFF_CON + i, __uint_as_float(e0 | e1 << 16));
+      unsigned x0 = 2 * i < ncon ? (unsigned)s.con_elem[2 * i] : 0u;
+      unsigned x1 = 2 * i + 1 < ncon ? (unsigned)s.con_elem[2 * i + 1] : 0u;
+      __stcs(rec + OFF_TELEM + i, __uint_as_float(x0 | x1 << 16));"""),
+    # broad phase: the terrain replaces the floor plane unless TERRAIN_FLOOR
+    ("""        if (PPLANE(pr)) {
+#if FLOOR_G >= 0""",
+     """        if (PPLANE(pr)) {
+#if !TERRAIN_FLOOR
+          keep = false;
+#else
+#if FLOOR_G >= 0"""),
+    ("""          keep = dot3(dif, n) <= RFMA(c_grbound[g2], 1.f + 1e-5f, 1e-6f);
+        } else {""",
+     """          keep = dot3(dif, n) <= RFMA(c_grbound[g2], 1.f + 1e-5f, 1e-6f);
+#endif
+        } else {"""),
+    # narrow phase: the terrain contacts after the model's pairs
+    ("""    for (int i = lane; i < ncand; i += 32) collide_pair(s, s.cand[i]);
+""",
+     """    for (int i = lane; i < ncand; i += 32) collide_pair(s, s.cand[i]);
+    collide_terrain(s, lane);
+"""),
+)
+
+
+# native heightfield builds (TerrainConfig.mode = "native"), after TERRAIN_HOOKS: each contact's candidate id (the
+# tape's taux), so that the adjoint replays one prism
+TERRAIN_NATIVE_HOOKS = (
+    ("""  unsigned short con_elem[MAXCON];  // terrain builds: the contact's terrain element (add_contact's slot >> 8)
+""",
+     """  unsigned short con_elem[MAXCON];  // terrain builds: the contact's terrain element (add_contact's slot >> 8)
+  unsigned con_aux[MAXCON];  // native heightfield contacts: the candidate id (HfCand.pid), else 0
+"""),
+    ("""  unsigned short con_elem[MAXCON];
+  float *con_dist""",
+     """  unsigned short con_elem[MAXCON];
+  unsigned con_aux[MAXCON];
+  float *con_dist"""),
+    ("""  s.con_elem[c] = (unsigned short)(slot >> 8);
+  s.con_dim[c] = PDIM(pair);
+  s.con_dist[c] = dist;
+  for (int k = 0; k < 3; k++) s.con_pos[c][k] = pos[k];
+  for (int k = 0; k < 9; k++) s.con_frame[c][k] = frame[k];
+  s.con_mu[c] = PFOOT(pair) ? s.fric : PMU(pair);
+  return true;""",
+     """  s.con_elem[c] = (unsigned short)(slot >> 8);
+  s.con_aux[c] = 0u;
+  s.con_dim[c] = PDIM(pair);
+  s.con_dist[c] = dist;
+  for (int k = 0; k < 3; k++) s.con_pos[c][k] = pos[k];
+  for (int k = 0; k < 9; k++) s.con_frame[c][k] = frame[k];
+  s.con_mu[c] = PFOOT(pair) ? s.fric : PMU(pair);
+  return true;"""),
+    ("""      __stcs(rec + OFF_TELEM + i, __uint_as_float(x0 | x1 << 16));""",
+     """      __stcs(rec + OFF_TELEM + i, __uint_as_float(x0 | x1 << 16));
+      __stcs(rec + OFF_TAUX + 2 * i, __uint_as_float(2 * i < ncon ? s.con_aux[2 * i] : 0u));
+      if (2 * i + 1 < MAXCON) __stcs(rec + OFF_TAUX + 2 * i + 1, __uint_as_float(2 * i + 1 < ncon ? s.con_aux[2 * i + 1] : 0u));"""),
+)
+
+
+def capbox_segs_source():
+    """capsule_box's witness search (STEP_DEVICE) as a function of its own: capbox_segs(...) -> the number of candidate
+    spheres (0..2) and their segment parameters segs[] (MuJoCo Warp's capsule_box_witness), for the terrain."""
+    i = STEP_DEVICE.index("// capsule-box (MuJoCo Warp's capsule_box_witness")
+    j = STEP_DEVICE.index("  for (int e = 0; e < 2; e++) {\n    if (e == 1 && !(second > -3.f)) break;", i)
+    src = STEP_DEVICE[i:j]
+    reps = (("// capsule-box (MuJoCo Warp's capsule_box_witness + capsule_box): up to two sphere-box contacts along the "
+             "segment\ntemplate <class S>\n__device__ void capsule_box(S& s, int pair, const float* cp, const float* "
+             "axisw, float cr, float hl, const float* bp,\n                            const float* R, const float* bs) {",
+             "// capsule_box's candidate spheres (generated from it by step.capbox_segs_source)\n"
+             "__device__ __noinline__ int capbox_segs(const float* cp, const float* axisw, float hl, const float* bp,\n"
+             "                                        const float* R, const float* bs, float* segs) {"),
+            ("  if (cltype == -4) return;\n", "  if (cltype == -4) return 0;\n"))
+    for a, b in reps:
+        if src.count(a) != 1:
+            raise RuntimeError(f"capbox_segs_source: {a[:60]!r}")
+        src = src.replace(a, b)
+    if "return;" in src:
+        raise RuntimeError("capbox_segs_source: a bare return left")
+    return src + "  segs[0] = bestseg;\n  if (!(second > -3.f)) return 1;\n  segs[1] = bestseg + second;\n  return 2;\n}\n"
+
+
+def apply_hooks(src, hooks):
+    """src with each (anchor, replacement) of hooks applied; every anchor must occur exactly once."""
+    for a, b in hooks:
+        if src.count(a) != 1:
+            raise RuntimeError(f"terrain hook anchor found {src.count(a)} times: {a[:60]!r}")
+        src = src.replace(a, b)
+    return src
+
+
+def terrain_source(src, terrain=None):
+    """src (STEP_DEVICE + STEP_KERNEL, or text containing them) with the terrain hooks for a terrain build; unchanged
+    when terrain is None."""
+    if terrain is None:
+        return src
+    dev = capbox_segs_source() + "\n" + TERRAIN_DEVICE.lstrip("\n") + "\n"
+    src = apply_hooks(src, [(a, dev + a if b is None else b) for a, b in TERRAIN_HOOKS])
+    if terrain[0].mode == "native":
+        src = apply_hooks(src, TERRAIN_NATIVE_HOOKS)
+    return src
+
+
 def extra_constants(m):
     """dof -> body map and per-body ancestor bitmasks (bit k: body k is the body or one of its ancestors)."""
     dofbody = np.asarray(m.dof_bodyid, np.float64)
@@ -2296,3 +3220,7 @@ def extra_constants(m):
 
 
 EXTRA_HEADER = "DKC int c_dofbody[NV];\nDKC unsigned int c_ancmask[NB];\n"
+
+
+
+

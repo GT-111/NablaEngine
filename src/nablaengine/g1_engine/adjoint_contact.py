@@ -62,11 +62,12 @@ def check_model(m):
     """The contact adjoint is for the mjlab model only: collision geoms are planes, spheres and capsules
     (no boxes), and no dof has a frictionloss row."""
     types = {int(m.geom_type[g]) for g in step.collision_geoms(m)}
-    assert int(mujoco.mjtGeom.mjGEOM_BOX) not in types, "the adjoint has no box collisions (mjlab model only)"
-    assert {step.GEOM_TYPE[t] for t in types} <= {0, 1, 2}, "collision geoms other than plane / sphere / capsule"
+    from nablaengine.g1_engine import model_hooks
+    has_box, box_ok, _ = model_hooks.box_pairs(m)
+    assert not has_box or box_ok, "the adjoint has box contacts with planes and boxes only (model_hooks)"
+    assert {step.GEOM_TYPE[t] for t in types} <= {0, 1, 2, 3}, "collision geoms other than plane / sphere / capsule / box"
     planes = [g for g in step.collision_geoms(m) if int(m.geom_type[g]) == int(mujoco.mjtGeom.mjGEOM_PLANE)]
     assert all(int(m.geom_bodyid[g]) == 0 for g in planes), "a plane not on the world body (it gets no cotangent)"
-    assert not (m.dof_frictionloss > 0).any(), "the adjoint has no frictionloss rows (mjlab model only)"
 
 
 def header(m):
@@ -504,6 +505,113 @@ __device__ __forceinline__ void geom_to_body_vjp(const float* xg, const float* X
 }
 """
 
+
+
+# ---- terrain builds (nablaengine.terrain; adjoint.ADJ_TERRAIN_HOOKS inserts it before adj_pair_geom) ----
+TERRAIN_DEVICE = r"""
+// A terrain contact (virtual pair NPAIR + t: geom 1 the static terrain, geom 2 the robot geom of type gt, size sz, pose
+// p2 / q2) with tape slot k | element << 8 (aux: a native heightfield contact's candidate, the tape's taux): the replay (dist, pos, fr: the forward's bits, by the same __noinline__
+// geometry, step.TERRAIN_DEVICE) and, with cot = (dbar, pbar, frbar), gb[6..11] = the robot geom's pose cotangents
+// (gb[0..5] = 0). The contact's point on the robot geom is a material point c = p2 + w l axis: the sphere centre (w = 0),
+// a capsule_box candidate (w: its segment parameter) or a heightfield sample point (w fixed); w is held constant (exact
+// at the segment ends and for the distance at an interior minimum, by the envelope theorem; the candidate's sliding
+// along the axis is left out). Box: dist = |c_l - clamp(c_l)| - r with the normal u = (c_l - cl) / |.| (outside, in the
+// box frame; its derivative (I - u u') P / |.| on the clamped axes P, scaled as the sphere core's: adj_kappa), or the
+// nearest face's constant normal (inside); heightfield: the triangle's plane, dist = n . c - const, constant normal.
+// Either way pos = c - n (r + dist / 2) up to the clamped part. Returns the ADJ_BR_* bits (-1: not a contact)
+__device__ __noinline__ int adj_terrain_geom(int slot, unsigned aux, int gt, const float* sz, const float* p2,
+                                             const float* q2, float* dist, float* pos, float* fr, float* nu,
+                                             const float* cot, float* gb) {
+  const int k = slot & 255, e = slot >> 8, nbox = g_ter.grid ? int(g_ter.grid[5]) : 0;
+  const bool box = e < nbox;  // a terrain box (ter_box)
+  *nu = __int_as_float(0x7f800000);
+  if (cot)
+    for (int t = 0; t < 12; t++) gb[t] = 0.f;
+  float n[3], c[3] = {p2[0], p2[1], p2[2]}, axis[3] = {0.f, 0.f, 0.f}, w = 0.f, qp[3];
+  bool point_n = false;  // native heightfield HF_POINT: n = (c - qp) / |c - qp|
+  if (gt == 2) zaxis_rn(q2, axis);
+  if (box) {
+    const float* b = ter_box(e);
+    if (gt == 2) {
+      float segs[2];
+      terrain_capbox_segs(p2, axis, sz[1], b, segs);
+      w = segs[k];
+      capbox_point(p2, axis, sz[1], b, w, c);
+    }
+    terrain_sphere_box(c, sz[0], b, dist, pos, n);
+  } else {
+#if TERRAIN_HF_NATIVE
+    // the native contact: its candidate (aux: the tape's taux, HfCand.pid) recomputed from its prism alone
+    (void)k;
+    HfCon con[1];
+    if (!hfield_native_one(e - nbox, gt, sz, p2, q2, aux, con)) return -1;
+    const int k1 = 0;
+    const float* hh = g_ter.hfh + 16 * (e - nbox);
+    *dist = con[k1].dist;
+    mv3(hh + 3, con[k1].pos, pos);
+    for (int t = 0; t < 3; t++) pos[t] += hh[t];
+    mv3(hh + 3, con[k1].n, n);
+    if (gt == 2) w = 2.f * con[k1].t - 1.f;
+    if (con[k1].type == HF_POINT) {  // normal from the fixed prism point q to the core point
+      mv3(hh + 3, con[k1].q, qp);
+      for (int t = 0; t < 3; t++) qp[t] += hh[t];
+      point_n = true;
+    }
+#else
+    if (!terrain_hfield_point(e - nbox, gt, sz, p2, q2, k, dist, pos, n)) return -1;
+    if (gt == 2) w = TERRAIN_CAP_PTS > 1 ? -1.f + float(k) * 2.f / float(TERRAIN_CAP_PTS - 1) : 0.f;
+#endif
+  }
+  make_frame(n, fr);
+  const int br = (-0.5f < n[1] && n[1] < 0.5f) ? 0 : ADJ_BR_FRAME_Z;
+  if (!cot) return br;
+  const float* pb = cot + 1;
+  float cb[3];  // the material point's cotangent (world)
+  bool fixed_n = !box;
+  if (box) {
+    const float *b = ter_box(e), *R = b + 3, *bs = b + 12;
+    float d[3] = {c[0] - b[0], c[1] - b[1], c[2] - b[2]}, cl[3], u[3], P[3], pbl[3], cbl[3];
+    mtv3(R, d, cl);
+    for (int t = 0; t < 3; t++) {
+      float q = fmaxf(-bs[t], fminf(bs[t], cl[t]));
+      u[t] = cl[t] - q;
+      P[t] = q != cl[t] ? 1.f : 0.f;
+    }
+    float dd = sqrtf(dot3(u, u));
+    if (dd <= 1e-15f) fixed_n = true;  // inside: the nearest face's normal
+    else {
+      float nbar[3], nbl[3], ub[3];
+      mtv3(R, pb, pbl);
+      make_frame_vjp(fr, cot + 4, nbar);
+      mtv3(R, nbar, nbl);
+      for (int t = 0; t < 3; t++) { u[t] /= dd; ub[t] = nbl[t] - 0.5f * sz[0] * pbl[t]; }
+      const float uu = dot3(u, ub), kap = adj_kappa(dd);
+      for (int t = 0; t < 3; t++)
+        cbl[t] = u[t] * cot[0] + 0.5f * (2.f - P[t]) * pbl[t] + P[t] * kap * (ub[t] - u[t] * uu);
+      mv3(R, cbl, cb);
+    }
+  }
+  if (point_n) {  // the sphere core on (qp, c): nu = |c - qp| = dist + r
+    float nbar[3], qb[3] = {0.f, 0.f, 0.f};
+    make_frame_vjp(fr, cot + 4, nbar);
+    for (int t = 0; t < 3; t++) cb[t] = 0.f;
+    sphere_core_vjp(n, *dist + sz[0], *dist, 0.f, cot[0], pb, nbar, qb, cb);
+    fixed_n = false;
+  }
+  if (fixed_n) {  // dist = n . c - const, pos = c - n (r + dist / 2): cbar = pbar - n (n . pbar) / 2 + n dbar
+    const float pn = dot3(n, pb);
+    for (int t = 0; t < 3; t++) cb[t] = pb[t] - 0.5f * n[t] * pn + n[t] * cot[0];
+  }
+  for (int t = 0; t < 3; t++) gb[6 + t] = cb[t];
+  if (gt == 2) {  // c = p2 + w l axis: axis bar = w l cbar, as a torque
+    float ab[3];
+    for (int t = 0; t < 3; t++) ab[t] = w * sz[1] * cb[t];
+    cross(axis, ab, gb + 9);
+  }
+  return br;
+}
+
+"""
 
 def source(m):
     """header(m) + DEVICE: the contact adjoint's device code for model m, to place after step.STEP_DEVICE."""

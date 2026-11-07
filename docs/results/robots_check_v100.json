@@ -1,0 +1,369 @@
+{
+ "description": "Robots beyond the G1 (scripts/robots/export_robot.py models, scripts/robots/robot_check.py). forward_vs_mjw: one control step of about 4000 corpus states (rollouts of random PD targets from the initial state with random tilt, height and velocities; worlds whose base falls below half its initial height restart) against MuJoCo Warp 3.17.0, qvel relative and qpos absolute errors, the share of worlds with equal contact counts. gradient_vs_mujoco_c64: the VJP (50 iterations) of random cotangents along random directions of qpos (not the root quaternion), qvel and ctrl against float64 central differences of MuJoCo C (tolerance 1e-12), on the worlds whose forward agrees with MuJoCo C (qvel relative error < 1e-4; MuJoCo C's box-box collision and frictionloss differ from MuJoCo Warp's, hence the lower shares for OP3, Berkeley Humanoid and the Booster T1).",
+ "provenance": {
+  "commit": null,
+  "gpu": "Tesla V100-SXM2-16GB, 550.90.07",
+  "mujoco": "3.17.0",
+  "mujoco_warp": "3.17.0",
+  "date": "2026-11-06",
+  "commit_note": "a revision before this repository's history: not recorded"
+ },
+ "robots": {
+  "go1": {
+   "robot": "Unitree Go1",
+   "source": "mjlab (unitree_go1_flat_env_cfg)",
+   "export_options": "",
+   "nq": 19,
+   "nv": 18,
+   "npair": 30,
+   "pair_types": [
+    "box-plane",
+    "capsule-plane",
+    "plane-sphere"
+   ],
+   "timestep": 0.005,
+   "substeps": 4,
+   "forward_vs_mjw": {
+    "nworld": 3996,
+    "qvel_rel_median": 9.197921144732391e-07,
+    "qvel_rel_p99": 5.696151674783323e-06,
+    "qpos_abs_median": 1.1920928955078125e-07,
+    "qpos_abs_max": 0.0029305443167686462,
+    "ncon_equal": 0.9997497497497497,
+    "flags": 0
+   },
+   "gradient_vs_mujoco_c64": {
+    "nworld": 256,
+    "iterations": 50,
+    "forward_agree_share": 0.99609375,
+    "qpos": {
+     "agree_rel_median": 1.013255501867208e-06,
+     "agree_rel_p90": 1.5625592082190896e-05
+    },
+    "qvel": {
+     "agree_rel_median": 7.299926947206234e-07,
+     "agree_rel_p90": 6.149062684756854e-06
+    },
+    "ctrl": {
+     "agree_rel_median": 2.5854606438057456e-07,
+     "agree_rel_p90": 1.6046292670091535e-06
+    }
+   }
+  },
+  "go2": {
+   "robot": "Unitree Go2",
+   "source": "MuJoCo Menagerie unitree_go2/scene.xml",
+   "export_options": "--foot-class foot --feet-only --locomotion --servo 35,0.5",
+   "nq": 19,
+   "nv": 18,
+   "npair": 4,
+   "pair_types": [
+    "plane-sphere"
+   ],
+   "timestep": 0.002,
+   "substeps": 10,
+   "forward_vs_mjw": {
+    "nworld": 3996,
+    "qvel_rel_median": 9.606202411305276e-07,
+    "qvel_rel_p99": 2.0560941266012378e-05,
+    "qpos_abs_median": 1.1920928955078125e-07,
+    "qpos_abs_max": 0.0017612669616937637,
+    "ncon_equal": 0.9997497497497497,
+    "flags": 0
+   },
+   "gradient_vs_mujoco_c64": {
+    "nworld": 256,
+    "iterations": 50,
+    "forward_agree_share": 1.0,
+    "qpos": {
+     "agree_rel_median": 4.189658985630982e-06,
+     "agree_rel_p90": 3.2528778317414896e-05
+    },
+    "qvel": {
+     "agree_rel_median": 1.4809767474462546e-06,
+     "agree_rel_p90": 1.160821091142457e-05
+    },
+    "ctrl": {
+     "agree_rel_median": 1.0954984452490206e-06,
+     "agree_rel_p90": 1.4684401563318591e-05
+    }
+   }
+  },
+  "a1": {
+   "robot": "Unitree A1",
+   "source": "MuJoCo Menagerie unitree_a1/scene.xml",
+   "export_options": "--foot-class foot --feet-only --locomotion",
+   "nq": 19,
+   "nv": 18,
+   "npair": 4,
+   "pair_types": [
+    "plane-sphere"
+   ],
+   "timestep": 0.002,
+   "substeps": 10,
+   "forward_vs_mjw": {
+    "nworld": 3996,
+    "qvel_rel_median": 8.922019674173498e-07,
+    "qvel_rel_p99": 1.6583286196691915e-05,
+    "qpos_abs_median": 1.1920928955078125e-07,
+    "qpos_abs_max": 0.0017896667122840881,
+    "ncon_equal": 1.0,
+    "flags": 0
+   },
+   "gradient_vs_mujoco_c64": {
+    "nworld": 256,
+    "iterations": 50,
+    "forward_agree_share": 1.0,
+    "qpos": {
+     "agree_rel_median": 4.188997754954156e-06,
+     "agree_rel_p90": 3.6000035726874646e-05
+    },
+    "qvel": {
+     "agree_rel_median": 1.846332735947967e-06,
+     "agree_rel_p90": 1.2931627303280218e-05
+    },
+    "ctrl": {
+     "agree_rel_median": 7.274669310832644e-07,
+     "agree_rel_p90": 9.26451590243005e-06
+    }
+   }
+  },
+  "anymal_c": {
+   "robot": "ANYbotics ANYmal C",
+   "source": "MuJoCo Menagerie anybotics_anymal_c/scene.xml",
+   "export_options": "--foot-class foot --feet-only --locomotion --z 0.62",
+   "nq": 19,
+   "nv": 18,
+   "npair": 4,
+   "pair_types": [
+    "plane-sphere"
+   ],
+   "timestep": 0.002,
+   "substeps": 10,
+   "forward_vs_mjw": {
+    "nworld": 3996,
+    "qvel_rel_median": 1.2481873454817105e-06,
+    "qvel_rel_p99": 0.00020817342738155276,
+    "qpos_abs_median": 1.1920928955078125e-07,
+    "qpos_abs_max": 0.0008499026298522949,
+    "ncon_equal": 1.0,
+    "flags": 0
+   },
+   "gradient_vs_mujoco_c64": {
+    "nworld": 256,
+    "iterations": 50,
+    "forward_agree_share": 1.0,
+    "qpos": {
+     "agree_rel_median": 4.555237445910415e-06,
+     "agree_rel_p90": 4.538705902945479e-05
+    },
+    "qvel": {
+     "agree_rel_median": 2.292308874295593e-06,
+     "agree_rel_p90": 1.7742425698788815e-05
+    },
+    "ctrl": {
+     "agree_rel_median": 9.93052689174934e-07,
+     "agree_rel_p90": 6.329674539619639e-06
+    }
+   }
+  },
+  "spot": {
+   "robot": "Boston Dynamics Spot",
+   "source": "MuJoCo Playground spot/xmls/scene_mjx_feetonly_flat_terrain.xml",
+   "export_options": "",
+   "nq": 19,
+   "nv": 18,
+   "npair": 4,
+   "pair_types": [
+    "plane-sphere"
+   ],
+   "timestep": 0.004,
+   "substeps": 5,
+   "forward_vs_mjw": {
+    "nworld": 3996,
+    "qvel_rel_median": 1.0677085811039433e-06,
+    "qvel_rel_p99": 1.1615427865763195e-05,
+    "qpos_abs_median": 1.1920928955078125e-07,
+    "qpos_abs_max": 0.0005759000778198242,
+    "ncon_equal": 1.0,
+    "flags": 0
+   },
+   "gradient_vs_mujoco_c64": {
+    "nworld": 256,
+    "iterations": 50,
+    "forward_agree_share": 0.83984375,
+    "qpos": {
+     "agree_rel_median": 1.600706077542446e-05,
+     "agree_rel_p90": 0.00012676636819074918
+    },
+    "qvel": {
+     "agree_rel_median": 3.2812340720549106e-06,
+     "agree_rel_p90": 3.9897621561600164e-05
+    },
+    "ctrl": {
+     "agree_rel_median": 8.140961291532428e-07,
+     "agree_rel_p90": 9.300321530598805e-06
+    }
+   }
+  },
+  "h1": {
+   "robot": "Unitree H1",
+   "source": "MuJoCo Playground h1/xmls/scene_mjx_feetonly.xml",
+   "export_options": "",
+   "nq": 26,
+   "nv": 25,
+   "npair": 6,
+   "pair_types": [
+    "capsule-plane"
+   ],
+   "timestep": 0.004,
+   "substeps": 5,
+   "forward_vs_mjw": {
+    "nworld": 3994,
+    "qvel_rel_median": 9.168184647023736e-07,
+    "qvel_rel_p99": 6.365915851347381e-06,
+    "qpos_abs_median": 1.1920928955078125e-07,
+    "qpos_abs_max": 0.00023014843463897705,
+    "ncon_equal": 1.0,
+    "flags": 0
+   },
+   "gradient_vs_mujoco_c64": {
+    "nworld": 256,
+    "iterations": 50,
+    "forward_agree_share": 0.9921875,
+    "qpos": {
+     "agree_rel_median": 4.748196711134379e-07,
+     "agree_rel_p90": 7.80941168886523e-05
+    },
+    "qvel": {
+     "agree_rel_median": 5.681478468527915e-07,
+     "agree_rel_p90": 2.606073411546661e-05
+    },
+    "ctrl": {
+     "agree_rel_median": 2.5296426094137834e-07,
+     "agree_rel_p90": 2.8108885166860233e-06
+    }
+   }
+  },
+  "t1": {
+   "robot": "Booster T1",
+   "source": "MuJoCo Playground t1/xmls/scene_mjx_feetonly_flat_terrain.xml",
+   "export_options": "",
+   "nq": 30,
+   "nv": 29,
+   "npair": 9,
+   "pair_types": [
+    "box-box",
+    "plane-sphere"
+   ],
+   "timestep": 0.002,
+   "substeps": 10,
+   "forward_vs_mjw": {
+    "nworld": 4011,
+    "qvel_rel_median": 1.5144597682592575e-06,
+    "qvel_rel_p99": 5.697219239664264e-05,
+    "qpos_abs_median": 1.1920928955078125e-07,
+    "qpos_abs_max": 0.004690051078796387,
+    "ncon_equal": 0.9982547993019197,
+    "flags": 0
+   },
+   "gradient_vs_mujoco_c64": {
+    "nworld": 256,
+    "iterations": 50,
+    "forward_agree_share": 0.53515625,
+    "qpos": {
+     "agree_rel_median": 1.4444743412217032e-05,
+     "agree_rel_p90": 8.169331323535893e-05
+    },
+    "qvel": {
+     "agree_rel_median": 4.729700431937346e-06,
+     "agree_rel_p90": 3.081716190516668e-05
+    },
+    "ctrl": {
+     "agree_rel_median": 1.1246414185772342e-06,
+     "agree_rel_p90": 7.315095840895569e-06
+    }
+   }
+  },
+  "op3": {
+   "robot": "ROBOTIS OP3",
+   "source": "MuJoCo Playground op3/xmls/scene_mjx_feetonly.xml",
+   "export_options": "",
+   "nq": 27,
+   "nv": 26,
+   "npair": 8,
+   "pair_types": [
+    "box-box",
+    "box-plane"
+   ],
+   "timestep": 0.004,
+   "substeps": 5,
+   "forward_vs_mjw": {
+    "nworld": 3990,
+    "qvel_rel_median": 3.384681122042821e-07,
+    "qvel_rel_p99": 0.00012405785673763603,
+    "qpos_abs_median": 1.1920928955078125e-07,
+    "qpos_abs_max": 0.0032127201557159424,
+    "ncon_equal": 0.9997493734335839,
+    "flags": 0
+   },
+   "gradient_vs_mujoco_c64": {
+    "nworld": 256,
+    "iterations": 50,
+    "forward_agree_share": 0.6953125,
+    "qpos": {
+     "agree_rel_median": 9.139097371696621e-06,
+     "agree_rel_p90": 8.809851550133777e-05
+    },
+    "qvel": {
+     "agree_rel_median": 1.1709502526464562e-06,
+     "agree_rel_p90": 1.1335907759021903e-05
+    },
+    "ctrl": {
+     "agree_rel_median": 2.2955692372214568e-07,
+     "agree_rel_p90": 3.5472601260388766e-06
+    }
+   }
+  },
+  "berkeley_humanoid": {
+   "robot": "Berkeley Humanoid",
+   "source": "MuJoCo Playground berkeley_humanoid/xmls/scene_mjx_feetonly_flat_terrain.xml",
+   "export_options": "",
+   "nq": 19,
+   "nv": 18,
+   "npair": 3,
+   "pair_types": [
+    "box-box",
+    "box-plane"
+   ],
+   "timestep": 0.002,
+   "substeps": 10,
+   "forward_vs_mjw": {
+    "nworld": 3996,
+    "qvel_rel_median": 2.264056774947676e-06,
+    "qvel_rel_p99": 5.663162301061675e-05,
+    "qpos_abs_median": 1.1920928955078125e-07,
+    "qpos_abs_max": 0.006104722619056702,
+    "ncon_equal": 0.998998998998999,
+    "flags": 0
+   },
+   "gradient_vs_mujoco_c64": {
+    "nworld": 256,
+    "iterations": 50,
+    "forward_agree_share": 0.55078125,
+    "qpos": {
+     "agree_rel_median": 2.4756080068787336e-05,
+     "agree_rel_p90": 0.00048047590452827944
+    },
+    "qvel": {
+     "agree_rel_median": 6.036110360483864e-06,
+     "agree_rel_p90": 6.338770596888527e-05
+    },
+    "ctrl": {
+     "agree_rel_median": 1.1883449963516767e-06,
+     "agree_rel_p90": 1.7483333614149617e-05
+    }
+   }
+  }
+ }
+}
