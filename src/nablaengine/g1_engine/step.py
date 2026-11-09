@@ -505,7 +505,7 @@ __device__ __forceinline__ void make_frame(const float* n, float* fr) {
 }
 
 // slot: which contact of the pair this is (the tape's contact table, tape.py): the end e of a plane-capsule pair
-// (0: +axis, 1: -axis), the candidate e = 0..3 of a parallel capsule-capsule pair, a box corner / clip point; else 0.
+// (0: +axis, 1: -axis), the endpoint e = 0, 1 of a parallel capsule-capsule pair, a box corner / clip point; else 0.
 // (The atomicAdd's result in divergent code: see UNIFORM)
 template <class S>
 __device__ __forceinline__ bool add_contact(S& s, int pair, int slot, float dist, const float* pos,
@@ -614,7 +614,9 @@ __device__ __forceinline__ float segment_point(const float* p1, const float* p2,
   return raw;
 }
 
-// capsule-capsule (MuJoCo Warp's capsule_capsule): the segments p_k + x_k a_k, x_k in [-1, 1], with the scaled axes
+// Capsule-capsule follows MuJoCo 3.17's mjc_segWeights (engine_collision_primitive.c):
+// https://github.com/google-deepmind/mujoco/blob/3.17.0/src/engine/engine_collision_primitive.c
+// the segments p_k + x_k a_k, x_k in [-1, 1], with the scaled axes
 // a_k = hl_k R_k e_z, dif = p1 - p2, the normal equations [ma mb; mb mc] x = (u, v) and det = ma mc - mb^2
 struct CapCap { float a1[3], a2[3], dif[3], ma, mb, mc, u, v, det; };
 __device__ __forceinline__ void capcap_setup(const float* p1, const float* q1, float hl1, const float* p2,
@@ -631,38 +633,42 @@ __device__ __forceinline__ void capcap_setup(const float* p1, const float* q1, f
   cross_rn(c.a1, c.a2, w);
   c.det = dot3_rn(w, w);
 }
-// the segment parameters where |det| >= 1e-15: the unconstrained minimum, then the clamp cascade. f1, f2: x1 / x2 free
+__device__ __forceinline__ bool capcap_nonparallel(const CapCap& c) {
+  return c.det > RMUL(1e-8f, RMUL(c.ma, c.mc));  // MuJoCo 3.17: sin^2 of the axes' angle
+}
+// the nonparallel segment parameters: the unconstrained minimum, then the clamp cascade. f1, f2: x1 / x2 free
 // (not fixed at +-1; wp.clamp's gradient rule lo <= raw < hi for the clamp of x1 in the cascade's second stage), raw:
 // x1 before that clamp (0 if it did not happen)
 __device__ __forceinline__ void capcap_params(const CapCap& c, float* x1o, float* x2o, bool* f1, bool* f2, float* raw) {
-  float x1 = RFMA(c.mc, c.u, -RMUL(c.mb, c.v)) / c.det, x2 = RFMA(c.ma, c.v, -RMUL(c.mb, c.u)) / c.det;
-  *f1 = *f2 = true;
+  float w[3], t[3];
+  cross_rn(c.a1, c.a2, w);
+  cross_rn(c.a2, c.dif, t);  // Binet-Cauchy: mc u - mb v without near-parallel cancellation
+  float first = dot3_rn(w, t) / c.det;
+  float x1 = fminf(fmaxf(first, -1.f), 1.f), x2 = RFMS(c.mb, x1, c.v) / c.mc;
+  *f1 = first >= -1.f && first < 1.f;
+  *f2 = x2 >= -1.f && x2 < 1.f;
   *raw = 0.f;
-  if (x1 > 1.f) { x1 = 1.f; x2 = RSUB(c.v, c.mb) / c.mc; *f1 = false; }
-  else if (x1 < -1.f) { x1 = -1.f; x2 = RADD(c.v, c.mb) / c.mc; *f1 = false; }
   if (x2 > 1.f || x2 < -1.f) {
-    bool hi = x2 > 1.f;
-    x2 = hi ? 1.f : -1.f;
-    *raw = hi ? RSUB(c.u, c.mb) / c.ma : RADD(c.u, c.mb) / c.ma;
+    x2 = fminf(fmaxf(x2, -1.f), 1.f);
+    *raw = RFMS(c.mb, x2, c.u) / c.ma;
     x1 = fminf(fmaxf(*raw, -1.f), 1.f);
     *f1 = *raw >= -1.f && *raw < 1.f;
     *f2 = false;
   }
   *x1o = x1; *x2o = x2;
 }
-// candidate e = 0..3 of the parallel case (|det| < 1e-15): an end of one segment (e = 0, 1: x1 = +1, -1; 2, 3: x2 =
-// +1, -1) and the other's clamped closest parameter (raw before its clamp); f1, f2 as capcap_params
+// Parallel endpoints e = 0, 1 start at x1 = -1, +1, then clamp on segment 2
+// and reproject onto segment 1. A longer first capsule must not leave the
+// contact beyond the shorter segment's overlap. f1, f2 as capcap_params.
 __device__ __forceinline__ void capcap_candidate(const CapCap& c, int e, float* x1, float* x2, bool* f1, bool* f2,
                                                  float* raw) {
-  if (e < 2) {
-    *x1 = e == 0 ? 1.f : -1.f;
-    *raw = e == 0 ? RSUB(c.v, c.mb) / c.mc : RADD(c.v, c.mb) / c.mc;
-    *x2 = fminf(fmaxf(*raw, -1.f), 1.f);
-    *f1 = false;
-    *f2 = *raw >= -1.f && *raw < 1.f;
-  } else {
-    *x2 = e == 2 ? 1.f : -1.f;
-    *raw = e == 2 ? RSUB(c.u, c.mb) / c.ma : RADD(c.u, c.mb) / c.ma;
+  *x1 = e == 0 ? -1.f : 1.f;
+  *raw = RFMS(c.mb, *x1, c.v) / c.mc;
+  *x2 = fminf(fmaxf(*raw, -1.f), 1.f);
+  *f1 = false;
+  *f2 = *raw >= -1.f && *raw < 1.f;
+  if (*raw < -1.f || *raw > 1.f) {
+    *raw = RFMS(c.mb, *x2, c.u) / c.ma;
     *x1 = fminf(fmaxf(*raw, -1.f), 1.f);
     *f2 = false;
     *f1 = *raw >= -1.f && *raw < 1.f;
@@ -1229,19 +1235,15 @@ __device__ DK_INL_COLLIDE void collide_pair(S& s, int pair) {
     capcap_setup(p1, q1, sz1[1], p2, q2, sz2[1], cc);
     float dist, pos[3], n[3], x1, x2, raw;
     bool f1, f2;
-    if (fabsf(cc.det) >= 1e-15f) {
+    if (capcap_nonparallel(cc)) {
       capcap_params(cc, &x1, &x2, &f1, &f2, &raw);
       float nu = capcap_core(p1, p2, cc, x1, x2, sz1[0], sz2[0], &dist, pos, n);
       if (dist < 0.f) add_sphere_contact(s, pair, 0, nu, dist, pos, n);
     } else {
-      int cnt = 0;
-      for (int e = 0; e < 4 && cnt < 2; e++) {
+      for (int e = 0; e < 2; e++) {
         capcap_candidate(cc, e, &x1, &x2, &f1, &f2, &raw);
         float nu = capcap_core(p1, p2, cc, x1, x2, sz1[0], sz2[0], &dist, pos, n);
-        if (dist <= 0.f) {
-          cnt++;
-          if (dist < 0.f) add_sphere_contact(s, pair, e, nu, dist, pos, n);
-        }
+        if (dist < 0.f) add_sphere_contact(s, pair, e, nu, dist, pos, n);
       }
     }
     return;

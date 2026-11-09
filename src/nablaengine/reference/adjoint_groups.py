@@ -3,7 +3,7 @@
 A control step's gradient is labelled by what happened in any of its substeps. mjw_substep(mjm, d_in, d_out) reads one
 substep of MuJoCo Warp (d_out: the Data that mjw.step(m, d_in, d_out) filled; its contacts, rows and acceleration belong
 to the input state d_in) into numpy: contacts with their (pair, slot) identity (step.py's collide_pair: plane-capsule end
-0 = +axis, 1 = -axis; capsule-capsule 0, or the candidate 0..3 of the parallel branch; else 0), rows, x_e = J a* - aref,
+0 = +axis, 1 = -axis; capsule-capsule 0, or endpoint 0..1 of the parallel branch; else 0), rows, x_e = J a* - aref,
 clamp flags and solver iterations. labels(mjm, subs, ...) turns a list of them into one boolean per world and group:
 
   G1 axis < 5 mm   min nu < 5 mm over sphere / capsule self contacts (nu = dist + r1 + r2, the centre or axis distance

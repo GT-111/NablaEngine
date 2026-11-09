@@ -48,7 +48,9 @@ Terrain builds add static boxes and heightfields with a height scan (`docs/terra
 
 This development branch extends upstream 0.2 to one or two FREE trees with native actuator ordering, passive hinges,
 damping, dof frictionloss and soft linear joint equalities. The Torch interface owns independent immutable model
-contexts and applied-force gradients. CPU source/layout checks cover these extensions; the upstream GPU results above
+contexts and applied-force gradients. Capsule-capsule contacts use MuJoCo 3.17 segment weights and the same endpoint
+clamp cascade in forward and adjoint replay. CPU source/layout and contact-geometry checks cover these extensions;
+the upstream GPU results above
 describe the upstream models and builds. Forward, VJP and training qualification of the extended hand models is a
 separate target-GPU check (`docs/verification.md`).
 

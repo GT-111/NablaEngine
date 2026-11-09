@@ -503,7 +503,7 @@ def sphere_capsule(sp, r1, cp, cq, r2, hl, mode=NORMAL_EXACT, eps=1e-3, reg=1e-6
 
 def capsule_params(p1, q1, hl1, p2, q2, hl2, slot=0, parallel_eps=None):
     """Segment parameters (x1, x2) in [-1, 1] of the capsule-capsule closest points (the engine's clamp cascade), the
-    determinant and whether the parallel branch (|det| < 1e-15, candidate `slot`) was taken. parallel_eps (the engine's
+    determinant and whether the parallel branch (sin^2 <= 1e-8, endpoint `slot`) was taken. parallel_eps (the engine's
     DK_ADJ_PARALLEL = 1 with DK_ADJ_PARALLEL_EPS; None: exact): where both parameters are free and sin^2(theta) =
     |a1 x a2|^2 / (|a1|^2 |a2|^2) < parallel_eps, x1 and x2 are held constant in the derivative (stop_gradient; the
     values are unchanged)."""
@@ -511,22 +511,22 @@ def capsule_params(p1, q1, hl1, p2, q2, hl2, slot=0, parallel_eps=None):
     dif = p1 - p2
     ma, mb, mc = jnp.dot(a1, a1), -jnp.dot(a1, a2), jnp.dot(a2, a2)
     u, v = -jnp.dot(a1, dif), jnp.dot(a2, dif)
-    det = ma * mc - mb * mb
-    par = jnp.abs(det) < 1e-15
-    dets = jnp.where(par, 1.0, det)
-    x1, x2 = (mc * u - mb * v) / dets, (ma * v - mb * u) / dets
     w = cross(a1, a2)
-    frozen = (~par & (jnp.abs(x1) <= 1.0) & (jnp.abs(x2) <= 1.0) & (jnp.dot(w, w) < parallel_eps * ma * mc)
+    det = jnp.dot(w, w)
+    par = det <= 1e-8 * ma * mc
+    dets = jnp.where(par, 1.0, det)
+    first = jnp.dot(w, cross(a2, dif)) / dets
+    x1 = jnp.clip(first, -1.0, 1.0)
+    second = (v - mb * x1) / mc
+    frozen = (~par & (jnp.abs(first) <= 1.0) & (jnp.abs(second) <= 1.0) & (det < parallel_eps * ma * mc)
               if parallel_eps is not None else None)  # both free (no clamp below) and near parallel
-    x1, x2 = (jnp.where(x1 > 1.0, 1.0, jnp.where(x1 < -1.0, -1.0, x1)),
-              jnp.where(x1 > 1.0, (v - mb) / mc, jnp.where(x1 < -1.0, (v + mb) / mc, x2)))
-    x1, x2 = (jnp.where(x2 > 1.0, jnp.clip((u - mb) / ma, -1.0, 1.0),
-                        jnp.where(x2 < -1.0, jnp.clip((u + mb) / ma, -1.0, 1.0), x1)),
-              jnp.where(x2 > 1.0, 1.0, jnp.where(x2 < -1.0, -1.0, x2)))
-    cand = [(1.0, jnp.clip((v - mb) / mc, -1.0, 1.0)), (-1.0, jnp.clip((v + mb) / mc, -1.0, 1.0)),
-            (jnp.clip((u - mb) / ma, -1.0, 1.0), 1.0), (jnp.clip((u + mb) / ma, -1.0, 1.0), -1.0)][slot]
-    x1 = jnp.where(par, cand[0], x1)
-    x2 = jnp.where(par, cand[1], x2)
+    x2 = jnp.clip(second, -1.0, 1.0)
+    x1 = jnp.where(jnp.abs(second) > 1.0, jnp.clip((u - mb * x2) / ma, -1.0, 1.0), x1)
+    endpoint = -1.0 if slot == 0 else 1.0
+    other = (v - mb * endpoint) / mc
+    candidate2 = jnp.clip(other, -1.0, 1.0)
+    candidate1 = jnp.where(jnp.abs(other) > 1.0, jnp.clip((u - mb * candidate2) / ma, -1.0, 1.0), endpoint)
+    x1, x2 = jnp.where(par, candidate1, x1), jnp.where(par, candidate2, x2)
     if frozen is not None:
         x1 = jnp.where(frozen, jax.lax.stop_gradient(x1), x1)
         x2 = jnp.where(frozen, jax.lax.stop_gradient(x2), x2)

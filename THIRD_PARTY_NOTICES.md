@@ -7,7 +7,7 @@ third-party software that the checks compare with but that the repository does n
 | Material | Licence | Copyright | Used in |
 |---|---|---|---|
 | MuJoCo Warp | Apache-2.0 | 2025 The Newton Developers | `src/nablaengine/g1_engine/step.py` (translated code); `src/nablaengine/g1_engine/adjoint_contact.py`, `src/nablaengine/reference/jax64.py` (built on those translations); conventions in `src/nablaengine/g1_engine/adjoint.py` and `benchmarks/bench/adapters/mjw_pr.py` |
-| MuJoCo | Apache-2.0 | 2021 DeepMind Technologies Limited | through the MuJoCo Warp primitives in `step.py`; the model semantics the engine implements |
+| MuJoCo | Apache-2.0 | 2021 DeepMind Technologies Limited | through the MuJoCo Warp primitives in `step.py`; MuJoCo 3.17 capsule segment weights; the model semantics the engine implements |
 | MuJoCo MJX | Apache-2.0 | 2023 DeepMind Technologies Limited | `src/nablaengine/g1_engine/kinematics.py` (reproduced semantics, no code) |
 | MuJoCo Menagerie, Unitree G1 | BSD-3-Clause | 2016-2023 HangZhou YuShu TECHNOLOGY CO.,LTD. ("Unitree Robotics") | `fixtures/mjlab/g1_train.mjb` |
 | mjlab | Apache-2.0 | 2025, The mjlab Developers | `fixtures/mjlab/g1_train.mjb` (parameter values) |
@@ -62,7 +62,9 @@ Files:
 - Copyright 2021 DeepMind Technologies Limited.
 
 Parts of the MuJoCo Warp collision primitives of section 1 follow MuJoCo's C implementation, and the translations in
-`step.py` carry those parts over. The rest of the engine is its own code. It implements MuJoCo's documented model
+`step.py` carry those parts over. Its capsule-capsule segment weights also follow `mjc_segWeights` in
+[MuJoCo 3.17's `engine_collision_primitive.c`](https://github.com/google-deepmind/mujoco/blob/3.17.0/src/engine/engine_collision_primitive.c),
+implemented in float32 CUDA and shared by forward and adjoint replay. The rest of the engine is its own code. It implements MuJoCo's documented model
 semantics:
 
 - in `src/nablaengine/g1_engine/source.py`: the composite-rigid-body mass matrix and the recursive Newton-Euler

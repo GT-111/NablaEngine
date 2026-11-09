@@ -90,7 +90,7 @@ static_assert(!HAS_BOX, "the contact adjoint has no box collisions");
 // adj_contact_geom's branch bits (its return value; -1: a type combination without a VJP)
 #define ADJ_BR_FREE1 1      // capsule-capsule: segment parameter x1 free (inside, not clamped)
 #define ADJ_BR_FREE2 2      // capsule-capsule x2 / sphere-capsule t free
-#define ADJ_BR_PARALLEL 4   // capsule-capsule parallel branch (|det| < 1e-15), the tape's slot = the candidate
+#define ADJ_BR_PARALLEL 4   // capsule-capsule parallel branch (sin^2 <= 1e-8), the tape's slot = the endpoint
 #define ADJ_BR_FALLBACK 8   // plane-capsule: the projected axis is shorter than 0.5, the frame uses make_frame's basis
 #define ADJ_BR_FRAME_Z 16   // the frame's basis vector is e_z (|n_y| >= 0.5), else e_y
 """
@@ -300,7 +300,7 @@ __device__ __forceinline__ void sphere_core_vjp(const float* n, float nu, float 
 // One contact's geometry from the two geoms' world poses (geom_poses: s.gx, s.gq): the replay and, with cot, its VJP.
 // t1 <= t2: engine geom types of the pair's geoms g1, g2 (0 plane, 1 sphere, 2 capsule; c_gtype[PG1 / PG2]), sz1, sz2
 // their sizes (c_gsize + 3 g), slot: the tape's (plane-capsule end 0: +axis, 1: -axis; parallel capsule-capsule
-// candidate 0..3; else 0). Replay (always): dist, pos[3], fr[9] = the forward's (collide_pair) bitwise, and nu = the
+// endpoint 0..1; else 0). Replay (always): dist, pos[3], fr[9] = the forward's (collide_pair) bitwise, and nu = the
 // sphere core's centre distance |c2 - c1| before the radii (the tape's min_nu; +inf for plane contacts): by collide_pair's
 // own functions (step.py: zaxis_rn, plane_point, plane_capsule_frame, capsule_end, segment_point, capcap_*,
 // sphere_sphere, make_frame; explicit roundings, so the same bits in this kernel as in the forward's). The primitive's
@@ -408,7 +408,7 @@ __device__ __noinline__ int adj_contact_geom(int t1, int t2, int slot, const flo
   const float ma = cc.ma, mb = cc.mb, mc = cc.mc, det = cc.det;
   float x1, x2, raw;
   bool f1, f2;  // a clamp to [-1, 1] leaves x free for -1 <= raw < 1 (wp.clamp's gradient rule)
-  if (fabsf(det) >= 1e-15f) capcap_params(cc, &x1, &x2, &f1, &f2, &raw);
+  if (capcap_nonparallel(cc)) capcap_params(cc, &x1, &x2, &f1, &f2, &raw);
   else {  // parallel: candidate e = slot of the forward's loop
     br |= ADJ_BR_PARALLEL;
     capcap_candidate(cc, slot, &x1, &x2, &f1, &f2, &raw);

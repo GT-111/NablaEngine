@@ -66,47 +66,77 @@ def dense_contact_model(nconmax=320, njmax=1400, *, frictionloss=0.0, equality=F
 
 class GenerationCheck(unittest.TestCase):
     @unittest.skipUnless(shutil.which("c++"), "capsule geometry check requires a C++ compiler")
-    def test_parallel_capsules_keep_the_two_contact_branch(self):
-        # Execute the actual collision/replay helper with IEEE float operations.
-        # At hand-proxy sizes, the subtractive Gram determinant contains enough
-        # rounding noise to select one contact for perfectly parallel capsules.
+    def test_parallel_capsules_match_mujoco_manifold(self):
+        # Execute the actual collision/replay helpers and capsule dispatch on
+        # CPU, with IEEE float operations, against the installed MuJoCo oracle.
+        # Unequal overlapping segments exercise the endpoint clamp cascade;
+        # the small tilt exercises MuJoCo 3.17's relative parallel criterion.
         rounded = "#define RMUL" + source.DEVICE.split("#define RMUL", 1)[1].split(
             "__device__ __forceinline__ float warp_sum", 1)[0]
         capsule = "struct CapCap" + step.STEP_DEVICE.split("struct CapCap", 1)[1].split(
-            "// the segment parameters", 1)[0]
+            "// 3x3 helpers", 1)[0]
+        sphere = "__device__ __forceinline__ float sphere_sphere" + step.STEP_DEVICE.split(
+            "__device__ __forceinline__ float sphere_sphere", 1)[1].split("// The contact geometry", 1)[0]
+        dispatch = "  if (t1 == 2 && t2 == 2) {  // capsule-capsule" + step.STEP_DEVICE.split(
+            "  if (t1 == 2 && t2 == 2) {  // capsule-capsule", 1)[1].split("#if HAS_BOX", 1)[0]
         harness = r'''
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #define __device__
 #define __forceinline__ inline
 inline float __fmul_rn(float a, float b) { return a*b; }
 inline float __fadd_rn(float a, float b) { return a+b; }
 inline float __fsub_rn(float a, float b) { return a-b; }
 inline float __fmaf_rn(float a, float b, float c) { return std::fma(a,b,c); }
+struct Contacts { int count=0; float values[2][7]; };
+void add_sphere_contact(Contacts& s, int, int, float, float dist, const float* pos, const float* n) {
+  float* out=s.values[s.count++]; out[0]=dist;
+  for (int k=0;k<3;k++) { out[k+1]=pos[k]; out[k+4]=n[k]; }
+}
+'''
+        collide = r'''
+void collide(Contacts& s, const float* q2) {
+  int t1=2,t2=2,pair=0;
+  float p1[3]={},p2[3]={.01f,0,.005f},q1[4]={1,0,0,0},sz1[3]={.02f,.04f,0},sz2[3]={.02f,.03f,0};
 '''
         main = r'''
-int main() {
-  float p1[3]={}, p2[3]={.01f,0,.005f}, q[4]={1,0,0,0}, opposite[4]={0,1,0,0};
-  CapCap cc;
-  capcap_setup(p1,q,.03f,p2,q,.04f,cc);
-  float old = RFMA(cc.ma,cc.mc,-RMUL(cc.mb,cc.mb));
-  std::printf("%.10e %.10e ",cc.det,old);
-  capcap_setup(p1,q,.03f,p2,opposite,.04f,cc);
-  std::printf("%.10e\n",cc.det);
+int main(int argc,char** argv) {
+  float q2[4]; for (int k=0;k<4;k++) q2[k]=std::strtof(argv[k+1],nullptr);
+  Contacts contacts; collide(contacts,q2);
+  std::printf("%d\n",contacts.count);
+  for (int i=0;i<contacts.count;i++) {
+    for (int k=0;k<7;k++) std::printf("%.10e ",contacts.values[i][k]);
+    std::printf("\n");
+  }
 }
 '''
         with tempfile.TemporaryDirectory(prefix="nabla-capsule-cpu-") as directory:
             path = Path(directory)
-            (path / "capsule.cc").write_text(harness + rounded + capsule + main)
+            (path / "capsule.cc").write_text(harness + rounded + sphere + capsule + collide + dispatch + "}\n" + main)
             compiled = subprocess.run(["c++", "-std=c++17", "-O2", "-ffp-contract=off",
                                        str(path / "capsule.cc"), "-o", str(path / "capsule")],
                                       text=True, capture_output=True)
             self.assertEqual(compiled.returncode, 0, compiled.stderr)
-            result = subprocess.run([str(path / "capsule")], check=True, text=True, capture_output=True)
-        parallel, cancellation, antiparallel = map(float, result.stdout.split())
-        self.assertGreaterEqual(abs(cancellation), 1e-15, "the regression must exercise the old wrong branch")
-        self.assertLess(abs(parallel), 1e-15)
-        self.assertLess(abs(antiparallel), 1e-15)
+            for quat in ((1., 0., 0., 0.), (np.cos(2.5e-5), 0., np.sin(2.5e-5), 0.),
+                         (0., 1., 0., 0.), (np.cos(.05), 0., np.sin(.05), 0.),
+                         (np.cos(.05), 0., -np.sin(.05), 0.)):
+                with self.subTest(quaternion=quat):
+                    model = mujoco.MjModel.from_xml_string(f'''<mujoco><worldbody>
+                      <body><freejoint/><geom type="capsule" size=".02 .04"/></body>
+                      <body pos=".01 0 .005" quat="{' '.join(map(str, quat))}"><freejoint/>
+                        <geom type="capsule" size=".02 .03"/></body></worldbody></mujoco>''')
+                    data = mujoco.MjData(model)
+                    mujoco.mj_fwdPosition(model, data)
+                    reference = np.asarray([[c.dist, *c.pos, *c.frame.reshape(3, 3)[0]] for c in data.contact])
+                    result = subprocess.run([str(path / "capsule"), *map(str, quat)],
+                                            check=True, text=True, capture_output=True)
+                    lines = result.stdout.splitlines()
+                    self.assertEqual(int(lines[0]), data.ncon)
+                    actual = np.asarray([[float(v) for v in row.split()] for row in lines[1:]])
+                    actual, reference = (value[np.argsort(value[:, 3])] for value in (actual, reference))
+                    np.testing.assert_allclose(actual[:, :4], reference[:, :4], rtol=2e-6, atol=2e-8)
+                    np.testing.assert_allclose(actual[:, 4:], reference[:, 4:], rtol=2e-6, atol=1e-6)
 
     def test_upstream_020_terrain_and_coupled_build_plans(self):
         from coupled_physics_check import native_contact_model
