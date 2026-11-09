@@ -624,7 +624,12 @@ __device__ __forceinline__ void capcap_setup(const float* p1, const float* q1, f
   for (int k = 0; k < 3; k++) { c.a1[k] = RMUL(c.a1[k], hl1); c.a2[k] = RMUL(c.a2[k], hl2); c.dif[k] = RSUB(p1[k], p2[k]); }
   c.ma = dot3_rn(c.a1, c.a1); c.mb = -dot3_rn(c.a1, c.a2); c.mc = dot3_rn(c.a2, c.a2);
   c.u = -dot3_rn(c.a1, c.dif); c.v = dot3_rn(c.a2, c.dif);
-  c.det = RFMA(c.ma, c.mc, -RMUL(c.mb, c.mb));
+  // |a1 x a2|^2 is the same Gram determinant without cancellation. The
+  // subtractive form can put parallel hand capsules on the one-contact branch
+  // through FMA rounding noise. Forward and adjoint replay share this helper.
+  float w[3];
+  cross_rn(c.a1, c.a2, w);
+  c.det = dot3_rn(w, w);
 }
 // the segment parameters where |det| >= 1e-15: the unconstrained minimum, then the clamp cascade. f1, f2: x1 / x2 free
 // (not fixed at +-1; wp.clamp's gradient rule lo <= raw < hi for the clamp of x1 in the cascade's second stage), raw:

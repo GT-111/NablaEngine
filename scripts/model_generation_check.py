@@ -65,6 +65,49 @@ def dense_contact_model(nconmax=320, njmax=1400, *, frictionloss=0.0, equality=F
 
 
 class GenerationCheck(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("c++"), "capsule geometry check requires a C++ compiler")
+    def test_parallel_capsules_keep_the_two_contact_branch(self):
+        # Execute the actual collision/replay helper with IEEE float operations.
+        # At hand-proxy sizes, the subtractive Gram determinant contains enough
+        # rounding noise to select one contact for perfectly parallel capsules.
+        rounded = "#define RMUL" + source.DEVICE.split("#define RMUL", 1)[1].split(
+            "__device__ __forceinline__ float warp_sum", 1)[0]
+        capsule = "struct CapCap" + step.STEP_DEVICE.split("struct CapCap", 1)[1].split(
+            "// the segment parameters", 1)[0]
+        harness = r'''
+#include <cmath>
+#include <cstdio>
+#define __device__
+#define __forceinline__ inline
+inline float __fmul_rn(float a, float b) { return a*b; }
+inline float __fadd_rn(float a, float b) { return a+b; }
+inline float __fsub_rn(float a, float b) { return a-b; }
+inline float __fmaf_rn(float a, float b, float c) { return std::fma(a,b,c); }
+'''
+        main = r'''
+int main() {
+  float p1[3]={}, p2[3]={.01f,0,.005f}, q[4]={1,0,0,0}, opposite[4]={0,1,0,0};
+  CapCap cc;
+  capcap_setup(p1,q,.03f,p2,q,.04f,cc);
+  float old = RFMA(cc.ma,cc.mc,-RMUL(cc.mb,cc.mb));
+  std::printf("%.10e %.10e ",cc.det,old);
+  capcap_setup(p1,q,.03f,p2,opposite,.04f,cc);
+  std::printf("%.10e\n",cc.det);
+}
+'''
+        with tempfile.TemporaryDirectory(prefix="nabla-capsule-cpu-") as directory:
+            path = Path(directory)
+            (path / "capsule.cc").write_text(harness + rounded + capsule + main)
+            compiled = subprocess.run(["c++", "-std=c++17", "-O2", "-ffp-contract=off",
+                                       str(path / "capsule.cc"), "-o", str(path / "capsule")],
+                                      text=True, capture_output=True)
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
+            result = subprocess.run([str(path / "capsule")], check=True, text=True, capture_output=True)
+        parallel, cancellation, antiparallel = map(float, result.stdout.split())
+        self.assertGreaterEqual(abs(cancellation), 1e-15, "the regression must exercise the old wrong branch")
+        self.assertLess(abs(parallel), 1e-15)
+        self.assertLess(abs(antiparallel), 1e-15)
+
     def test_upstream_020_terrain_and_coupled_build_plans(self):
         from coupled_physics_check import native_contact_model
         from nablaengine import fixtures, jax_ffi

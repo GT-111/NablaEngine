@@ -427,9 +427,8 @@ __device__ __noinline__ int adj_contact_geom(int t1, int t2, int slot, const flo
     float s1b[3], s2b[3], xb1, xb2, w[3];
     cross(a1, a2, w);
     float ww = dot3(w, w);  // = det = ma mc - mb^2 without its cancellation
-    // exactly parallel float32 axes can still take the non-parallel branch (det is FMA rounding noise, >= 1e-15): w
-    // is then 0, so below sin^2(theta) = 1e-12 the general chain runs and G is inverted with the forward's det, as
-    // MuJoCo Warp does (large but finite)
+    // Below sin^2(theta) = 1e-12 use the general chain with the forward's
+    // determinant; otherwise the normal can be differentiated through w.
     bool wok = ww > 1e-12f * ma * mc;
 #if DK_ADJ_PARALLEL
     // near parallel with both parameters free (DK_ADJ_PARALLEL): the closest points slide along the axes
