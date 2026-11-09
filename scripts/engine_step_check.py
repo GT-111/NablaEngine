@@ -100,7 +100,7 @@ int main(int argc, char** argv) {  // dir nworld iterations reps substeps [block
   const float* p = cf.data();
 LOAD_CONSTS
 #define IN(name, n) snprintf(path, sizeof path, "%s/" #name ".bin", dir); float* d_##name = up(readf(path, (size_t)nw * (n)));
-  IN(qpos, NQ) IN(qvel, NV) IN(warm, NV) IN(ctrl, NV - 6) IN(fric, 1) IN(com, 3)
+  IN(qpos, NQ) IN(qvel, NV) IN(warm, NV) IN(ctrl, NU) IN(fric, 1) IN(com, 3)
   float *oq, *ov, *ow, *oc; int* oi;
   cudaMalloc(&oc, (size_t)nw * MAXCON * 8 * 4);
   cudaMalloc(&oq, (size_t)nw * NQ * 4); cudaMalloc(&ov, (size_t)nw * NV * 4); cudaMalloc(&ow, (size_t)nw * NV * 4);
@@ -343,7 +343,9 @@ def tape_checks(args, m, mt, arr, run, main, K):
     dup = sum(len(set(zip(rec["pair"][i, k][valid[i, k]], rec["slot"][i, k][valid[i, k]]))) != valid[i, k].sum()
               for i in range(nw) for k in range(nsub))
     nfl = int((m.dof_frictionloss > 0).sum())  # frictionloss rows come first (a model with frictionloss)
-    nrows = np.where(valid, np.where(pdim[np.maximum(rec["pair"], 0)] == 3, 4, 1), 0).sum(-1) + rec["nlim"] + nfl
+    contact_rows = (np.where(valid, np.where(pdim[np.maximum(rec["pair"], 0)] == 3, 4, 1), 0).sum(-1)
+                    if m.npair else 0)
+    nrows = contact_rows + rec["nlim"] + nfl + m.neq
     c1 = sub[1]["con"] if nsub > 1 else main["con"]
     p1 = c1[:, :, 0].astype(np.int64)
     t3 = dict(rec0_vs_1substep_run_order=bool(np.array_equal(rec["pair"][:, 0], p1)),
@@ -353,7 +355,7 @@ def tape_checks(args, m, mt, arr, run, main, K):
               slots_invalid=int((sl >= lim).sum()),
               slots=dict(zip(*(x.tolist() for x in np.unique(sl, return_counts=True)))),
               duplicate_pair_slot_records=int(dup),
-              nefc_vs_rows=float((rec["nefc"] == np.minimum(nrows, step.NEFC)).mean()),
+              nefc_vs_rows=float((rec["nefc"] == np.minimum(nrows, step.nefc(m))).mean()),
               ncon_last_vs_info=float((rec["ncon"][:, -1] == np.minimum(main["info"][:, 1], step.maxcon(m))).mean()),
               nefc_last_vs_info=float((rec["nefc"][:, -1] == main["info"][:, 2]).mean()))
     if fixtures.has_contacts(args.corpus):  # record 0's pairs (with the 1-substep run's distances) against MuJoCo Warp's
@@ -387,20 +389,23 @@ def tape_checks(args, m, mt, arr, run, main, K):
 
     # limit rows (the engine's float32 test) and the clamp mask against a float64 recomputation
     c1c = source.constants(m)[0]
-    lay = {s: n for s, n in zip([x[0] for x in source.CONST_LAYOUT], np.cumsum([0] + [
-        (dict(nb=m.nbody, nv=m.nv, one=1)[c] if isinstance(c, str) else c) * w for _, _, c, w in source.CONST_LAYOUT]))}
+    lay = {s: n for s, n in zip([x[0] for x in source.const_layout(m)], np.cumsum([0] + [
+        (dict(nb=m.nbody, nv=m.nv, one=1, nr=len(source.free_roots(m)))[c] if isinstance(c, str) else c) * w for _, _, c, w in source.const_layout(m)]))}
     cget = lambda s, n: c1c[lay[s]:lay[s] + n]  # noqa: E731
     kp, kv, frc = cget("c_kp", nv), cget("c_kv", nv), cget("c_frclim", nv)
+    actid = cget("c_actid", nv).astype(int)
     jr = np.zeros((nv, 2), np.float32)
     jl = np.zeros(nv, bool)
     for j in range(1, m.njnt):
         jr[m.jnt_dofadr[j]], jl[m.jnt_dofadr[j]] = m.jnt_range[j], m.jnt_limited[j]
     qd = rec["qpos"][..., 1:]  # hinge dof i at qpos i + 1 (i >= 6)
     lim_on = (np.arange(nv) >= 6) & jl & (np.minimum(qd - jr[:, 0], jr[:, 1] - qd) < 0)
-    ctrl = np.concatenate([np.zeros((nw, 6), np.float32), arr["ctrl"].astype(np.float32)], 1)[:, None]
+    ctrl = np.zeros((nw, nv), np.float32)
+    ctrl[:, actid >= 0] = arr["ctrl"][:, actid[actid >= 0]]
+    ctrl = ctrl[:, None]
     act = kp.astype(np.float64) * (ctrl - qd.astype(np.float64)) - kv.astype(np.float64) * rec["qvel"].astype(np.float64)
     cl64 = np.abs(act) >= frc
-    cl64[..., :6] = False
+    cl64[..., actid < 0] = False
     mis = cl64 != rec["clamp_dof"]
     marg = np.abs(np.abs(act) - frc) / frc
     out["clamp_mask"] = dict(dofs_clamped=int(rec["clamp_dof"].sum()), float64_recompute_mismatch=int(mis.sum()),
@@ -411,9 +416,9 @@ def tape_checks(args, m, mt, arr, run, main, K):
     d = mujoco.MjData(m)
     torso, foot = fixtures.torso_id(m, mt), mt["foot_pairs"]
     ipos0, fric0 = m.body_ipos[torso].copy(), m.pair_friction.copy()
-    kv64 = np.zeros(nv)
+    kv64 = m.dof_damping.copy()
     for a in range(m.nu):
-        kv64[m.jnt_dofadr[m.actuator_trnid[a, 0]]] = -m.actuator_biasprm[a, 2]
+        kv64[m.jnt_dofadr[m.actuator_trnid[a, 0]]] -= m.actuator_biasprm[a, 2]
     pair_of = {frozenset((int(m.pair_geom1[i]), int(m.pair_geom2[i]))): i for i in range(m.npair)}
     eng_g = []  # the engine's geom order of each pair (lower type first, as step.pair_constants)
     for p in range(m.npair):
@@ -424,6 +429,8 @@ def tape_checks(args, m, mt, arr, run, main, K):
     binvw, dinvw, hh = m.body_invweight0[:, 0], m.dof_invweight0, float(np.float32(m.opt.timestep))
     sets = step.pair_param_sets(m)
     LIMIT = mujoco.mjtConstraint.mjCNSTR_LIMIT_JOINT
+    FRICTION = mujoco.mjtConstraint.mjCNSTR_FRICTION_DOF
+    EQUALITY = mujoco.mjtConstraint.mjCNSTR_EQUALITY
     jp1, jp2 = np.zeros((3, nv)), np.zeros((3, nv))
     e4, e5, e5b, e5c, e5_refact, unmatched, skipped, geo_order = [], [], [], [], [], 0, 0, 0
     worst = {False: [], True: []}  # per SINGULAR: the largest T5 errors (error, world, substep, T5b, T5c, largest
@@ -441,7 +448,7 @@ def tape_checks(args, m, mt, arr, run, main, K):
             Q = M + hh * np.diag(kv64)
             LQ = tape.tri_unpack(rec["L_Q"][i, k], nv).astype(np.float64)
             e4.append(np.linalg.norm(LQ @ LQ.T - Q) / np.linalg.norm(Q))
-            if rec["unsupported"][i, k] or nfl:  # T5 has no frictionloss rows (nor has the adjoint)
+            if rec["unsupported"][i, k]:
                 skipped += 1
                 continue
             nc, zone = int(rec["ncon"][i, k]), rec["zone"][i, k]
@@ -456,6 +463,8 @@ def tape_checks(args, m, mt, arr, run, main, K):
                     slot = 0 if (cc.pos - d.geom_xpos[g]) @ d.geom_xmat[g].reshape(3, 3)[:, 2] > 0 else 1
                 mj.setdefault((p, slot), []).append(ci)
             mlim = {int(m.jnt_dofadr[d.efc_id[r]]): r for r in range(d.nefc) if d.efc_type[r] == LIMIT}
+            mfloss = {int(d.efc_id[r]): r for r in range(d.nefc) if d.efc_type[r] == FRICTION}
+            meq = {int(d.efc_id[r]): r for r in range(d.nefc) if d.efc_type[r] == EQUALITY}
             ldofs = [j for j in range(nv) if lim_on[i, k, j]]
             if (sorted(mj) != sorted(tk) or any(len(v) != 1 for v in mj.values()) or sorted(mlim) != ldofs):
                 unmatched += 1
@@ -469,6 +478,24 @@ def tape_checks(args, m, mt, arr, run, main, K):
             ce = (sub[k + 1] if k + 1 < nsub else main)["con"][i]
             Hs = {v: M.copy() for v in (("mujoco", "mujoco_geometry_engine_D") if con_e else ()) + ("engine",)}
             r, dev = 0, np.zeros(3)
+            for j in np.flatnonzero(m.dof_frictionloss > 0):
+                if zone[r]:
+                    _, _, imp = kbimp64(m.dof_solref[j], m.dof_solimp[j], 0.0, hh)
+                    for v in Hs:
+                        Hs[v][j, j] += d.efc_D[mfloss[j]] if v == "mujoco" else 1 / max(dinvw[j] * (1 - imp) / imp, 1e-15)
+                r += 1
+            for e in range(m.neq):
+                j1, j2 = m.jnt_dofadr[[m.eq_obj1id[e], m.eq_obj2id[e]]]
+                poly = m.eq_data[e, :2].astype(np.float32).astype(np.float64)
+                pos = rec["qpos"][i, k, j1 + 1] - poly[0] - poly[1] * rec["qpos"][i, k, j2 + 1]
+                _, _, imp = kbimp64(m.eq_solref[e], m.eq_solimp[e], pos, hh)
+                ej = np.zeros(nv)
+                ej[j1], ej[j2] = 1.0, -poly[1]
+                iw = dinvw[j1] + dinvw[j2]
+                for v in Hs:
+                    D = d.efc_D[meq[e]] if v == "mujoco" else 1 / max(iw * (1 - imp) / imp, 1e-15)
+                    Hs[v] += D * np.outer(ej, ej)
+                r += 1
             for j in ldofs:  # limit rows, dof ascending
                 if zone[r]:
                     q = rec["qpos"][i, k, j + 1]
@@ -594,12 +621,12 @@ def binary_source(m, foot_pairs):
     c1, maxd = source.constants(m)
     c2 = step.pair_constants(m, foot_pairs)
     dofbody, mask = step.extra_constants(m)
-    halves = np.stack([mask & 0xFFFF, mask >> 16], 1).ravel()
+    halves = np.stack([(mask >> shift) & 0xFFFF for shift in (0, 16, 32, 48)], 1).ravel()
     consts = np.concatenate([c1, c2, dofbody.astype(np.float32), halves.astype(np.float32)])
-    sizes = {"nb": m.nbody, "nv": m.nv, "one": 1, "nv2": 2 * m.nv}
-    lay1 = source.CONST_LAYOUT
+    sizes = {"nb": m.nbody, "nv": m.nv, "one": 1, "nv2": 2 * m.nv, "nr": len(source.free_roots(m))}
+    lay1 = source.const_layout(m)
     lay2 = [(s, k, n, 1) for s, k, n in step.const_layout(m)]
-    lay3 = [("c_dofbody", "i", "nv", 1), ("c_ancmask", "u", "nb", 1)]
+    lay3 = [("c_dofbody", "i", "nv", 1), ("c_ancmask", "q", "nb", 1)]
     src = (source.header(m, maxd, 1) + step.EXTRA_HEADER + step.step_header(m) + tape.header(m) + source.DEVICE
            + step.STEP_DEVICE + step.STEP_KERNEL + KERNEL
            + HOST.replace("LOAD_CONSTS", loader(list(lay1) + lay2 + lay3, sizes)).replace("NCONST", str(len(consts))))

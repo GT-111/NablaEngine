@@ -74,7 +74,7 @@ int main(int argc, char** argv) {  // dir nworld iterations substeps ncot reps d
   const float* p = cf.data();
 LOAD_CONSTS
 #define IN(name, n) snprintf(path, sizeof path, "%s/" #name ".bin", dir); float* d_##name = up(readf(path, (size_t)nw * (n)));
-  IN(qpos, NQ) IN(qvel, NV) IN(warm, NV) IN(ctrl, NV - 6) IN(fric, 1) IN(com, 3)
+  IN(qpos, NQ) IN(qvel, NV) IN(warm, NV) IN(ctrl, NU) IN(fric, 1) IN(com, 3)
 #if DK_ADJ_CLAMP_KV == 2
   // the soft clamp (adjoint.py): its delta (argv[10], default 0: the gradients of DK_ADJ_CLAMP_KV=1) and the ctrl the
   // adjoint then always needs
@@ -119,7 +119,7 @@ LOAD_CONSTS
   down(dir, "out_con.bin", oc, (size_t)nw * MAXCON * 8);
   down(dir, "tape.bin", tp, ntape);
   float *gq, *gv, *gu, *dbg = nullptr; int* ai;
-  cudaMalloc(&gq, (size_t)nw * NQ * 4); cudaMalloc(&gv, (size_t)nw * NV * 4); cudaMalloc(&gu, (size_t)nw * (NV - 6) * 4);
+  cudaMalloc(&gq, (size_t)nw * NQ * 4); cudaMalloc(&gv, (size_t)nw * NV * 4); cudaMalloc(&gu, (size_t)nw * (NU) * 4);
   cudaMalloc(&ai, (size_t)nw * 4);
   size_t ndbg = (size_t)nw * nsub * DBG_WORDS;
   if (dbg_on) cudaMalloc(&dbg, ndbg * 4);
@@ -153,7 +153,7 @@ LOAD_CONSTS
 #endif
     snprintf(name, sizeof name, "grad%d_qpos.bin", c); down(dir, name, gq, (size_t)nw * NQ);
     snprintf(name, sizeof name, "grad%d_qvel.bin", c); down(dir, name, gv, (size_t)nw * NV);
-    snprintf(name, sizeof name, "grad%d_ctrl.bin", c); down(dir, name, gu, (size_t)nw * (NV - 6));
+    snprintf(name, sizeof name, "grad%d_ctrl.bin", c); down(dir, name, gu, (size_t)nw * (NU));
     snprintf(name, sizeof name, "adj_info%d.bin", c); down(dir, name, ai, (size_t)nw);
     if (dbg && c == 0) down(dir, "dbg0.bin", dbg, ndbg);  // the intermediates of cotangent 0 (as the dump's)
   }

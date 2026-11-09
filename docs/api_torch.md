@@ -38,6 +38,10 @@ imports no JAX and no mujoco and calls no nvcc (an artifact built elsewhere: cop
 an update of the package `init()` rebuilds it where mujoco and nvcc are available and refuses it otherwise. Without
 any artifact, `init()` builds one first.
 
+Concurrent processes requesting the same library key share one compilation under a Linux file lock; different
+keys can compile in parallel. Constants, artifact metadata and the current-artifact pointer are published by
+atomic replacement, so another rank always reads complete files.
+
 On a V100 (sm_70) install a PyTorch build that still targets sm_70, e.g. the CUDA 12.6 wheels
 (`--index-url https://download.pytorch.org/whl/cu126`); the CUDA 12.8 and 12.9 wheels start at sm_75.
 
@@ -45,9 +49,10 @@ On a V100 (sm_70) install a PyTorch build that still targets sm_70, e.g. the CUD
 
 | entry | as in jax_ffi | notes |
 |---|---|---|
-| `init(device=None, artifact=None, model_dir=None, model=None, foot_pairs=None, terrain=None, com_body=None)` | `init` | loads the artifact (building it if needed) and uploads the model constants to `device` (default: the current CUDA device); the first call on a device synchronizes it; one architecture per process |
+| `init(device=None, artifact=None, model_dir=None, model=None, foot_pairs=None, com_body_id=None)` | `init` | prepares the default context and returns its model facts; the first call on a device synchronizes it |
+| `create_context(device=None, artifact=None, model_dir=None, model=None, foot_pairs=None, com_body_id=None)` | | returns an independent `ModelContext` with its own immutable model library, dimensions, constants, readiness and diagnostics |
 | `build(arch, ...)`, `python -m nablaengine.torch_ffi build` | | the artifact for an architecture (mujoco and nvcc needed) |
-| `step(qpos, qvel, warm, ctrl, friction, com, *, iterations=10, substeps=4, clamp_kv=0, normal=3, clamp_soft=None, grad_decay=1.0, kinematics=False)` | `step` | a `torch.autograd.Function`; the tape is written only when an input requires grad; `warm'` is not differentiable |
+| `step(qpos, qvel, warm, ctrl, friction, com, qfrc_applied=None, kp_scale=None, *, iterations=10, substeps=4, clamp_kv=0, normal=3, clamp_soft=None, grad_decay=1.0, kinematics=False, return_info=False, context=None)` | `step` | differentiable in Q, V, control and applied generalized force; the tape is written only when an input requires grad; `warm'` is not differentiable |
 | `kinematics(qpos, qvel, com)` | `kinematics` | differentiable in `qpos` and `qvel` |
 | `scale_grad(tree, gamma)` | `scale_grad` | on a pytree of tensors (`torch.utils._pytree`); non-floating leaves pass through |
 | `forward(...)`, `backward(...)` | `forward`, `backward` | without autograd; the same outputs, `info` included |
@@ -60,6 +65,45 @@ On a V100 (sm_70) install a PyTorch build that still targets sm_70, e.g. the CUD
 Every tensor is float32, contiguous and on one CUDA device, with the worlds as the leading dimension; another dtype,
 device, layout or shape raises `TypeError` (nothing is cast or copied). Every call runs on PyTorch's current CUDA
 stream of the inputs' device, with that device made current for the call.
+
+`qfrc_applied` is `(B, nv)` in the model's generalized force coordinates; omitted means zero. It is held for the
+native substeps in that call. `kp_scale` is `(B,)` and multiplies the actual position servo Kp, leaving Kd unchanged;
+omitted means one. It is a stopped physical randomization parameter, with no gradient. `backward(...,
+qfrc_applied=..., kp_scale=...)` takes the same operands as its forward and appends `g_qfrc_applied` to its usual four
+outputs when an applied force is supplied.
+
+`return_info=True` inserts the same `(B, 4)` int32 forward status as `forward()` after `warm'`, before any optional
+kinematics outputs. It is not differentiable. Its columns are the last substep's Newton iterations, contact count,
+constraint-row count and unsupported/overflow flags. This lets a differentiated rollout check capacity on the
+device, for example `torch._assert_async((info[:, 3] == 0).all(), "unsupported native step")`, without a host read.
+
+## Independent models in one process
+
+Module calls without `context=` keep their original default G1 API. `init()` prepares that context once; it never
+switches the default model after loading. Build or load additional models explicitly:
+
+```python
+left = torch_ffi.create_context(model=left_model, foot_pairs=[], com_body_id=left_root_body)
+right = torch_ffi.create_context(model=right_model, foot_pairs=[], com_body_id=right_root_body)
+q1, v1, warm1 = left.step(qpos_left, qvel_left, warm_left, finger_ctrl_left, friction_left, com_left,
+                        qfrc_applied_left, kp_scale_left, substeps=1)
+# Equivalently: torch_ffi.step(..., context=left).
+```
+
+Each context has `step`, `forward`, `backward`, `kinematics`, `init`, `tape_bytes`, `diagnostics`, `read_diagnostics`
+and `set_diagnostics` methods. Native dimensions and artifact facts are in `context.info`. The optional numeric
+`com_body_id` is a numeric body ID for one FREE root, or an ordered tuple of two body IDs for a coupled two-FREE
+model. Each body's authored local inertial position receives its own three-component offset: `com` is `(B, 3*nr)`
+and the G1 default remains `(B, 3)` with its torso binding. `context.info` records `nr`, `com_width`,
+`com_body_ids` and the actual FREE Q/V addresses. Contexts are retained for the process lifetime because delayed autograd and
+captured CUDA graphs reference their libraries and constants. There is no model reload or global constant switch.
+
+Custom ops register once and carry both the process-local context ID and the existing artifact model key.
+The key distinguishes model shapes in persistent compiler caches when a new process reuses a context number.
+Their fake shapes use that context's Q/V, actuator, body and tape dimensions. Forward saves both identities for
+delayed backward, including after another model has run. Prepare each context on every target device with `context.init(device)` before capture.
+`scripts/torch_context_check.py` checks routing and fake shapes on CPU; `--cuda ARTIFACT_A ARTIFACT_B` additionally
+checks real delayed VJPs and compiled/graph execution on CUDA. CPU routing checks are not CUDA qualification.
 
 ## Rollouts and memory
 
@@ -85,8 +129,13 @@ gradients or cotangents, replay mismatches; `jax_ffi.DIAG`) to an int64 tensor o
 only. `diagnostics()` returns that tensor without reading it; `read_diagnostics()` copies it to the host (a
 synchronization) and by default resets it. The backward's `info` carries the same per-world bits as `jax_ffi.backward`.
 
-Contacts or constraint rows beyond a world's capacity (64 contacts, 192 rows) are dropped and flagged as in the JAX
-interface (`docs/api.md`, Diagnostics, Capacity): `info[:, 3] & OVERFLOW_CONTACTS / OVERFLOW_ROWS` of `forward()`, the
+The artifact's `maxcon` and `nefc` record its model-derived point and row capacities. A positive model `nconmax`
+owns the point budget; automatic models use a bounded 256-point budget, limited by the pair graph with a 32-point
+minimum allocation. Rows cover every stored contact plus frictionloss, soft equalities and limits; a larger positive
+model `njmax` is preserved. Artifact version 4 records the widened tape counts; older artifacts must be rebuilt.
+Contacts or constraint rows beyond a world's compiled capacity are dropped and flagged as in the JAX
+interface (`docs/api.md`, Diagnostics, Capacity): `info[:, 3] & OVERFLOW_CONTACTS / OVERFLOW_ROWS` of `forward()` or
+`step(..., return_info=True)`, the
 counters `fwd_contact_overflow_worlds` / `fwd_row_overflow_worlds`, and with `set_overflow_warnings(True)` (or
 `DK_OVERFLOW_WARN=1`; off by default) a `RuntimeWarning` from `read_diagnostics()` and once more at exit for counts
 nobody read.

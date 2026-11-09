@@ -1,11 +1,11 @@
 """Which MuJoCo models the engine supports: input validation of a model before anything is built.
 
 The engine's code is generated from the model (nablaengine.g1_engine), but its kernels are written for one class of
-robot models (the mjlab G1's): a floating base with one hinge per body, position servos, explicit contact pairs
-between planes, spheres, capsules and boxes, the implicitfast integrator and the Newton solver, no passive forces,
-tendons or equality constraints. Without these checks many departures from that class would be silent: code generation
-would accept the model and the engine would simulate other physics (contype / conaffinity contacts left out, condim 4
-treated as frictionless, joint damping ignored, an Euler model integrated as implicitfast, ...). check() turns every
+robot models (the mjlab G1's): one or two floating bases with one hinge per body, position servos, contact pairs
+between planes, spheres, capsules and boxes, linear damping and frictionloss, soft linear joint equalities,
+the implicitfast integrator and the Newton solver, no tendons. Without these checks departures would be silent: code generation
+would accept the model and the engine would simulate other physics (unsupported collision geometry, condim 4
+treated as frictionless, nonlinear damping ignored, an Euler model integrated as implicitfast, ...). check() turns every
 assumption into a finding with a code:
 
   error  the engine would compute other physics than MuJoCo, or fail: the model is unsupported (UnsupportedModel)
@@ -54,10 +54,10 @@ CONTACTS_PER_PAIR = {(0, 1): 1, (0, 2): 2, (0, 3): 4, (1, 1): 1, (1, 2): 1, (2, 
 D, E = mujoco.mjtDisableBit, mujoco.mjtEnableBit
 # disable flags that cannot change the engine's results: sensors (the engine computes none), Euler damping (Euler is
 # rejected), auto reset, midphase / island bookkeeping of MuJoCo's own collision and solver paths, the parent filter
-# (contype contacts are rejected; explicit pairs are not filtered), ctrl clamping (the engine never clamps); the CCD
+# (the generated implicit pair table applies this flag), ctrl clamping (the engine never clamps); the CCD
 # flags only without box pairs (box-box follows MuJoCo Warp's native CCD, step.py BOX_BOX_CCD; no other pair uses CCD)
 DISABLE_OK = (D.mjDSBL_SENSOR, D.mjDSBL_EULERDAMP, D.mjDSBL_AUTORESET, D.mjDSBL_MIDPHASE, D.mjDSBL_ISLAND,
-              D.mjDSBL_FILTERPARENT, D.mjDSBL_CLAMPCTRL)
+              D.mjDSBL_FILTERPARENT, D.mjDSBL_CLAMPCTRL, D.mjDSBL_CONTACT)
 DISABLE_OK_NO_BOX = (D.mjDSBL_NATIVECCD, D.mjDSBL_MULTICCD)
 # disable flags of physics a supported model does not have, so they change nothing: springs and dampers (every
 # stiffness and damping field must be at its default 0: H22 and the default-kind fields; no tendons or flexes: H25),
@@ -163,6 +163,8 @@ def filter_pairs(m):
     same weld body, the parent filter unless disabled, not excluded, not already an explicit pair; measured on mujoco
     3.17: an explicit pair replaces only its own geom pair, exclude signatures are body1 << 16 | body2): the contacts
     the engine, which generates only explicit pairs, would leave out."""
+    if m.opt.disableflags & int(D.mjDSBL_CONTACT):
+        return []
     ex = {int(s) for s in m.exclude_signature} if m.nexclude else set()
     explicit = {frozenset((int(a), int(b))) for a, b in zip(m.pair_geom1, m.pair_geom2)}
     filt_parent = not (m.opt.disableflags & int(D.mjDSBL_FILTERPARENT))
@@ -184,15 +186,6 @@ def filter_pairs(m):
                 continue
             out.append((g1, g2))
     return out
-
-
-def collision_geoms(m):
-    return sorted({int(g) for g in m.pair_geom1} | {int(g) for g in m.pair_geom2})
-
-
-def _pair_codes(m, p):
-    a, b = int(m.geom_type[m.pair_geom1[p]]), int(m.geom_type[m.pair_geom2[p]])
-    return tuple(sorted((GEOM_CODE.get(a, -1), GEOM_CODE.get(b, -1))))
 
 
 def _name(m, objtype, i):
@@ -221,59 +214,65 @@ def check(m, foot_pairs=None, com_body=COM_BODY, scope="engine"):
     hinge = [j for j in range(m.njnt) if m.jnt_type[j] == J.mjJNT_HINGE]
 
     # ---- tree, joints, dofs
-    add("H1", nb <= 32, "error", "at most 32 bodies (lane = body, 32-bit ancestor masks)", nb,
+    roots = [b for b in range(1, nb) if m.body_jntnum[b] == 1 and m.body_jntadr[b] >= 0
+             and m.jnt_type[m.body_jntadr[b]] == J.mjJNT_FREE]
+    add("H1", nb <= 64, "error", "at most 64 bodies (two body tiles, 64-bit ancestor masks)", nb,
         ("forward", "kinematics"))
-    add("H2", nb <= 31, "error", "at most 31 bodies in the adjoint (lanes 0 and 31 carry root rotation dofs)", nb,
+    add("H2", nb <= (31 if len(roots) == 1 else 64), "error", "at most 31 bodies in the single-root adjoint, "
+        "64 in the two-root adjoint", nb,
         ("adjoint",))
-    add("H3", nv >= 7, "error", "nv >= 7 (a free root and at least one hinge)", nv)
+    add("H3", nv >= 6, "error", "nv >= 6 (a free root)", nv)
     add("H4", nv <= 64, "error", "nv <= 64 (two rows per lane)", nv)
     add("H5", 33 <= nv <= 35, "warn", "33 <= nv <= 35: the tuned CHOL_BCAST / NEWTON_REUSE / blocked triangular solve "
         "(else the register Cholesky fallback: untested on a corpus, slower)", nv, ("forward", "adjoint"))
-    free1 = nb > 1 and m.body_jntnum[1] == 1 and m.jnt_type[m.body_jntadr[1]] == J.mjJNT_FREE
-    one_tree = nb > 1 and all(int(m.body_rootid[b]) == 1 for b in range(1, nb))
-    add("H6", free1 and children[0] == [1] and one_tree, "error",
-        "body 1 has the only joint of its body, a free joint, and is the world's only child (one tree)",
-        dict(world_children=children[0], body1_free=bool(free1)), ("forward", "kinematics"))
-    bad7 = [b for b in range(2, nb) if not (m.body_jntnum[b] == 1 and m.body_jntadr[b] >= 0
+    add("H6", len(roots) in (1, 2) and children[0] == roots, "error",
+        "one or two actual top-level FREE roots, each with its only joint",
+        dict(world_children=children[0], free_roots=roots), ("forward", "kinematics"))
+    bad7 = [b for b in range(1, nb) if b not in roots and not (m.body_jntnum[b] == 1 and m.body_jntadr[b] >= 0
                                             and m.jnt_type[m.body_jntadr[b]] == J.mjJNT_HINGE
                                             and not np.any(m.jnt_pos[m.body_jntadr[b]]))]
     add("H7", not bad7, "error", "every body after the root has one hinge at its origin (no welded, multi-joint, ball "
         "or slide bodies, no hinge anchor offset)", [_name(m, mujoco.mjtObj.mjOBJ_BODY, b) for b in bad7[:8]],
         ("forward", "kinematics"))
-    order = nb > 2 and m.body_dofadr[1] == 0 and m.body_dofnum[1] == 6 and all(
-        m.body_dofnum[b] == 1 and m.body_dofadr[b] == b + int(m.body_dofadr[2]) - 2 for b in range(2, nb))
-    add("H7b", bool(order), "error", "dofs in body order: the root's 0-5, then body b's hinge at b + const "
-        "(adjoint.header's ADJ_HINGE_DOF0)", None, ("adjoint",))
+    offset, order = 0, True
+    for b in range(1, nb):
+        width = 6 if b in roots else 1
+        order &= m.body_dofadr[b] == offset and m.body_dofnum[b] == width
+        offset += width
+    add("H7b", bool(order), "error", "dofs in compiled body order: six per FREE root, one per hinge", None,
+        ("adjoint",))
     q0 = [j for j in hinge if m.qpos0[m.jnt_qposadr[j]] != 0]
     add("H8", not q0, "error", "hinge qpos0 = 0 (the engine uses qpos as the angle, MuJoCo qpos - qpos0)",
         {_name(m, mujoco.mjtObj.mjOBJ_JOINT, j): float(m.qpos0[m.jnt_qposadr[j]]) for j in q0[:8]},
         ("forward", "kinematics"))
     nch = max((len(c) for c in children[1:]), default=0)
-    add("H9", nch <= 8, "error", "at most 8 children per body (c_child; model_hooks.py beyond 3)", nch)
+    add("H9", nch <= 8, "error", "at most 8 children per body (MAX_CHILD)", nch)
 
     def nanc(b):
         k, n = parent[b], 0
-        while k >= 2:
+        while k > 0 and k not in roots:
             n, k = n + 1, parent[k]
         return n
     na_max = max((nanc(b) for b in range(2, nb)), default=0)
     add("H10", na_max <= 12, "error", "at most 12 hinge ancestors per body (c_anc)", na_max)
 
     # ---- actuators
-    bad11 = []
+    bad11, driven = [], []
     for a in range(int(m.nactuator)):
         j = int(m.actuator_trnid[a, 0])
         ok = (m.actuator_trntype[a] == T.mjTRN_JOINT and 0 <= j < m.njnt and m.jnt_type[j] == J.mjJNT_HINGE
-              and m.jnt_dofadr[j] == 6 + a and m.actuator_biastype[a] == mujoco.mjtBias.mjBIAS_AFFINE
+              and m.actuator_biastype[a] == mujoco.mjtBias.mjBIAS_AFFINE
               and m.actuator_gear[a, 0] == 1.0 and not np.any(m.actuator_gear[a, 1:])
-              and m.actuator_gainprm[a, 0] == -m.actuator_biasprm[a, 1] and not m.actuator_forcelimited[a]
+              and m.actuator_gainprm[a, 0] == -m.actuator_biasprm[a, 1]
               and m.actuator_ctrladr[a] == a and m.actuator_ctrlnum[a] == 1 and m.actuator_outadr[a] == a
               and m.actuator_outnum[a] == 1)
         if not ok:
             bad11.append(_name(m, mujoco.mjtObj.mjOBJ_ACTUATOR, a))
-    add("H11a", nu == m.nactuator == m.nout == nv - 6 and not bad11, "error",
-        "one position servo per hinge in joint order (actuator a on dof 6 + a, one control and force each), joint "
-        "transmission, affine bias, gear 1, gainprm[0] = -biasprm[1], not force-limited",
+        else:
+            driven.append(j)
+    add("H11a", nu == m.nactuator == m.nout and len(set(driven)) == len(driven) and not bad11, "error",
+        "at most one position servo per hinge (passive hinges allowed, independent control order), joint "
+        "transmission, affine bias, gear 1, gainprm[0] = -biasprm[1]",
         dict(nu=nu, nactuator=int(m.nactuator), hinges=nv - 6, bad=bad11[:8]))
     gt = [_name(m, mujoco.mjtObj.mjOBJ_ACTUATOR, a) for a in range(int(m.nactuator))
           if m.actuator_gaintype[a] != mujoco.mjtGain.mjGAIN_FIXED or m.actuator_dyntype[a] != mujoco.mjtDyn.mjDYN_NONE
@@ -286,51 +285,59 @@ def check(m, foot_pairs=None, com_body=COM_BODY, scope="engine"):
         "it; the interface's documented semantics)", dict(ctrllimited=clamped))
     asym = [_name(m, mujoco.mjtObj.mjOBJ_JOINT, j) for j in range(m.njnt)
             if m.jnt_actfrclimited[j] and m.jnt_actfrcrange[j, 0] != -m.jnt_actfrcrange[j, 1]]
-    add("H12", not asym, "error", "symmetric actuator force ranges (jnt_actfrcrange)", asym[:8])
+    asym += [_name(m, mujoco.mjtObj.mjOBJ_ACTUATOR, a) for a in range(m.nactuator)
+             if m.actuator_forcelimited[a] and m.actuator_forcerange[a, 0] != -m.actuator_forcerange[a, 1]]
+    add("H12", not asym, "error", "symmetric actuator and joint actuator force ranges", asym[:8])
     if com_body is not None:
-        tid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, com_body)
-        add("H13", tid >= 1, "error", f"the COM-offset body {com_body!r} exists", tid)
+        selected = [com_body] if isinstance(com_body, (str, int, np.integer)) else list(com_body)
+        tids = [mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, b) if isinstance(b, str) else int(b)
+                for b in selected]
+        add("H13", len(tids) == len(roots) and all(1 <= tid < nb for tid in tids), "error",
+            f"one compiled COM-offset body per FREE root {com_body!r}", tids)
 
     # ---- contacts
-    cg = collision_geoms(m)
+    cg = step.collision_geoms(m)
+    generated_pairs = step.contact_pairs(m)
+    pair_codes = [tuple(sorted(GEOM_CODE.get(int(m.geom_type[g]), -1) for g in pair)) for pair in generated_pairs]
     types = {GEOM_CODE.get(int(m.geom_type[g]), -1) for g in cg}
     tnames = sorted({mujoco.mjtGeom(int(m.geom_type[g])).name for g in cg})
     add("H14a", types <= FORWARD_TYPES, "error", "contact pair geoms are planes, spheres, capsules or boxes", tnames)
     planes_off_world = [g for g in cg if m.geom_type[g] == G.mjGEOM_PLANE and m.geom_bodyid[g] != 0]
-    box_ok = all(0 in _pair_codes(m, p) or _pair_codes(m, p) == (3, 3) for p in range(m.npair)
-                 if 3 in _pair_codes(m, p))  # plane-box and box-box (model_hooks.py)
+    box_ok = all(0 in codes or codes == (3, 3) for codes in pair_codes if 3 in codes)  # plane-box and box-box (model_hooks.py)
     add("H14b", (types <= ADJOINT_TYPES or (types <= ADJOINT_TYPES | {3} and box_ok)) and not planes_off_world, "error",
         "contact pair geoms are planes (on the world body), spheres or capsules in the adjoint, and boxes in pairs "
         "with planes (model_hooks.py)", dict(types=tnames, planes_off_world=planes_off_world[:4]), ("adjoint",))
-    combos = sorted({_pair_codes(m, p) for p in range(m.npair)} - DISPATCHED)
+    combos = sorted(set(pair_codes) - DISPATCHED)
     add("H14c", not combos, "error", "every pair's type combination is one the forward collides (not plane-plane, "
         "sphere-box)", combos)
     # box-box follows MuJoCo Warp's native CCD (GJK / EPA with opt.ccd_iterations and ccd_tolerance) by its converged
     # result (step.py box_box, BOX_BOX_CCD): fewer iterations or a looser tolerance change MuJoCo Warp's contacts, not
     # the engine's (no other pair type of the engine uses CCD)
     d_it, d_tol = F.option_default("ccd_iterations"), F.option_default("ccd_tolerance")
-    boxbox = sum(1 for p in range(m.npair) if _pair_codes(m, p) == (3, 3))
+    boxbox = pair_codes.count((3, 3))
     add("H14d", not boxbox or (m.opt.ccd_iterations >= d_it and m.opt.ccd_tolerance <= d_tol), "error",
         f"box-box pairs: native CCD at least as converged as MuJoCo's default (ccd_iterations >= {d_it}, ccd_tolerance "
         f"<= {d_tol:g}), whose converged contact the forward computes",
         dict(boxbox_pairs=boxbox, ccd_iterations=int(m.opt.ccd_iterations), ccd_tolerance=float(m.opt.ccd_tolerance)))
     fp = filter_pairs(m)
-    add("H15", not fp, "error", "no contype / conaffinity contacts (the engine generates only the explicit pairs)",
+    add("H15", True, "info", "explicit and eligible contype / conaffinity pairs are generated",
         dict(n=len(fp), first=[(_name(m, mujoco.mjtObj.mjOBJ_GEOM, a), _name(m, mujoco.mjtObj.mjOBJ_GEOM, b))
                                for a, b in fp[:4]]))
-    mg = [p for p in range(m.npair) if m.pair_margin[p] or m.pair_gap[p]
-          or m.pair_friction[p, 0] != m.pair_friction[p, 1]]
+    pair_params, generated_pairs = step.contact_parameters(m), step.contact_pairs(m)
+    mg = [p for p in range(len(generated_pairs)) if pair_params["margin"][p] or pair_params["gap"][p]
+          or pair_params["friction"][p, 0] != pair_params["friction"][p, 1]]
     add("H16", not mg, "error", "pair margin = gap = 0 and friction[0] = friction[1]",
-        [_name(m, mujoco.mjtObj.mjOBJ_PAIR, p) for p in mg[:8]])
-    cd = sorted({int(x) for x in m.pair_dim} - {1, 3})
+        mg[:8])
+    cd = sorted({int(x) for x in pair_params["dim"]} - {1, 3})
     add("H17", not cd, "error", "pair condim 1 or 3 (others would be simulated as frictionless)", cd)
     add("H18", m.opt.cone == mujoco.mjtCone.mjCONE_PYRAMIDAL, "error", "pyramidal friction cone",
         mujoco.mjtCone(int(m.opt.cone)).name)
     # MuJoCo Warp (constraint.py) reads each solref entry on its own: solref[0] <= 0 is a direct stiffness, solref[1]
     # <= 0 a direct damping (e.g. (0.02, 0) is the time constant's stiffness without damping); the engine's kbimp has
     # the standard form of both only
-    neg = dict(pairs=int((m.pair_solref <= 0).any(axis=1).sum()), joints=int((m.jnt_solref[1:] <= 0).any(axis=1).sum()),
-               dofs=int((m.dof_solref <= 0).any(axis=1).sum()))
+    neg = dict(pairs=int((pair_params["solref"] <= 0).any(axis=1).sum()), joints=int((m.jnt_solref[1:] <= 0).any(axis=1).sum()),
+               dofs=int((m.dof_solref <= 0).any(axis=1).sum()),
+               equalities=int((m.eq_solref <= 0).any(axis=1).sum()))
     add("H19", not any(neg.values()), "error", "solref in the standard form, both entries > 0 (time constant, damping "
         "ratio; a direct, non-positive stiffness or damping entry is unsupported)", neg)
     lim_free = [j for j in range(m.njnt) if m.jnt_limited[j] and m.jnt_type[j] != J.mjJNT_HINGE]
@@ -339,8 +346,11 @@ def check(m, foot_pairs=None, com_body=COM_BODY, scope="engine"):
     add("H20", bool(uni and not m.jnt_margin.any() and dof_uni and not lim_free), "error",
         "one solref / solimp for every joint limit and every dof, jnt_margin 0, only hinge limits",
         dict(limited_non_hinge=lim_free[:4]))
-    add("U10", not (m.dof_frictionloss > 0).any(), "warn", "no frictionloss rows (the G1's; their adjoint, "
-        "model_hooks.py, is untested on a held-out corpus)", int((m.dof_frictionloss > 0).sum()), ("adjoint",))
+    add("H21", True, "info", "dof frictionloss rows (forward and adjoint)", int((m.dof_frictionloss > 0).sum()),
+        ("adjoint",))
+    add("U10", not (m.dof_frictionloss > 0).any(), "warn",
+        "frictionloss adjoint has not been checked on a held-out corpus",
+        int((m.dof_frictionloss > 0).sum()), ("adjoint",))
 
     # ---- passive forces, integrator, solver, options
     medium = dict(density=float(m.opt.density), viscosity=float(m.opt.viscosity), wind=[float(x) for x in m.opt.wind])
@@ -351,7 +361,9 @@ def check(m, foot_pairs=None, com_body=COM_BODY, scope="engine"):
     add("H24a", m.opt.solver == mujoco.mjtSolver.mjSOL_NEWTON, "error", "Newton solver",
         mujoco.mjtSolver(int(m.opt.solver)).name)
     has_box = any(m.geom_type[g] == G.mjGEOM_BOX for g in cg)
-    noop = DISABLE_NOOP + ((D.mjDSBL_FRICTIONLOSS,) if not (m.dof_frictionloss > 0).any() else ()) + (
+    noop = tuple(x for x in DISABLE_NOOP if x != D.mjDSBL_DAMPER or not m.dof_damping.any())
+    noop = tuple(x for x in noop if x != D.mjDSBL_EQUALITY or not m.neq)
+    noop += ((D.mjDSBL_FRICTIONLOSS,) if not (m.dof_frictionloss > 0).any() else ()) + (
         (D.mjDSBL_LIMIT,) if not np.asarray(m.jnt_limited).any() else ())
     dis = int(m.opt.disableflags) & ~_mask(DISABLE_OK + noop + (() if has_box else DISABLE_OK_NO_BOX))
     en = int(m.opt.enableflags) & ~_mask(ENABLE_OK)
@@ -359,25 +371,39 @@ def check(m, foot_pairs=None, com_body=COM_BODY, scope="engine"):
         "no disable / enable flags that change the physics, noslip off, no disabled actuator groups",
         dict(disable=_bits(dis, D), enable=_bits(en, E), noslip_iterations=int(m.opt.noslip_iterations),
              disableactuator=int(m.opt.disableactuator)))
-    add("H25", m.ntendon == 0 and m.neq == 0 and m.nmocap == 0 and m.nflex == 0 and m.nplugin == 0, "error",
-        "no tendons, equality constraints, mocap bodies, flexes or plugins",
+    add("H25", m.ntendon == 0 and m.nmocap == 0 and m.nflex == 0 and m.nplugin == 0, "error",
+        "no tendons, mocap bodies, flexes or plugins",
         dict(ntendon=int(m.ntendon), neq=int(m.neq), nmocap=int(m.nmocap), nflex=int(m.nflex),
              nplugin=int(m.nplugin)), ("forward", "kinematics"))
+    badeq = []
+    for e in range(m.neq):
+        j1, j2 = int(m.eq_obj1id[e]), int(m.eq_obj2id[e])
+        if not (m.eq_type[e] == mujoco.mjtEq.mjEQ_JOINT and m.eq_active0[e]
+                and 0 <= j1 < m.njnt and 0 <= j2 < m.njnt and j1 != j2
+                and m.jnt_type[j1] == J.mjJNT_HINGE and m.jnt_type[j2] == J.mjJNT_HINGE
+                and not np.any(m.eq_data[e, 2:5])):
+            badeq.append(e)
+    add("H25b", m.neq <= 6 * len(roots) and not badeq, "error", "at most six active soft linear joint equalities "
+        "per root between hinges",
+        dict(neq=int(m.neq), bad=badeq), ("forward",))
 
     # ---- capacities (the generators' own values; they need supported geom types and one hinge per body)
     gen = types <= FORWARD_TYPES and not bad7 and nb > 1
-    kdof = step.max_support(m) if m.npair and gen else 0
+    kdof = step.max_support(m) if generated_pairs and gen else 0
     maxcon = step.maxcon(m)
     npset = len(step.pair_param_sets(m)[0])
-    add("H26a", len(cg) <= 255 and npset <= 255 and kdof <= 32 and maxcon <= 64 and m.npair < 65536, "error",
-        "<= 255 collision geoms and parameter sets (the pair word), KDOF <= 32, MAXCON <= 64",
-        dict(ngeomc=len(cg), param_sets=npset, kdof=kdof, maxcon=maxcon))
-    add("H26b", m.npair <= 512, "error", "at most 512 contact pairs (the tape's 9-bit pair index)", int(m.npair),
+    rows = step.nefc(m) if gen else 0
+    add("H26a", len(cg) <= 255 and npset <= 255 and kdof <= 32 and maxcon <= 65535 and rows <= 65535
+        and len(generated_pairs) < 65536, "error",
+        "<= 255 collision geoms and parameter sets (the pair word), KDOF <= 32, 16-bit point and row counts",
+        dict(ngeomc=len(cg), param_sets=npset, kdof=kdof, maxcon=maxcon, nefc=rows))
+    add("H26b", len(generated_pairs) <= 2048, "error", "at most 2048 generated contact pairs (up to 11 tape bits)",
+        len(generated_pairs),
         ("adjoint",))
     if foot_pairs is not None:
         fps = [int(p) for p in np.asarray(foot_pairs).ravel()]
-        add("H30", set(fps) <= set(range(m.npair)), "error", "the friction (foot) pairs are contact pair indices",
-            dict(n=len(fps), outside=sorted(set(fps) - set(range(m.npair)))[:8]))
+        add("H30", set(fps) <= set(range(len(generated_pairs))), "error", "friction overrides name generated pairs",
+            dict(n=len(fps), outside=sorted(set(fps) - set(range(len(generated_pairs))))[:8]))
 
     # ---- kinematics outputs
     sub = np.array(m.body_mass, np.float64)
@@ -397,14 +423,14 @@ def check(m, foot_pairs=None, com_body=COM_BODY, scope="engine"):
         "a corpus", nv, ("forward", "adjoint"))
     add("U2", not gen or kdof == 16, "warn", "KDOF = 16 (the G1's): otherwise DK_JV_VEC's 128-bit con_jv loads are off and the "
         "scalar path, never run on a corpus, is used", kdof)
-    add("U3", maxcon == 64, "warn", "MAXCON 64 in the adjoint (npair > 64; the adjoint never ran with MAXCON 32)",
+    add("U3", maxcon <= 256, "warn", "point budgets above the automatic 256-point capacity need separate CUDA validation",
         maxcon, ("adjoint",))
     worst = 0
     dr = ([int(p) for p in np.asarray(foot_pairs).ravel()] if foot_pairs is not None
-          else [p for p in range(m.npair) if 0 in _pair_codes(m, p)])
+          else [p for p, codes in enumerate(pair_codes) if 0 in codes])
     for p in dr:
-        if 0 <= p < m.npair:
-            worst += CONTACTS_PER_PAIR.get(_pair_codes(m, p), 1)
+        if 0 <= p < len(generated_pairs):
+            worst += CONTACTS_PER_PAIR.get(pair_codes[p], 1)
     add("U4", worst <= maxcon, "warn", "the friction (foot) pairs' worst-case contacts fit MAXCON (else contacts are "
         "dropped and the world flagged while standing)", dict(worst_case=worst, maxcon=maxcon))
     floor = step.floor_geom(m) if gen else None  # (unsupported types: H14a, the switch is not generated)
@@ -412,7 +438,7 @@ def check(m, foot_pairs=None, com_body=COM_BODY, scope="engine"):
         "the general plane path, untested on a corpus)", floor)
     add("U6", bool(step.dof_body_root6(m)), "warn", "bodies and dofs in the same order (DOF_BODY_ROOT6; else the general "
         "support mask, untested on a corpus)", bool(step.dof_body_root6(m)))
-    pw = sorted({float(np.float32(x)) for x in list(m.pair_solimp[:, 4]) + list(m.jnt_solimp[1:, 4])})
+    pw = sorted({float(np.float32(x)) for x in list(pair_params["solimp"][:, 4]) + list(m.jnt_solimp[1:, 4])})
     add("U7", bool(step.solimp_pow2(m)) and len(pw) <= 1, "warn", "every solimp power 2 (SOLIMP_POW2, ADJ_SOLIMP_POWER; "
         "else the general power paths, untested on a corpus)", pw, ("forward", "adjoint"))
     add("I1", True, "info", "the timestep (baked into the constants)", float(m.opt.timestep))

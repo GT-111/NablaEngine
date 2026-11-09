@@ -12,6 +12,36 @@ scripts/verify.sh [OUTDIR]           # about 15 minutes on a V100: every check o
 
 `OUTDIR` defaults to `runs/verify`; each check leaves `<name>.log` and `<name>.json` there.
 
+The generated model extensions have a separate CPU check:
+
+```bash
+PYTHONPATH=src python scripts/model_generation_check.py
+```
+
+It checks genuine zero-contact generation, `nv` 13 / 18 / 22 / 28, three / four / five child branches, the compiled
+COM body, independent actuator ordering with passive hinges, damping constants, and six soft linear joint equalities
+with dof frictionloss. Equality positions, velocities, Jacobians and constraint weights are compared with MuJoCo C
+3.17. It also generates both upstream 0.2 terrain modes and a two-root build plan, so the native layout cannot silently
+break their source hooks. These checks do not execute CUDA kernels or qualify a hand's forward accuracy, finite-difference VJP accuracy,
+runtime or contact behavior. Run forward and VJP checks on the actual compiled model and target GPU for those claims;
+use `clamp_kv=1, normal=0, grad_decay=1` for finite differences and report training mode separately.
+The two-root cases also cover all 56 velocities / 58 positions, 64-bit ancestor masks, 12 soft joint equalities,
+implicit cross-root sphere contacts, native material mixing, and a nonzero off-diagonal contact Hessian. They check
+that native implicit mesh contacts remain rejected. Most synthetic cases have no collision geometry; none represents
+the full enabled convex-mesh contact graph of the normal DexForge five-hand native scenes.
+
+The first coupled CUDA snapshot has a finite check with explicit source, cache and result locations:
+
+```bash
+python scripts/coupled_physics_check.py --source-root "$NABLA_SOURCE" --cache "$NABLA_CACHE" \
+    --out "$NABLA_RESULTS/coupled-check.json" --device cuda:0 \
+    --cases coupled_contact,coupled_large,coupled_equalities,g1
+```
+
+It compares forward Q/V and directional Q/V/control/applied-force VJPs with float64 MuJoCo, checks a force on one
+root affects the other through contact, and reports the differentiated forward's status and tape diagnostics. It runs only on the selected local CUDA device;
+no CUDA result is implied by the script's presence.
+
 ## Data
 
 | data | file | what it is |

@@ -46,6 +46,12 @@ Booster T1, ROBOTIS OP3 and Berkeley Humanoid (`docs/robots.md`).
 
 Terrain builds add static boxes and heightfields with a height scan (`docs/terrain.md`).
 
+This development branch extends upstream 0.2 to one or two FREE trees with native actuator ordering, passive hinges,
+damping, dof frictionloss and soft linear joint equalities. The Torch interface owns independent immutable model
+contexts and applied-force gradients. CPU source/layout checks cover these extensions; the upstream GPU results above
+describe the upstream models and builds. Forward, VJP and training qualification of the extended hand models is a
+separate target-GPU check (`docs/verification.md`).
+
 Other models are rejected with an error that names the unsupported features.
 
 Requirements: Linux x86_64, an NVIDIA GPU of compute capability 7.0 or newer (tested: V100, RTX 3090, H100, RTX PRO
@@ -114,8 +120,10 @@ qpos1, qvel1, warm1 = torch_ffi.step(qpos, qvel, warm, ctrl, friction, com)
 
 Inputs are float32 arrays with the worlds as the leading dimension: `qpos (B, 36)`, `qvel (B, 35)`, the solver's warm
 start `warm (B, 35)`, the position targets `ctrl (B, 29)`, and per-world foot `friction (B,)` and torso
-centre-of-mass offset `com (B, 3)` for domain randomization. Each world holds up to 64 contacts and 192 constraint
-rows; a world beyond them (e.g. deep interpenetration after a fall) drops the extra ones and is flagged and counted
+centre-of-mass offset `com (B, 3)` for domain randomization. Contact storage uses a positive model `nconmax`, or a
+bounded automatic budget of 256 points, limited by the eligible pair graph with a 32-point minimum allocation.
+Constraint storage covers those points and the model's frictionloss, equality and limit rows, and preserves a larger
+positive `njmax`. Overflow is flagged and counted; a flagged successor omits forces and must be rejected
 (`docs/api.md`, Diagnostics).
 
 ## Documentation

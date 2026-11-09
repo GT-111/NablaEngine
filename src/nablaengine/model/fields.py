@@ -5,7 +5,7 @@ Kinds:
   consumed    read by the engine's code generation, constants or interface (nablaengine.g1_engine, jax_ffi); its
               value is used, under the checks of the code given (e.g. jnt_margin: H20 requires 0)
   checked     the engine does not model it; the capability check of the code given rejects the values it cannot
-              represent (e.g. opt.integrator: H23, implicitfast only; geom_contype: H15, no filter contacts)
+              represent (e.g. opt.integrator: H23, implicitfast only)
   default     the engine does not model it and has no check of its own: every row must equal MuJoCo's compile default
               (default_rows(), from a probe model compiled by this MuJoCo), else an error under the code given. This is
               where a physics field that a MuJoCo release adds lands first (actuator_damping, *_dampingpoly,
@@ -46,8 +46,6 @@ def _f(kind, code=None, note=""):
 
 VISUAL = "rendering only"
 USER = "user data, not read"
-FILTER = ("parameter of contype / conaffinity contacts (MuJoCo's mixing rules); the engine has only explicit pairs, "
-          "which carry their own (H15 rejects filter contacts)")
 
 FIELDS = {
     # ---- generalized coordinates
@@ -83,8 +81,8 @@ FIELDS = {
     "dof_bodyid": _f("consumed", "H7b"), "dof_jntid": _f("derived"), "dof_parentid": _f("derived"),
     "dof_treeid": _f("derived"), "dof_Madr": _f("derived"), "dof_simplenum": _f("derived"),
     "dof_solref": _f("consumed", "H19"), "dof_solimp": _f("consumed", "H20"),
-    "dof_frictionloss": _f("consumed", None, "frictionloss rows (forward and adjoint; U10)"), "dof_armature": _f("consumed"),
-    "dof_damping": _f("consumed", None, "joint damping (model_hooks.py: c_damp)"),
+    "dof_frictionloss": _f("consumed", "H21"), "dof_armature": _f("consumed"),
+    "dof_damping": _f("consumed", "H22", "linear joint damping"),
     "dof_dampingpoly": _f("default", "H22", "joint damping (higher order)"),
     "dof_invweight0": _f("consumed"), "dof_M0": _f("derived"), "dof_length": _f("derived"),
     # ---- kinematic trees
@@ -92,17 +90,17 @@ FIELDS = {
     "tree_dofnum": _f("derived"),
     "tree_sleep_policy": _f("irrelevant", "H24b", "island sleeping (mjENBL_SLEEP is rejected, H24b)"),
     # ---- geoms
-    "geom_type": _f("consumed", "H14a"), "geom_contype": _f("checked", "H15"),
-    "geom_conaffinity": _f("checked", "H15"), "geom_condim": _f("irrelevant", "H15", FILTER),
+    "geom_type": _f("consumed", "H14a"), "geom_contype": _f("consumed", "H15"),
+    "geom_conaffinity": _f("consumed", "H15"), "geom_condim": _f("consumed", "H17"),
     "geom_bodyid": _f("consumed"), "geom_dataid": _f("derived", "H14a", "mesh / height field of a geom (the "
                                                      "collision geoms' types are checked)"),
     "geom_matid": _f("irrelevant", note=VISUAL), "geom_group": _f("irrelevant", note=VISUAL),
-    "geom_priority": _f("irrelevant", "H15", FILTER), "geom_plugin": _f("default", "H25", "geom plugins (SDF)"),
-    "geom_sameframe": _f("derived"), "geom_solmix": _f("irrelevant", "H15", FILTER),
-    "geom_solref": _f("irrelevant", "H15", FILTER), "geom_solimp": _f("irrelevant", "H15", FILTER),
+    "geom_priority": _f("consumed", "H15"), "geom_plugin": _f("default", "H25", "geom plugins (SDF)"),
+    "geom_sameframe": _f("derived"), "geom_solmix": _f("consumed", "H15"),
+    "geom_solref": _f("consumed", "H19"), "geom_solimp": _f("consumed", "H20"),
     "geom_size": _f("consumed"), "geom_aabb": _f("derived"), "geom_rbound": _f("consumed"),
-    "geom_pos": _f("consumed"), "geom_quat": _f("consumed"), "geom_friction": _f("irrelevant", "H15", FILTER),
-    "geom_margin": _f("irrelevant", "H15", FILTER), "geom_gap": _f("irrelevant", "H15", FILTER),
+    "geom_pos": _f("consumed"), "geom_quat": _f("consumed"), "geom_friction": _f("consumed", "H16"),
+    "geom_margin": _f("consumed", "H16"), "geom_gap": _f("consumed", "H16"),
     "geom_surfacevel": _f("default", "H16", "contact surface velocity"),
     "geom_adhesion": _f("default", "H16", "contact adhesion"),
     "geom_fluid": _f("default", "H22", "the ellipsoid fluid model"), "geom_user": _f("irrelevant", note=USER),
@@ -114,8 +112,7 @@ FIELDS = {
     "pair_solimp": _f("consumed"), "pair_margin": _f("consumed", "H16"), "pair_gap": _f("consumed", "H16"),
     "pair_adhesion": _f("default", "H16", "contact adhesion"),
     "pair_friction": _f("consumed", "H16", "tangential friction; spin and rolling unused at condim 1 / 3 (H17)"),
-    "exclude_signature": _f("irrelevant", "H15", "excluded body pairs of contype / conaffinity contacts (H15 "
-                                                  "applies them)"),
+    "exclude_signature": _f("consumed", "H15", "excluded body pairs of contype / conaffinity contacts"),
     # ---- actuators
     "actuator_trntype": _f("consumed", "H11a"), "actuator_dyntype": _f("checked", "H11b"),
     "actuator_gaintype": _f("checked", "H11b"), "actuator_biastype": _f("consumed", "H11a"),
@@ -141,7 +138,7 @@ FIELDS = {
                                                 "rejected by H24b"),
     "actuator_user": _f("irrelevant", note=USER), "actuator_plugin": _f("default", "H25", "actuator plugins"),
     "actuator_forcelimited": _f("consumed", "H11a"),
-    "actuator_forcerange": _f("irrelevant", "H11a", "unused: no actuator is force-limited (H11a)"),
+    "actuator_forcerange": _f("consumed", "H12", "symmetric force limit combined with the joint force limit"),
     "actuator_ctrllimited": _f("checked", "H11c"), "actuator_ctrlrange": _f("checked", "H11c"),
     "actuator_gear": _f("consumed", "H11a"), "actuator_acc0": _f("derived"), "actuator_length0": _f("derived"),
     "actuator_lengthrange": _f("derived", note="computed for muscles; no muscles (H11b)"),
@@ -200,7 +197,7 @@ SIZES = {  # mjModel's sizes: consumed / checked as their arrays, derived counts
     "nmocap": _f("checked", "H25"), "neq": _f("checked", "H25"), "ntendon": _f("checked", "H25"),
     "nwrap": _f("checked", "H25"), "nJten": _f("derived", "H25"), "nflex": _f("checked", "H25"),
     "nplugin": _f("checked", "H25"), "npluginattr": _f("derived", "H25"), "npluginstate": _f("derived", "H25"),
-    "nhistory": _f("derived", "H11e"), "ngravcomp": _f("derived", "H22"), "nexclude": _f("irrelevant", "H15", FILTER),
+    "nhistory": _f("derived", "H11e"), "ngravcomp": _f("derived", "H22"), "nexclude": _f("derived", "H15"),
     **{k: _f("derived", "H25") for k in (
         "nflexnode", "nflexvert", "nflexedge", "nflexelem", "nflexelemdata", "nflexstiffness", "nflexbending",
         "nefm0dof", "nefm0L", "nefmCvert", "nflexelemedge", "nflexshelldata", "nflextexcoord", "nJfe", "nJfv")},
@@ -224,7 +221,7 @@ PREFIXES = (  # (prefix, Field) for element types classified as a whole; checked
     ("flexedge_", _f("checked", "H25", "flexes (nflex = 0)")),
     ("flexvert_", _f("checked", "H25", "flexes (nflex = 0)")),
     ("efm0_", _f("checked", "H25", "flexes (nflex = 0)")), ("efmC_", _f("checked", "H25", "flexes (nflex = 0)")),
-    ("eq_", _f("checked", "H25", "equality constraints (neq = 0)")),
+    ("eq_", _f("consumed", "H25b", "soft linear joint equality rows")),
     ("tendon_", _f("checked", "H25", "tendons (ntendon = 0)")), ("ten_J_", _f("checked", "H25", "tendons")),
     ("wrap_", _f("checked", "H25", "tendon wraps (nwrap = 0)")),
     ("plugin_", _f("checked", "H25", "plugin instances (nplugin = 0)")),

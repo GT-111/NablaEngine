@@ -197,16 +197,17 @@ def apply(src, m, part="engine"):
     if not needed(m):
         return src
     hooks = ()
-    if source.child_width(m) > 3:
+    native = "#define NR " in src or "MAX_CHILD" in src
+    if source.child_width(m) > 3 and not native:
         hooks += ENGINE_CHILD if part == "engine" else KIN_CHILD
-    if m.nv < 32 and part == "engine":
+    if m.nv < 32 and part == "engine" and not native:
         hooks += ENGINE_SMALL_NV
-    if source.has_damping(m) and part == "engine":
+    if source.has_damping(m) and part == "engine" and not native:
         hooks += ENGINE_DAMPING
     has_box, box_ok, boxbox = box_pairs(m)
-    if (has_box or has_floss(m)) and part == "engine":
+    if (has_box or has_floss(m)) and part == "engine" and not native:
         hooks += ENGINE_ADJ_SCOPE
-    if has_floss(m) and part == "engine":
+    if has_floss(m) and part == "engine" and not native:
         hooks += ENGINE_FLOSS
     if has_box and part == "engine":
         if not box_ok:

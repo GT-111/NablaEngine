@@ -8,9 +8,7 @@ the mass matrix is taken about the root body's origin and includes the armature 
 
 constants(m) packs the model arrays the kernels read (global memory, see DKC; load order = CONST_LAYOUT) and
 asserts the model structure the kernels assume, among others: a free root at body 1, then one hinge per body at
-its origin, at most 32 bodies and MAX_CHILDREN children per body, nv >= MIN_NV (model_hooks.py adapts the kernels'
-text to nv < 32 and to more than 3 children per body), position actuators in joint order
-(actuator a on dof 6 + a), and the COM-offset body (default torso_link).
+its origin, at most 32 bodies, and position actuators. The COM-offset body is selected when packing the constants.
 """
 
 import mujoco
@@ -18,104 +16,120 @@ import numpy as np
 
 CONST_LAYOUT = (  # (symbol, kind, length in units of the body count or "nv", per-entry width)
     ("c_parent", "i", "nb", 1), ("c_depth", "i", "nb", 1), ("c_qadr", "i", "nb", 1), ("c_dadr", "i", "nb", 1),
+    ("c_isfree", "i", "nb", 1), ("c_root", "i", "nb", 1), ("c_roots", "i", "nr", 1),
+    ("c_dofqadr", "i", "nv", 1), ("c_doflocal", "i", "nv", 1), ("c_combody", "i", "nr", 1),
     ("c_nchild", "i", "nb", 1), ("c_child", "i", "nb", 3), ("c_pos", "f", "nb", 3), ("c_quat", "f", "nb", 4),
     ("c_axis", "f", "nb", 3), ("c_ipos", "f", "nb", 3), ("c_iquat", "f", "nb", 4), ("c_mass", "f", "nb", 1),
     ("c_inert", "f", "nb", 3), ("c_grav", "f", "one", 3), ("c_armature", "f", "nv", 1), ("c_nanc", "i", "nb", 1),
-    ("c_anc", "i", "nb", 12), ("c_kp", "f", "nv", 1), ("c_kv", "f", "nv", 1), ("c_frclim", "f", "nv", 1),
+    ("c_anc", "i", "nb", 12), ("c_actid", "i", "nv", 1), ("c_kp", "f", "nv", 1), ("c_kv", "f", "nv", 1),
+    ("c_damping", "f", "nv", 1), ("c_frclim", "f", "nv", 1),
     ("c_misc", "f", "one", 2),  # timestep, torso body id
 )
 
 
-MAX_CHILDREN = 8  # children per body (c_child's width: child_width; model_hooks.py beyond 3)
-MIN_NV = 7  # a free root and at least one hinge (model_hooks.py below 32)
-
+MAX_CHILDREN = 8
+MIN_NV = 6
+COM_BODY = "torso_link"
 
 def children_of(m):
-    """[[child body ids] per body]."""
     children = [[] for _ in range(m.nbody)]
-    for b in range(1, m.nbody):
-        children[m.body_parentid[b]].append(b)
+    for body in range(1, m.nbody):
+        children[m.body_parentid[body]].append(body)
     return children
 
-
 def child_width(m):
-    """c_child's entries per body: 3 (the G1's layout), or the model's most children per body."""
-    return max(3, max(len(c) for c in children_of(m)[1:]))
-
+    return max_children(m)
 
 def has_damping(m):
-    """True where a dof has joint damping (model_hooks.py: c_damp; the G1 has none)."""
     return bool((m.dof_damping != 0).any())
+
+def max_depth(m):
+    depth = [0] * m.nbody
+    for body in range(1, m.nbody):
+        depth[body] = depth[m.body_parentid[body]] + 1
+    return max(depth)
+
+def max_children(m):
+    """Child-table width, at least the G1's original three entries."""
+    return max(3, int(np.bincount(m.body_parentid[1:], minlength=m.nbody)[1:].max(initial=0)))
+
+
+def free_roots(m):
+    """The one or two actual top-level FREE bodies, in compiled coordinate order."""
+    joints = np.flatnonzero(m.jnt_type == mujoco.mjtJoint.mjJNT_FREE)
+    roots = np.asarray(m.jnt_bodyid[joints], dtype=int)
+    assert len(roots) in (1, 2) and np.all(m.body_parentid[roots] == 0)
+    return roots
 
 
 def const_layout(m):
-    """CONST_LAYOUT with c_child's width for model m, and c_damp for joint damping (CONST_LAYOUT itself for the G1)."""
-    w = child_width(m)
-    lay = tuple((sym, kind, n, w if sym == "c_child" else width) for sym, kind, n, width in CONST_LAYOUT)
-    return lay + ((("c_damp", "f", "nv", 1),) if has_damping(m) else ())
+    """CONST_LAYOUT with this model's child-table width."""
+    return [(s, k, n, max_children(m) if s == "c_child" else w) for s, k, n, w in CONST_LAYOUT]
 
 
-COM_BODY = "torso_link"  # the body that takes the per-world COM offset by default (the G1's torso)
-
-
-def max_depth(m):
-    """The kinematic tree's maximum depth (constants' second result)."""
-    depth = [0] * m.nbody
-    for b in range(1, m.nbody):
-        depth[b] = depth[m.body_parentid[b]] + 1
-    return max(depth)
-
-
-def constants(m, com_body=None):
-    """Model arrays in const_layout(m) order (float32), and the tree's maximum depth; com_body: the name of the body
-    that takes the per-world COM offset (default COM_BODY)."""
+def constants(m, com_body_id=None):
+    """Model arrays in CONST_LAYOUT order (float32), and the tree's maximum depth."""
     nb = m.nbody
-    depth, children = [0] * nb, children_of(m)
+    depth, children = [0] * nb, [[] for _ in range(nb)]
     for b in range(1, nb):
         depth[b] = depth[m.body_parentid[b]] + 1
-    assert nb <= 32 and max(len(c) for c in children[1:]) <= MAX_CHILDREN
-    assert m.jnt_type[m.body_jntadr[1]] == mujoco.mjtJoint.mjJNT_FREE and m.body_jntnum[1] == 1
+        children[m.body_parentid[b]].append(b)
+    roots = free_roots(m)
+    assert nb <= 64 and max(len(c) for c in children[1:]) <= MAX_CHILDREN
+    assert children[0] == list(roots)
     qadr, dadr, axis = np.zeros(nb), np.zeros(nb), np.zeros((nb, 3))
-    for b in range(2, nb):
+    isfree = np.zeros(nb, dtype=int)
+    isfree[roots] = 1
+    dofqadr, doflocal = np.zeros(m.nv, dtype=int), np.zeros(m.nv, dtype=int)
+    for b in range(1, nb):
         j = m.body_jntadr[b]
-        assert m.body_jntnum[b] == 1 and m.jnt_type[j] == mujoco.mjtJoint.mjJNT_HINGE and not m.jnt_pos[j].any()
+        assert m.body_jntnum[b] == 1 and (isfree[b] or m.jnt_type[j] == mujoco.mjtJoint.mjJNT_HINGE)
+        assert not m.jnt_pos[j].any()
         qadr[b], dadr[b], axis[b] = m.jnt_qposadr[j], m.jnt_dofadr[j], m.jnt_axis[j]
-    assert m.nv >= MIN_NV, f"nv = {m.nv}: a free root and at least one hinge"
-    # (nv < 32: the solves' lanes beyond the last dof repeat its row, model_hooks.py)
-    child = np.zeros((nb, child_width(m)))
+        q, d = int(qadr[b]), int(dadr[b])
+        width = 6 if isfree[b] else 1
+        dofqadr[d:d + width] = q + np.arange(width)
+        doflocal[d:d + width] = np.arange(width)
+    child = np.zeros((nb, max_children(m)))
     for b in range(1, nb):
         child[b, :len(children[b])] = children[b]
     nchild = np.array([len(children[b]) if b else 0 for b in range(nb)])
     anc, nanc = np.zeros((nb, 12)), np.zeros(nb)  # hinge-joint ancestors of each body (root excluded), nearest first
-    for b in range(2, nb):
+    for b in range(1, nb):
         k, lst = m.body_parentid[b], []
-        while k >= 2:
+        while k > 0 and not isfree[k]:
             lst.append(k)
             k = m.body_parentid[k]
         assert len(lst) <= 12
         anc[b, :len(lst)], nanc[b] = lst, len(lst)
     kp, kv, frclim = np.zeros(m.nv), np.zeros(m.nv), np.full(m.nv, 1e30)
+    actid = np.full(m.nv, -1)
     for a in range(m.nu):  # position actuators on hinge joints, gear 1: force = kp (ctrl - q) - kv qdot
         j = m.actuator_trnid[a, 0]
         assert m.actuator_trntype[a] == mujoco.mjtTrn.mjTRN_JOINT, f"actuator {a}: joint transmissions only"
-        assert m.jnt_dofadr[j] == 6 + a, (
-            f"actuator {a} drives dof {m.jnt_dofadr[j]}: the kernels read the setpoint of hinge dof i from "
-            "ctrl[i - 6], so actuator a must drive dof 6 + a (actuators in joint order)")
+        assert m.jnt_type[j] == mujoco.mjtJoint.mjJNT_HINGE
         assert m.actuator_biastype[a] == mujoco.mjtBias.mjBIAS_AFFINE and m.actuator_gear[a, 0] == 1.0
-        assert m.actuator_gainprm[a, 0] == -m.actuator_biasprm[a, 1] and not m.actuator_forcelimited[a]
+        assert m.actuator_gainprm[a, 0] == -m.actuator_biasprm[a, 1]
         dof = m.jnt_dofadr[j]
+        assert actid[dof] == -1, "at most one position actuator per hinge"
+        actid[dof] = a
         kp[dof], kv[dof] = m.actuator_gainprm[a, 0], -m.actuator_biasprm[a, 2]
+        if m.actuator_forcelimited[a]:
+            assert m.actuator_forcerange[a, 0] == -m.actuator_forcerange[a, 1]
+            frclim[dof] = m.actuator_forcerange[a, 1]
         if m.jnt_actfrclimited[j]:
-            frclim[dof] = m.jnt_actfrcrange[j, 1]
+            frclim[dof] = min(frclim[dof], m.jnt_actfrcrange[j, 1])
             assert m.jnt_actfrcrange[j, 0] == -m.jnt_actfrcrange[j, 1]
-    com_body = com_body or COM_BODY
-    torso = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, com_body)
-    assert torso >= 1, f'no body named "{com_body}": the per-world COM offset (com) is applied to that body'
-    parts = [m.body_parentid, depth, qadr, dadr, nchild, child, m.body_pos, m.body_quat, axis, m.body_ipos,
-             m.body_iquat, m.body_mass, m.body_inertia, m.opt.gravity, m.dof_armature, nanc, anc, kp, kv, frclim,
-             [m.opt.timestep, torso]]
-    if has_damping(m):
-        parts.append(m.dof_damping)
+    if com_body_id is None:
+        combody = [mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, "torso_link")]
+    else:
+        combody = np.atleast_1d(com_body_id).astype(int)
+    assert len(combody) == len(roots) and all(1 <= b < nb for b in combody)
+    parts = [m.body_parentid, depth, qadr, dadr, isfree, m.body_rootid, roots, dofqadr, doflocal, combody,
+             nchild, child, m.body_pos, m.body_quat, axis, m.body_ipos,
+             m.body_iquat, m.body_mass, m.body_inertia, m.opt.gravity, m.dof_armature, nanc, anc, actid, kp, kv,
+             m.dof_damping, frclim,
+             [m.opt.timestep, combody[0]]]
     return np.concatenate([np.asarray(x, np.float64).ravel() for x in parts]).astype(np.float32), max(depth)
 
 
@@ -125,6 +139,10 @@ def header(m, maxd, wpb):
 #define NB {m.nbody}
 #define NQ {m.nq}
 #define NV {m.nv}
+#define NU {m.nu}
+#define NR {len(free_roots(m))}
+#define COM_WIDTH (3 * NR)
+#define MAX_CHILD {max_children(m)}
 #define MAXD {maxd}
 #define WPB {wpb}
 #define NTRI (NV * (NV + 1) / 2)
@@ -134,10 +152,10 @@ def header(m, maxd, wpb):
 #define DKC __device__  // where the model arrays live: global memory (L1-cached), as lanes index them by pair, body or
                        // dof (divergent addresses serialize in __constant__ memory); -DDKC=__constant__ for comparison
 #endif
-DKC int c_parent[NB], c_depth[NB], c_qadr[NB], c_dadr[NB], c_nchild[NB], c_child[NB * 3], c_nanc[NB],
-    c_anc[NB * 12];
+DKC int c_parent[NB], c_depth[NB], c_qadr[NB], c_dadr[NB], c_nchild[NB], c_child[NB * MAX_CHILD], c_nanc[NB],
+    c_anc[NB * 12], c_actid[NV], c_isfree[NB], c_root[NB], c_roots[NR], c_dofqadr[NV], c_doflocal[NV], c_combody[NR];
 DKC float c_pos[NB * 3], c_quat[NB * 4], c_axis[NB * 3], c_ipos[NB * 3], c_iquat[NB * 4], c_mass[NB],
-    c_inert[NB * 3], c_grav[3], c_armature[NV], c_kp[NV], c_kv[NV], c_frclim[NV], c_misc[2];
+    c_inert[NB * 3], c_grav[3], c_armature[NV], c_kp[NV], c_kv[NV], c_damping[NV], c_frclim[NV], c_misc[2];
 """
 
 
@@ -261,12 +279,14 @@ __device__ __forceinline__ void fwd_body(int b, const float* Qp, const float* Xp
                                          const float* ALp, const float* Ap, const float* qpos, const float* qvel,
                                          const float* qacc, float* Q, float* X, float* W, float* V, float* AL,
                                          float* A) {
-  if (b == 1) {  // free root: world position, quaternion, world linear / local angular velocity
-    float n = rsqrtf(RFMA(qpos[6], qpos[6], RFMA(qpos[5], qpos[5], RFMA(qpos[3], qpos[3], RMUL(qpos[4], qpos[4])))));
-    for (int k = 0; k < 4; k++) Q[k] = RMUL(qpos[3 + k], n);
-    for (int k = 0; k < 3; k++) { X[k] = qpos[k]; V[k] = qvel[k]; A[k] = RSUB(qacc[k], c_grav[k]); }
-    qrot_rn(Q, qvel + 3, W);
-    qrot_rn(Q, qacc + 3, AL);
+  if (c_isfree[b]) {  // world linear / local angular velocity at this root's compiled addresses
+    int q = c_qadr[b], d = c_dadr[b];
+    float n = rsqrtf(RFMA(qpos[q + 6], qpos[q + 6], RFMA(qpos[q + 5], qpos[q + 5],
+                            RFMA(qpos[q + 3], qpos[q + 3], RMUL(qpos[q + 4], qpos[q + 4])))));
+    for (int k = 0; k < 4; k++) Q[k] = RMUL(qpos[q + 3 + k], n);
+    for (int k = 0; k < 3; k++) { X[k] = qpos[q + k]; V[k] = qvel[d + k]; A[k] = RSUB(qacc[d + k], c_grav[k]); }
+    qrot_rn(Q, qvel + d + 3, W);
+    qrot_rn(Q, qacc + d + 3, AL);
     return;
   }
   float q0[4], ha[4];
@@ -307,10 +327,10 @@ __device__ __forceinline__ void accumulate(const float* Xb, const float* Xc, con
 }
 
 __device__ __forceinline__ void torques(int b, const float* Q, const float* F, const float* N, float* qfrc) {
-  if (b == 1) {
+  if (c_isfree[b]) {
     float l[3];
     qrot_inv(Q, N, l);
-    for (int k = 0; k < 3; k++) { qfrc[k] = F[k]; qfrc[3 + k] = l[k]; }
+    for (int k = 0; k < 3; k++) { qfrc[c_dadr[b] + k] = F[k]; qfrc[c_dadr[b] + 3 + k] = l[k]; }
   } else {
     float aw[3];
     qrot(Q, c_axis + 3 * b, aw);
@@ -357,12 +377,13 @@ __device__ __forceinline__ void apply_inertia(const float* J, const float* w, co
 // motion subspace of dof t of body k about O: w (angular), v (velocity of the point O)
 __device__ __forceinline__ void dof_motion(int k, int t, const float* Q, const float* X, const float* O, float* w,
                                            float* v) {
-  if (k == 1) {
+  if (c_isfree[k]) {
     float e[3] = {0.f, 0.f, 0.f};
     if (t < 3) { e[t] = 1.f; w[0] = w[1] = w[2] = 0.f; v[0] = e[0]; v[1] = e[1]; v[2] = e[2]; return; }
     e[t - 3] = 1.f;
     qrot(Q, e, w);  // local angular axes about the root origin = O
-    v[0] = v[1] = v[2] = 0.f;
+    float r[3] = {O[0] - X[0], O[1] - X[1], O[2] - X[2]};
+    cross(w, r, v);
     return;
   }
   float r[3] = {O[0] - X[0], O[1] - X[1], O[2] - X[2]};
@@ -372,7 +393,10 @@ __device__ __forceinline__ void dof_motion(int k, int t, const float* Q, const f
 
 // COM offset of body b in its frame, with the per-world torso offset (domain randomization) applied
 __device__ __forceinline__ void body_ipos(int b, const float* com, float* out) {
-  for (int k = 0; k < 3; k++) out[k] = c_ipos[3 * b + k] + (b == (int)c_misc[1] ? com[k] : 0.f);
+  for (int k = 0; k < 3; k++) {
+    out[k] = c_ipos[3 * b + k];
+    for (int r = 0; r < NR; r++) if (b == c_combody[r]) out[k] += com[3 * r + k];
+  }
 }
 
 // in-place Cholesky A = L L^T (lower triangle of a dense NV x NV shared matrix) by one warp, left-looking (Crout):
@@ -411,10 +435,10 @@ __device__ __forceinline__ void chol_warp(float* A, int lane) {
 __device__ CHOL_INLINE void chol_solve_reg(const float* A, float* L, float* b, int lane) {
   static_assert(NV <= 64, "two rows per lane");
   const int r0 = lane, r1 = lane + 32;
-  const bool has1 = r1 < NV;
+  const bool has0 = r0 < NV, has1 = r1 < NV;
   float a0[NV], a1[NV], dinv[NV];
 #pragma unroll
-  for (int j = 0; j < NV; j++) { a0[j] = j <= r0 ? A[TRI(r0, j)] : 0.f; a1[j] = has1 && j <= r1 ? A[TRI(r1, j)] : 0.f; }
+  for (int j = 0; j < NV; j++) { a0[j] = has0 && j <= r0 ? A[TRI(r0, j)] : 0.f; a1[j] = has1 && j <= r1 ? A[TRI(r1, j)] : 0.f; }
   __syncwarp();
 #pragma unroll
   for (int k = 0; k < NV; k++) {
@@ -433,8 +457,8 @@ __device__ CHOL_INLINE void chol_solve_reg(const float* A, float* L, float* b, i
     }
   }
 #pragma unroll
-  for (int j = 0; j < NV; j++) { if (j <= r0) L[TRI(r0, j)] = a0[j]; if (has1 && j <= r1) L[TRI(r1, j)] = a1[j]; }
-  float y0 = b[r0], y1 = has1 ? b[r1] : 0.f;
+  for (int j = 0; j < NV; j++) { if (has0 && j <= r0) L[TRI(r0, j)] = a0[j]; if (has1 && j <= r1) L[TRI(r1, j)] = a1[j]; }
+  float y0 = has0 ? b[r0] : 0.f, y1 = has1 ? b[r1] : 0.f;
 #pragma unroll
   for (int k = 0; k < NV; k++) {  // forward: L y = b, column-wise
     float yk = __shfl_sync(0xffffffffu, k < 32 ? y0 : y1, k & 31) * dinv[k];
@@ -449,7 +473,7 @@ __device__ CHOL_INLINE void chol_solve_reg(const float* A, float* L, float* b, i
     if (r0 == k) y0 = xk; else if (r0 < k) y0 -= L[TRI(k, r0)] * xk;
     if (r1 == k) y1 = xk; else if (r1 < k) y1 -= L[TRI(k, r1)] * xk;
   }
-  b[r0] = y0;
+  if (has0) b[r0] = y0;
   if (has1) b[r1] = y1;
   __syncwarp();
 }
@@ -462,10 +486,10 @@ __device__ CHOL_INLINE void chol_solve_reg(const float* A, float* L, float* b, i
 __device__ __noinline__ void chol_solve_compact(const float* A, float* L, float* b, int lane) {
   static_assert(NV <= 64, "two rows per lane");
   const int r0 = lane, r1 = lane + 32;
-  const bool has1 = r1 < NV;
+  const bool has0 = r0 < NV, has1 = r1 < NV;
   float a0[NV], a1[NV];
 #pragma unroll
-  for (int j = 0; j < NV; j++) { a0[j] = j <= r0 ? A[TRI(r0, j)] : 0.f; a1[j] = has1 && j <= r1 ? A[TRI(r1, j)] : 0.f; }
+  for (int j = 0; j < NV; j++) { a0[j] = has0 && j <= r0 ? A[TRI(r0, j)] : 0.f; a1[j] = has1 && j <= r1 ? A[TRI(r1, j)] : 0.f; }
   __syncwarp();
   for (int k = 0; k < NV; k++) {
     float dkk = fmaxf(__shfl_sync(0xffffffffu, k < 32 ? a0[0] : a1[0], k & 31), 1e-30f);
@@ -473,7 +497,7 @@ __device__ __noinline__ void chol_solve_compact(const float* A, float* L, float*
     inv = inv * (1.5f - 0.5f * dkk * inv * inv);
     float d = dkk * inv;
     float l0 = r0 > k ? a0[0] * inv : (r0 == k ? d : 0.f), l1 = r1 > k ? a1[0] * inv : (r1 == k ? d : 0.f);
-    if (r0 >= k) L[TRI(r0, k)] = l0;
+    if (has0 && r0 >= k) L[TRI(r0, k)] = l0;
     if (has1 && r1 >= k) L[TRI(r1, k)] = l1;
     if (r0 == k) l0 = 0.f;  // the pivot row takes no part in the trailing update
     if (r1 == k) l1 = 0.f;
@@ -490,10 +514,10 @@ __device__ __noinline__ void chol_solve_compact(const float* A, float* L, float*
     }
   }
   __syncwarp();
-  float y0 = b[r0], y1 = has1 ? b[r1] : 0.f;
+  float y0 = has0 ? b[r0] : 0.f, y1 = has1 ? b[r1] : 0.f;
   for (int k = 0; k < NV; k++) {  // forward: L y = b, column-wise
     float yk = __shfl_sync(0xffffffffu, k < 32 ? y0 : y1, k & 31) / L[TRI(k, k)];
-    if (r0 == k) y0 = yk; else if (r0 > k) y0 -= L[TRI(r0, k)] * yk;
+    if (r0 == k) y0 = yk; else if (has0 && r0 > k) y0 -= L[TRI(r0, k)] * yk;
     if (r1 == k) y1 = yk; else if (has1 && r1 > k) y1 -= L[TRI(r1, k)] * yk;
   }
   for (int k = NV - 1; k >= 0; k--) {  // backward: L^T x = y
@@ -501,7 +525,7 @@ __device__ __noinline__ void chol_solve_compact(const float* A, float* L, float*
     if (r0 == k) y0 = xk; else if (r0 < k) y0 -= L[TRI(k, r0)] * xk;
     if (r1 == k) y1 = xk; else if (has1 && r1 < k) y1 -= L[TRI(k, r1)] * xk;
   }
-  b[r0] = y0;
+  if (has0) b[r0] = y0;
   if (has1) b[r1] = y1;
   __syncwarp();
 }

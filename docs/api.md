@@ -75,6 +75,11 @@ of 1-4% against finite differences in the default mode and about 1e-6 in exact m
 `normal`, `clamp_soft` or `grad_decay`: one tape serves every adjoint variant, and the forward outputs are bitwise
 the same in every mode.
 
+The native adjoint uses one power-of-two scale per world's incoming state cotangents to avoid intermediate
+overflow, then restores that scale on every returned physics gradient. This is numerical preconditioning;
+the gradient convention, clipping and decay options are unchanged. Gradients outside the float32 output range
+remain nonfinite.
+
 A VJP through the custom call is a plain JAX VJP:
 
 ```python
@@ -157,8 +162,12 @@ iteration), `tape_records`, `refact_records`, `nonconv_records`, `singular_recor
 | `last_forward(nworld=None)` | outside jit | the last forward call's record for that batch size: `worlds`, `contacts` (summed over the worlds), `contacts_max`, `rows_max` |
 | `launch_info(device=0)` | outside jit | the adjoint kernel's launch per variant: shared memory and worlds per SM |
 
-**Capacity.** Each world holds at most 64 contacts and 192 constraint rows (a frictional contact takes 4 rows, a joint
-limit 1). A world beyond them, typically after deep interpenetration with the floor or between links (a fall), keeps
+**Capacity.** Each library compiles point and row capacities from its model. Point storage uses a positive model
+`nconmax`, or an automatic budget of 256 points, limited by the sum of the eligible pairs' maximum manifold sizes
+with a 32-point minimum allocation. Row storage covers every stored point (4 rows for a frictional contact, 1 for a
+frictionless contact), every frictionloss and soft equality row, and one limit row per limited hinge. A larger positive
+model `njmax` is preserved. Read the actual capacities from `init()`'s `maxcon` and `nefc` metadata.
+A world beyond its capacities, for example during deep interpenetration with the floor or between links, keeps
 the first ones and drops the rest, so it misses part of its support and friction forces; its step is then not the
 model's. Such worlds are flagged in `forward()`'s `info[:, 3]` (`OVERFLOW_CONTACTS = 4`, `OVERFLOW_ROWS = 16`) and
 counted per call and world in `fwd_contact_overflow_worlds` / `fwd_row_overflow_worlds` (both also in
@@ -177,14 +186,24 @@ phys.stats()          # nacon, naconmax, nefc_max, njmax of the last forward cal
 phys.diagnostics()    # read_diagnostics()
 ```
 
-A batched physics object with MuJoCo Warp's capacity names (`nconmax` 64 contacts and `njmax` 192 constraint rows per
-world). The model constants come from the fixtures, and `mjm` must then be the same model (`check_model`), unless
+A batched physics object with MuJoCo Warp's capacity names (`nconmax` contact points and `njmax` constraint rows per
+world), set from the compiled model capacities above. The model constants come from the fixtures, and `mjm` must then be the same model (`check_model`), unless
 `use_model=True`: then from `mjm`. Other keyword options of a MuJoCo Warp based physics object are accepted and
 ignored.
 
 ## Unsupported models
 
-The engine supports the mjlab G1 and the robots of its class (below). `init`, `check_model`, `EnginePhysics` and the scripts' model loading
+The engine's model class is a free root and one hinge per later body, with at most 31 bodies, five children per body
+and 12 hinge ancestors. Position actuators may drive any unique subset of hinges, with independent `nu`; passive
+hinges remain in `qpos` and `qvel`. Linear joint damping, dof frictionloss and up to six active soft linear hinge
+equalities are represented. Contact pairs may be absent. Sphere, capsule and world-plane contact pairs have an
+analytic adjoint; boxes remain forward-only. The published numerical qualification is for the mjlab G1; CPU
+generation checks for smaller models are described in `docs/verification.md`.
+Multiple free roots, implicit `contype` / `conaffinity` contacts and convex-mesh collisions remain unsupported.
+Disabling contacts changes the simulated condition; a successful check of such a model does not qualify its original
+contact-enabled scene.
+
+`init`, `check_model`, `EnginePhysics` and the scripts' model loading
 run the capability checker (`nablaengine.model.capability`) first. A model outside its scope raises
 `nablaengine.model.capability.UnsupportedModel` (a subclass of `ValueError` and `AssertionError`) before anything is
 built, with the failing checks' codes and values; it never simulates other physics silently. `check_model(mjm,

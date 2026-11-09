@@ -24,14 +24,18 @@ FLAG_VERIFY_DIFF = 1 << 11  # -DDK_TAPE_VERIFY: L_H differs from a re-assembly a
 SINGULAR_NU = 5e-3  # m
 CON_NONE = 0xFFFF  # contact table entry past ncon
 
+
+def pair_bits(m):
+    return max(9, (len(step.contact_pairs(m)) - 1).bit_length())
+
 # (name, #define, length: callable of (nq, nv, ntri, maxcon) or an int); a None name pads to the next ALIGN boundary
 _FIELDS = (
-    ("hdr", "OFF_HDR", 1),  # ncon | nefc << 8 | nlim << 16 | niter << 24 (u8 each)
+    ("hdr", "OFF_HDR", 1),  # ncon | nefc << 16 (u16 each)
     ("flags", "OFF_FLAGS", 1),  # FLAG_*
     ("min_nu", "OFF_MIN_NU", 1),  # float: smallest centre / axis distance of a sphere or capsule self contact, else +inf
-    ("reserved", "OFF_RESERVED", 1),
+    ("counts", "OFF_COUNTS", 1),  # nlim | niter << 16 (u16 each)
     ("clamp", "OFF_CLAMP", lambda nq, nv, ntri, nc: -(-nv // 32)),  # dof bits: actuator force at its limit
-    ("zone", "OFF_ZONE", lambda nq, nv, ntri, nc: -(-step.NEFC // 32)),  # row bits: quadratic zone (row in the Hessian)
+    ("zone", "OFF_ZONE", None),  # model-derived row bits: quadratic zone (row in the Hessian)
     ("con", "OFF_CON", lambda nq, nv, ntri, nc: -(-nc // 2)),  # u16 per contact (row order): pair | slot << 9
     ("qpos", "OFF_QPOS", lambda nq, nv, ntri, nc: nq),  # substep input
     ("qvel", "OFF_QVEL", lambda nq, nv, ntri, nc: nv),
@@ -64,8 +68,8 @@ def kind(terrain):
 def _table(m, max_contacts=None, terrain=False):
     nc = max_contacts or step.maxcon(m)
     nv, ntri = m.nv, m.nv * (m.nv + 1) // 2
-    npmax = 1024 if terrain else 512
-    assert nv <= 64 and m.npair < npmax and nc <= 255 and step.NEFC <= 255, "field widths (clamp u64, pair bits, u8)"
+    npmax = 2048
+    assert nv <= 64 and len(step.contact_pairs(m)) < npmax and nc <= 65535 and step.nefc(m, nc) <= 65535, "field widths (clamp u64, pair bits, u8)"
     fields = _FIELDS
     if terrain:
         i = [f[0] for f in _FIELDS].index("con") + 1
@@ -75,7 +79,7 @@ def _table(m, max_contacts=None, terrain=False):
         if name is None:
             off = -(-off // n) * n
             continue
-        n = n(m.nq, nv, ntri, nc) if callable(n) else n
+        n = -(-step.nefc(m, nc) // 32) if name == "zone" else n(m.nq, nv, ntri, nc) if callable(n) else n
         out.append((name, define, off, n))
         off += n
     return out, off
@@ -99,7 +103,8 @@ def header(m, max_contacts=None, terrain=False):
     lines += [f"#define {define} {off}  // {name}, {n} words" for name, define, off, n in tab]
     lines += [f"#define TAPE_REFACT {FLAG_REFACT}u", f"#define TAPE_NONCONV {FLAG_NONCONV}u",
               f"#define TAPE_SINGULAR {FLAG_SINGULAR}u", f"#define TAPE_VERIFY_DIFF {FLAG_VERIFY_DIFF}u",
-              f"#define TAPE_SINGULAR_NU {SINGULAR_NU}f", f"#define TAPE_CON_NONE {CON_NONE}u"]
+              f"#define TAPE_SINGULAR_NU {SINGULAR_NU}f", f"#define TAPE_CON_NONE {CON_NONE}u",
+              f"#define TAPE_PAIR_BITS {10 if terrain else pair_bits(m)}", f"#define TAPE_PAIR_MASK {(1 << (10 if terrain else pair_bits(m))) - 1}u"]
     return "\n" + "\n".join(lines) + "\n"
 
 
@@ -124,7 +129,8 @@ def decode(arr, m, max_contacts=None, terrain=False):
     lay = layout(m, max_contacts, terrain)
     sl = lambda name: slice(lay[name][0], lay[name][0] + lay[name][1])  # noqa: E731
     hdr, flags = u[..., lay["hdr"][0]].astype(np.int64), u[..., lay["flags"][0]].astype(np.int64)
-    out = dict(ncon=hdr & 255, nefc=(hdr >> 8) & 255, nlim=(hdr >> 16) & 255, niter=hdr >> 24, flags=flags,
+    counts = u[..., lay["counts"][0]].astype(np.int64)
+    out = dict(ncon=hdr & 65535, nefc=hdr >> 16, nlim=counts & 65535, niter=counts >> 16, flags=flags,
                unsupported=flags & FLAG_UNSUPPORTED, refact=(flags & FLAG_REFACT) != 0,
                nonconv=(flags & FLAG_NONCONV) != 0, singular=(flags & FLAG_SINGULAR) != 0,
                verify_diff=(flags & FLAG_VERIFY_DIFF) != 0, min_nu=a[..., lay["min_nu"][0]])
@@ -134,11 +140,11 @@ def decode(arr, m, max_contacts=None, terrain=False):
         cw.shape[:-1] + (-1,))[..., :m.nv]
     zw = u[..., sl("zone")].astype(np.uint64)
     out["zone"] = ((zw[..., :, None] >> np.arange(32, dtype=np.uint64)) & np.uint64(1)).astype(bool).reshape(
-        zw.shape[:-1] + (-1,))[..., :step.NEFC]
+        zw.shape[:-1] + (-1,))[..., :step.nefc(m, max_contacts)]
     nc = max_contacts or step.maxcon(m)
     e = np.ascontiguousarray(u[..., sl("con")]).view(np.uint16)[..., :nc].astype(np.int64)  # little endian: low half first
     past = np.arange(nc) >= out["ncon"][..., None]
-    pb = 10 if terrain else 9
+    pb = 10 if terrain else pair_bits(m)
     out["pair"], out["slot"] = np.where(past, -1, e & ((1 << pb) - 1)), np.where(past, -1, e >> pb)
     if terrain:
         x = np.ascontiguousarray(u[..., sl("telem")]).view(np.uint16)[..., :nc].astype(np.int64)

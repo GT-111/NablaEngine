@@ -9,20 +9,20 @@ Sections (--sections, default all):
   fixtures   the mjlab G1 (fixtures/mjlab/g1_train.mjb) has 0 errors and 0 warnings in every scope (one info: H11c, the
              engine does not clamp ctrl); nablaengine.fixtures.load_model checks it
   variants   the G1 rebuilt as an MjSpec from the fixture's arrays (spec_from_model: bodies, joints, geoms, pairs,
-             actuators, options) checks clean, then each deliberately modified variant (contype contacts, condim 4,
-             joint damping, a joint equality, Euler, negative solref, qpos0 != 0, a tendon, gravcomp, the CG solver;
+             actuators, options) checks clean, then each deliberately modified unsupported variant (condim 4,
+             Euler, negative solref, qpos0 != 0, a tendon, gravcomp, the CG solver;
              actuator-level damping / armature / delay, damping polynomials, a motor actuator, a cylinder pair, a ball
              joint body, the waist roll and pitch welded, a direct damping solref (0.02,
              0), a box-box pair with fewer native-CCD iterations than MuJoCo's default, contacts disabled,
              frictionloss disabled with frictionloss) must raise exactly its own codes (new errors relative to the
              base) in the scope it names, and capability.require and nablaengine.jax_ffi.init(model=...) must reject
              it with UnsupportedModel before anything is built. Supported on purpose (no new error and no new
-             warning, require accepts): contype contacts that only duplicate explicit pairs (MuJoCo 3.17 collides
+             warning, require accepts): eligible implicit contype contacts, contype contacts that only duplicate explicit pairs (MuJoCo 3.17 collides
              such a geom pair once, with the pair's parameters: measured), a box-box pair at the CCD defaults
              (forward scope), renamed bodies and joints, visual-only geoms with a camera and a light, sites and
              sensors, another gravity vector, disable flags of physics the model does not have (springs, dampers,
-             equality, frictionloss), frictionloss (warns U10: its adjoint is not checked on a held-out corpus); and
-             the welded-waist G1 with its fused body named torso_link, which must warn U1
+             equality, frictionloss); linear joint damping, a soft linear joint equality and dof frictionloss;
+             and the welded-waist G1 with its fused body named torso_link, which must warn U1
              (the nv-33 Cholesky tail) and U2 (KDOF 14: the scalar con_jv path), code paths the G1 does not run
   kinematics g1_engine.kinematics.check_model: the G1 passes; a jointless (welded) body is rejected (the body_jntadr =
              -1 case)
@@ -262,14 +262,14 @@ def variants():
         m.dof_frictionloss[m.jnt_dofadr[j]] = 0.1
 
     return dict(
-        contype=("contype / conaffinity 1 on the pelvis and hip geoms (pelvis - hip roll: no explicit pair)", contype,
-                 "engine", {"H15"}),
+        contype=("contype / conaffinity 1 on the pelvis and hip geoms (pelvis - hip roll: generated implicit pair)", contype,
+                 "engine", set()),
         contype_covered=("contype / conaffinity 1 on 3 hand / wrist geoms whose filter pairs are all explicit pairs "
                          "(MuJoCo collides a geom pair once, with the pair's parameters): supported", contype_covered,
                          "engine", set()),
         condim4=("condim 4 on one foot-floor pair", condim4, "engine", {"H17"}),
-        damping=("dof damping 0.5 on knees and ankles: supported (model_hooks.py: c_damp)", damping, "engine", set()),
-        equality=("joint equality: left wrist yaw = right wrist yaw", equality, "engine", {"H25"}),
+        damping=("dof damping 0.5 on knees and ankles", damping, "engine", set()),
+        equality=("soft joint equality: left wrist yaw = right wrist yaw", equality, "engine", set()),
         euler=("Euler integrator", euler, "engine", {"H23"}),
         negsolref=("direct (negative) solref on the foot-floor pairs", negsolref, "engine", {"H19"}),
         qpos0=("left knee ref 0.3 (qpos0 != 0)", qpos0, "engine", {"H8"}),
@@ -285,7 +285,7 @@ def variants():
         cylinder=("a cylinder collision geom in the pairs", cylinder, "engine",
                   {"H14a", "H14b", "H14c"}),
         ball=("a limited ball joint on one wrist body", ball, "engine", {"H7", "H7b", "H11a", "H20"}),
-        frictionloss=("frictionloss 0.1 on one knee: supported (forward and adjoint), warns U10", None, "engine", set(),
+        frictionloss=("frictionloss 0.1 on one knee: supported by forward and adjoint", None, "engine", set(),
                       frictionloss),
         lockwaist=("waist roll and pitch welded (fusestatic, nv 33): torso_link fused away; untested paths", lockwaist,
                    "engine", {"H13"}),
@@ -302,7 +302,7 @@ def variants():
         gravity=("gravity (0.3, 0, -9.6): supported (packed into the constants)", gravity, "engine", set()),
         dsbl_noop=("springs, dampers, equality constraints and frictionloss disabled, none in the model: supported",
                    dsbl_noop, "engine", set()),
-        dsbl_contact=("contacts disabled (mjDSBL_CONTACT)", dsbl_contact, "engine", {"H24b"}),
+        dsbl_contact=("contacts disabled (mjDSBL_CONTACT): generated collision pass skipped", dsbl_contact, "engine", set()),
         dsbl_frictionloss=("frictionloss disabled with frictionloss 0.1 on one knee", dsbl_frictionloss, "engine",
                            {"H24b"}, frictionloss),
     )
