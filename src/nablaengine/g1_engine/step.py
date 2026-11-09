@@ -55,7 +55,7 @@ PAIR_LAYOUT = (  # (symbol, kind, per-pair width): one packed word per pair, see
 )
 PSET_WIDTH = 8  # a contact parameter set in c_pset: friction mu, solref[2], solimp[5]
 GEOM_LAYOUT = (  # (symbol, kind, per-geom width)
-    ("c_gbody", "i", 1), ("c_gtype", "i", 1), ("c_gsize", "f", 3), ("c_gpos", "f", 3), ("c_gquat", "f", 4),
+    ("c_gbody", "i", 1), ("c_gtype", "i", 1), ("c_gsize", "f", 3),
     ("c_grbound", "f", 1),
 )
 SOLVER_LAYOUT = (  # (symbol, kind, length in units of the body count, "nv", or a number)
@@ -220,10 +220,9 @@ def pair_constants(m, foot_pairs, terrain=None):
             words.append(pair_word(tg, gid[g], sets[1][p], int(m.pair_dim[p]), ft, 0))
     words = np.asarray(words, np.int64)
     out = [np.stack([words & 0xFFFF, words >> 16], 1).ravel(), np.asarray(sets[0], np.float64).ravel()]
-    gtab = [m.geom_bodyid[geoms], [GEOM_TYPE[int(m.geom_type[g])] for g in geoms], m.geom_size[geoms],
-            m.geom_pos[geoms], m.geom_quat[geoms], m.geom_rbound[geoms]]
+    gtab = [m.geom_bodyid[geoms], [GEOM_TYPE[int(m.geom_type[g])] for g in geoms], m.geom_size[geoms], m.geom_rbound[geoms]]
     if terrain:  # body 0, type 4 (terrain), at the origin
-        extra = [[0], [4], [[0.0, 0.0, 0.0]], [[0.0, 0.0, 0.0]], [[1.0, 0.0, 0.0, 0.0]], [0.0]]
+        extra = [[0], [4], [[0.0, 0.0, 0.0]], [0.0]]
         gtab = [np.concatenate([np.asarray(a, np.float64).reshape(len(geoms), -1),
                                 np.asarray(b, np.float64).reshape(1, -1)]) for a, b in zip(gtab, extra)]
     out += gtab
@@ -288,6 +287,22 @@ def dof_body_root6(m):
     return m.nv >= 6 and bool((d[:6] == 1).all() and (d[6:] == np.arange(6, m.nv) - 4).all())
 
 
+def geometry_pose_constants(m, terrain=None):
+    """Exact model frames for the contact pose sweep, embedded in its build."""
+    axis = np.zeros((m.nbody, 3))
+    axis[1:] = m.jnt_axis[m.body_jntadr[1:]]
+    geoms = collision_geoms(m)
+    position, quaternion = m.geom_pos[geoms], m.geom_quat[geoms]
+    if terrain:
+        position = np.concatenate((position, [[0., 0., 0.]]))
+        quaternion = np.concatenate((quaternion, [[1., 0., 0., 0.]]))
+    arrays = (("c_pose_pos", m.body_pos), ("c_pose_quat", m.body_quat), ("c_pose_axis", axis),
+              ("c_pose_gpos", position), ("c_pose_gquat", quaternion))
+    return "\n".join(f"__device__ const double {name}[{max(1, value.size)}] = "
+                     "{" + (", ".join(float(v).hex() for v in value.ravel()) or "0.") + "};"
+                     for name, value in arrays) + "\n"
+
+
 def step_header(m, max_contacts=None, terrain=None):
     p, g, kdof = len(contact_pairs(m)), len(collision_geoms(m)), max_support(m)
     nc, nr = max_contacts or maxcon(m), nefc(m, max_contacts)
@@ -339,14 +354,13 @@ DKC float c_pset[{max(1, len(pair_param_sets(m)[0]) * PSET_WIDTH)}];  // per par
 #define PSOLIMP(pr) (c_pset + PSET_WIDTH * PSET(pr) + 3)
 #define PSET_WIDTH {PSET_WIDTH}
 DKC int c_gbody[NGEOMC_STORAGE], c_gtype[NGEOMC_STORAGE];
-DKC float c_gsize[NGEOMC_STORAGE * 3], c_gpos[NGEOMC_STORAGE * 3], c_gquat[NGEOMC_STORAGE * 4],
-    c_grbound[NGEOMC_STORAGE];
+DKC float c_gsize[NGEOMC_STORAGE * 3], c_grbound[NGEOMC_STORAGE];
 DKC float c_binvw[NB], c_dinvw[NV], c_floss[NV], c_jrange[NV * 2], c_jlim[NV], c_jsolref[2], c_jsolimp[5],
     c_dsolref[2], c_dsolimp[5], c_sopt[4];  // impratio, meaninertia, tolerance, npair
 DKC int c_eqdof1[NEQ_STORAGE], c_eqdof2[NEQ_STORAGE];
 DKC float c_eqpoly[NEQ_STORAGE * 2], c_eqsolref[NEQ_STORAGE * 2], c_eqsolimp[NEQ_STORAGE * 5],
     c_eqinvw[NEQ_STORAGE];
-"""
+""" + geometry_pose_constants(m, terrain)
 
 
 STEP_DEVICE = r"""
@@ -532,21 +546,71 @@ __device__ __forceinline__ void add_sphere_contact(S& s, int pair, int slot, flo
   if (add_contact(s, pair, slot, dist, pos, fr)) atomicMin(&s.min_nu_bits, __float_as_int(nu));
 }
 
-// world pose (centre gx, rotation quaternion gq) of collision geom g on its body's pose (Qb, Xb): the forward's
-// geom_poses and the adjoint's replay (adjoint.py adj_contacts)
-__device__ __forceinline__ void geom_pose(int g, const float* Qb, const float* Xb, float* gx, float* gq) {
-  float t[3];
-  qrot_rn(Qb, c_gpos + 3 * g, t);
-  for (int i = 0; i < 3; i++) gx[i] = RADD(Xb[i], t[i]);
-  qmul_rn(Qb, c_gquat + 4 * g, gq);
+// Near-parallel capsule closest points amplify pose errors by 1 / sin^2(theta).
+// Keep the short model-frame chain in double and round only its final geom
+// pose to the float collision ABI. Dynamics and the public state remain float.
+// Explicit double rounding also makes the adjoint replay the same pose bits.
+#define DMUL(a, b) __dmul_rn((a), (b))
+#define DADD(a, b) __dadd_rn((a), (b))
+#define DFMA(a, b, c) __fma_rn((a), (b), (c))
+__device__ __forceinline__ void qmul64(const double* a, const double* b, double* o) {
+  double w = DFMA(-a[3], b[3], DFMA(-a[2], b[2], DFMA(a[0], b[0], -DMUL(a[1], b[1]))));
+  double x = DFMA(-a[3], b[2], DFMA(a[2], b[3], DFMA(a[0], b[1], DMUL(a[1], b[0]))));
+  double y = DFMA(a[3], b[1], DFMA(a[2], b[0], DFMA(a[0], b[2], -DMUL(a[1], b[3]))));
+  double z = DFMA(a[3], b[0], DFMA(-a[2], b[1], DFMA(a[0], b[3], DMUL(a[1], b[2]))));
+  o[0] = w; o[1] = x; o[2] = y; o[3] = z;
+}
+__device__ __forceinline__ void qrot64(const double* q, const double* v, double* o) {
+  double tx = DMUL(2., DFMA(q[2], v[2], -DMUL(q[3], v[1])));
+  double ty = DMUL(2., DFMA(q[3], v[0], -DMUL(q[1], v[2])));
+  double tz = DMUL(2., DFMA(q[1], v[1], -DMUL(q[2], v[0])));
+  o[0] = DFMA(-q[3], ty, DFMA(q[2], tz, DFMA(q[0], tx, v[0])));
+  o[1] = DFMA(-q[1], tz, DFMA(q[3], tx, DFMA(q[0], ty, v[1])));
+  o[2] = DFMA(-q[2], tx, DFMA(q[1], ty, DFMA(q[0], tz, v[2])));
+}
+__device__ __forceinline__ void cross64(const double* a, const double* b, double* o) {
+  o[0] = DFMA(a[1], b[2], -DMUL(a[2], b[1]));
+  o[1] = DFMA(a[2], b[0], -DMUL(a[0], b[2]));
+  o[2] = DFMA(a[0], b[1], -DMUL(a[1], b[0]));
+}
+__device__ __forceinline__ double dot64(const double* a, const double* b) {
+  return DFMA(a[2], b[2], DFMA(a[0], b[0], DMUL(a[1], b[1])));
+}
+__device__ __forceinline__ void geom_pose(int g, const float* qpos, float* gx, float* gq) {
+  int chain[MAXD], count = 0;
+  for (int b = c_gbody[g]; b; b = c_parent[b]) chain[count++] = b;
+  double Q[4] = {1., 0., 0., 0.}, X[3] = {0., 0., 0.};
+  for (int i = count - 1; i >= 0; i--) {
+    int b = chain[i], q = c_qadr[b];
+    if (c_isfree[b]) {
+      double norm = 0.;
+      for (int k = 0; k < 4; k++) { Q[k] = qpos[q + 3 + k]; norm = DFMA(Q[k], Q[k], norm); }
+      norm = 1. / sqrt(norm);
+      for (int k = 0; k < 4; k++) Q[k] = DMUL(Q[k], norm);
+      for (int k = 0; k < 3; k++) X[k] = qpos[q + k];
+    } else {
+      double t[3], q0[4], ha[4], sn, cs;
+      qrot64(Q, c_pose_pos + 3 * b, t);
+      for (int k = 0; k < 3; k++) X[k] = DADD(X[k], t[k]);
+      qmul64(Q, c_pose_quat + 4 * b, q0);
+      sincos(DMUL(.5, (double)qpos[q]), &sn, &cs);
+      ha[0] = cs;
+      for (int k = 0; k < 3; k++) ha[k + 1] = DMUL(sn, c_pose_axis[3 * b + k]);
+      qmul64(q0, ha, Q);
+    }
+  }
+  double t[3], rotation[4];
+  qrot64(Q, c_pose_gpos + 3 * g, t);
+  for (int k = 0; k < 3; k++) gx[k] = (float)DADD(X[k], t[k]);
+  qmul64(Q, c_pose_gquat + 4 * g, rotation);
+  for (int k = 0; k < 4; k++) gq[k] = (float)rotation[k];
 }
 
 // world poses of the collision geoms (position, rotation quaternion) from the body poses
 template <class S>
 __device__ __forceinline__ void geom_poses(S& s, int lane) {
   for (int g = lane; g < NGEOMC; g += 32) {
-    int b = c_gbody[g];
-    geom_pose(g, s.Q[b], s.X[b], s.gx[g], s.gq[g]);
+    geom_pose(g, s.qpos, s.gx[g], s.gq[g]);
   }
 }
 
@@ -618,68 +682,86 @@ __device__ __forceinline__ float segment_point(const float* p1, const float* p2,
 // https://github.com/google-deepmind/mujoco/blob/3.17.0/src/engine/engine_collision_primitive.c
 // the segments p_k + x_k a_k, x_k in [-1, 1], with the scaled axes
 // a_k = hl_k R_k e_z, dif = p1 - p2, the normal equations [ma mb; mb mc] x = (u, v) and det = ma mc - mb^2
-struct CapCap { float a1[3], a2[3], dif[3], ma, mb, mc, u, v, det; };
+struct CapCap { double a1[3], a2[3], dif[3], ma, mb, mc, u, v, det; };
 __device__ __forceinline__ void capcap_setup(const float* p1, const float* q1, float hl1, const float* p2,
                                              const float* q2, float hl2, CapCap& c) {
-  zaxis_rn(q1, c.a1);
-  zaxis_rn(q2, c.a2);
-  for (int k = 0; k < 3; k++) { c.a1[k] = RMUL(c.a1[k], hl1); c.a2[k] = RMUL(c.a2[k], hl2); c.dif[k] = RSUB(p1[k], p2[k]); }
-  c.ma = dot3_rn(c.a1, c.a1); c.mb = -dot3_rn(c.a1, c.a2); c.mc = dot3_rn(c.a2, c.a2);
-  c.u = -dot3_rn(c.a1, c.dif); c.v = dot3_rn(c.a2, c.dif);
+  double rotation1[4], rotation2[4];
+  for (int k = 0; k < 4; k++) { rotation1[k] = q1[k]; rotation2[k] = q2[k]; }
+  const double ez[3] = {0., 0., 1.};
+  qrot64(rotation1, ez, c.a1);
+  qrot64(rotation2, ez, c.a2);
+  for (int k = 0; k < 3; k++) {
+    c.a1[k] = DMUL(c.a1[k], (double)hl1); c.a2[k] = DMUL(c.a2[k], (double)hl2);
+    c.dif[k] = DADD((double)p1[k], -(double)p2[k]);
+  }
+  c.ma = dot64(c.a1, c.a1); c.mb = -dot64(c.a1, c.a2); c.mc = dot64(c.a2, c.a2);
+  c.u = -dot64(c.a1, c.dif); c.v = dot64(c.a2, c.dif);
   // |a1 x a2|^2 is the same Gram determinant without cancellation. The
   // subtractive form can put parallel hand capsules on the one-contact branch
   // through FMA rounding noise. Forward and adjoint replay share this helper.
-  float w[3];
-  cross_rn(c.a1, c.a2, w);
-  c.det = dot3_rn(w, w);
+  double w[3];
+  cross64(c.a1, c.a2, w);
+  c.det = dot64(w, w);
 }
 __device__ __forceinline__ bool capcap_nonparallel(const CapCap& c) {
-  return c.det > RMUL(1e-8f, RMUL(c.ma, c.mc));  // MuJoCo 3.17: sin^2 of the axes' angle
+  return c.det > DMUL(1e-8, DMUL(c.ma, c.mc));  // MuJoCo 3.17: sin^2 of the axes' angle
 }
 // the nonparallel segment parameters: the unconstrained minimum, then the clamp cascade. f1, f2: x1 / x2 free
 // (not fixed at +-1; wp.clamp's gradient rule lo <= raw < hi for the clamp of x1 in the cascade's second stage), raw:
 // x1 before that clamp (0 if it did not happen)
 __device__ __forceinline__ void capcap_params(const CapCap& c, float* x1o, float* x2o, bool* f1, bool* f2, float* raw) {
-  float w[3], t[3];
-  cross_rn(c.a1, c.a2, w);
-  cross_rn(c.a2, c.dif, t);  // Binet-Cauchy: mc u - mb v without near-parallel cancellation
-  float first = dot3_rn(w, t) / c.det;
-  float x1 = fminf(fmaxf(first, -1.f), 1.f), x2 = RFMS(c.mb, x1, c.v) / c.mc;
-  *f1 = first >= -1.f && first < 1.f;
-  *f2 = x2 >= -1.f && x2 < 1.f;
+  double w[3], t[3];
+  cross64(c.a1, c.a2, w);
+  cross64(c.a2, c.dif, t);  // Binet-Cauchy: mc u - mb v without near-parallel cancellation
+  double first = dot64(w, t) / c.det;
+  double x1 = fmin(fmax(first, -1.), 1.), x2 = DFMA(-c.mb, x1, c.v) / c.mc;
+  *f1 = first >= -1. && first < 1.;
+  *f2 = x2 >= -1. && x2 < 1.;
   *raw = 0.f;
   if (x2 > 1.f || x2 < -1.f) {
-    x2 = fminf(fmaxf(x2, -1.f), 1.f);
-    *raw = RFMS(c.mb, x2, c.u) / c.ma;
-    x1 = fminf(fmaxf(*raw, -1.f), 1.f);
-    *f1 = *raw >= -1.f && *raw < 1.f;
+    x2 = fmin(fmax(x2, -1.), 1.);
+    double projected = DFMA(-c.mb, x2, c.u) / c.ma;
+    *raw = (float)projected;
+    x1 = fmin(fmax(projected, -1.), 1.);
+    *f1 = projected >= -1. && projected < 1.;
     *f2 = false;
   }
-  *x1o = x1; *x2o = x2;
+  *x1o = (float)x1; *x2o = (float)x2;
 }
 // Parallel endpoints e = 0, 1 start at x1 = -1, +1, then clamp on segment 2
 // and reproject onto segment 1. A longer first capsule must not leave the
 // contact beyond the shorter segment's overlap. f1, f2 as capcap_params.
 __device__ __forceinline__ void capcap_candidate(const CapCap& c, int e, float* x1, float* x2, bool* f1, bool* f2,
                                                  float* raw) {
-  *x1 = e == 0 ? -1.f : 1.f;
-  *raw = RFMS(c.mb, *x1, c.v) / c.mc;
-  *x2 = fminf(fmaxf(*raw, -1.f), 1.f);
+  double first = e == 0 ? -1. : 1., projected = DFMA(-c.mb, first, c.v) / c.mc;
+  double second = fmin(fmax(projected, -1.), 1.);
   *f1 = false;
-  *f2 = *raw >= -1.f && *raw < 1.f;
-  if (*raw < -1.f || *raw > 1.f) {
-    *raw = RFMS(c.mb, *x2, c.u) / c.ma;
-    *x1 = fminf(fmaxf(*raw, -1.f), 1.f);
+  *f2 = projected >= -1. && projected < 1.;
+  if (projected < -1. || projected > 1.) {
+    projected = DFMA(-c.mb, second, c.u) / c.ma;
+    first = fmin(fmax(projected, -1.), 1.);
     *f2 = false;
-    *f1 = *raw >= -1.f && *raw < 1.f;
+    *f1 = projected >= -1. && projected < 1.;
   }
+  *x1 = (float)first; *x2 = (float)second; *raw = (float)projected;
 }
 // the sphere core on the closest points p_k + x_k a_k (radii r1, r2): returns nu, as sphere_sphere
 __device__ __forceinline__ float capcap_core(const float* p1, const float* p2, const CapCap& c, float x1, float x2,
                                              float r1, float r2, float* dist, float* pos, float* n) {
-  float v1[3], v2[3];
-  for (int k = 0; k < 3; k++) { v1[k] = RFMA(c.a1[k], x1, p1[k]); v2[k] = RFMA(c.a2[k], x2, p2[k]); }
-  return sphere_sphere(v1, r1, v2, r2, dist, pos, n);
+  double v1[3], direction[3];
+  for (int k = 0; k < 3; k++) {
+    v1[k] = DFMA(c.a1[k], (double)x1, (double)p1[k]);
+    direction[k] = DADD(DFMA(c.a2[k], (double)x2, (double)p2[k]), -v1[k]);
+  }
+  double distance = sqrt(dot64(direction, direction));
+  double separation = DADD(distance, -DADD((double)r1, (double)r2));
+  *dist = (float)separation;
+  for (int k = 0; k < 3; k++) {
+    double normal = distance == 0. ? (k == 0 ? 1. : 0.) : direction[k] / distance;
+    n[k] = (float)normal;
+    pos[k] = (float)DFMA(normal, DFMA(.5, separation, (double)r1), v1[k]);
+  }
+  return (float)distance;
 }
 
 // 3x3 helpers (row-major float[9]) for the box collisions, MuJoCo Warp's quat_to_mat convention

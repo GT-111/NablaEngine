@@ -75,6 +75,8 @@ class GenerationCheck(unittest.TestCase):
             "__device__ __forceinline__ float warp_sum", 1)[0]
         capsule = "struct CapCap" + step.STEP_DEVICE.split("struct CapCap", 1)[1].split(
             "// 3x3 helpers", 1)[0]
+        geometry_math = "#define DMUL" + step.STEP_DEVICE.split("#define DMUL", 1)[1].split(
+            "__device__ __forceinline__ void geom_pose", 1)[0]
         sphere = "__device__ __forceinline__ float sphere_sphere" + step.STEP_DEVICE.split(
             "__device__ __forceinline__ float sphere_sphere", 1)[1].split("// The contact geometry", 1)[0]
         dispatch = "  if (t1 == 2 && t2 == 2) {  // capsule-capsule" + step.STEP_DEVICE.split(
@@ -89,6 +91,9 @@ inline float __fmul_rn(float a, float b) { return a*b; }
 inline float __fadd_rn(float a, float b) { return a+b; }
 inline float __fsub_rn(float a, float b) { return a-b; }
 inline float __fmaf_rn(float a, float b, float c) { return std::fma(a,b,c); }
+inline double __dmul_rn(double a, double b) { return a*b; }
+inline double __dadd_rn(double a, double b) { return a+b; }
+inline double __fma_rn(double a, double b, double c) { return std::fma(a,b,c); }
 struct Contacts { int count=0; float values[2][7]; };
 void add_sphere_contact(Contacts& s, int, int, float, float dist, const float* pos, const float* n) {
   float* out=s.values[s.count++]; out[0]=dist;
@@ -113,7 +118,8 @@ int main(int argc,char** argv) {
 '''
         with tempfile.TemporaryDirectory(prefix="nabla-capsule-cpu-") as directory:
             path = Path(directory)
-            (path / "capsule.cc").write_text(harness + rounded + sphere + capsule + collide + dispatch + "}\n" + main)
+            (path / "capsule.cc").write_text(harness + rounded + geometry_math + sphere + capsule
+                                           + collide + dispatch + "}\n" + main)
             compiled = subprocess.run(["c++", "-std=c++17", "-O2", "-ffp-contract=off",
                                        str(path / "capsule.cc"), "-o", str(path / "capsule")],
                                       text=True, capture_output=True)
@@ -137,6 +143,78 @@ int main(int argc,char** argv) {
                     actual, reference = (value[np.argsort(value[:, 3])] for value in (actual, reference))
                     np.testing.assert_allclose(actual[:, :4], reference[:, :4], rtol=2e-6, atol=2e-8)
                     np.testing.assert_allclose(actual[:, 4:], reference[:, 4:], rtol=2e-6, atol=1e-6)
+
+    @unittest.skipUnless(shutil.which("c++"), "contact pose check requires a C++ compiler")
+    def test_contact_pose_chain_rounds_once(self):
+        # Real hand chains have nontrivial fixed body/geom rotations. Their
+        # float pose error is amplified by almost parallel capsule contacts.
+        # Execute the production pose helper: generated source alone cannot
+        # establish that the whole chain retains the model's double frames.
+        rng = np.random.default_rng(739)
+        def quaternion():
+            value = rng.normal(size=4)
+            return " ".join(map(str, value / np.linalg.norm(value)))
+        roots = []
+        for side in range(2):
+            chain = ""
+            for joint in range(5):
+                chain += (f'<body pos=".013 .004 .019" quat="{quaternion()}">'
+                          f'<joint axis="0 1 0"/><geom type="capsule" size=".006 .018" '
+                          f'pos=".002 .003 .011" quat="{quaternion()}"/>')
+            roots.append(f'<body pos="0 {side * .1} 0"><freejoint/>'
+                         '<geom type="sphere" size=".02"/>' + chain + '</body>' * 6)
+        model = mujoco.MjModel.from_xml_string('<mujoco><worldbody>' + ''.join(roots)
+                                                + '</worldbody></mujoco>')
+        data = mujoco.MjData(model)
+        data.qpos[:] = data.qpos.astype(np.float32)
+        data.qpos[model.jnt_qposadr[model.jnt_type == mujoco.mjtJoint.mjJNT_HINGE]] = np.linspace(-.03, .03, 10).astype(np.float32)
+        mujoco.mj_fwdPosition(model, data)
+        geoms = step.collision_geoms(model)
+        qadr = np.zeros(model.nbody, int)
+        isfree = np.zeros(model.nbody, int)
+        qadr[1:] = model.jnt_qposadr[model.body_jntadr[1:]]
+        isfree[source.free_roots(model)] = 1
+        def array(name, value, kind):
+            value = np.asarray(value).ravel()
+            numbers = (str(int(v)) if kind == "int" else float(v).hex() + "f" for v in value)
+            return f'{kind} {name}[{len(value)}]={{' + ','.join(numbers) + '};\n'
+        declarations = (array('c_parent', model.body_parentid, 'int')
+                        + array('c_qadr', qadr, 'int') + array('c_isfree', isfree, 'int')
+                        + array('c_gbody', model.geom_bodyid[geoms], 'int')
+                        + array('qpos', data.qpos, 'float'))
+        helper = '#define DMUL' + step.STEP_DEVICE.split('#define DMUL', 1)[1].split('// world poses', 1)[0]
+        harness = r'''
+#include <cmath>
+#include <cstdio>
+#define __device__
+#define __forceinline__ inline
+inline double __dmul_rn(double a,double b){return a*b;}
+inline double __dadd_rn(double a,double b){return a+b;}
+inline double __fma_rn(double a,double b,double c){return std::fma(a,b,c);}
+'''
+        main = 'int main(){float p[3],q[4];for(int g=0;g<' + str(len(geoms)) + r''';g++){
+  geom_pose(g,qpos,p,q);
+  for(float v:p)std::printf("%.12e ",v);
+  for(float v:q)std::printf("%.12e ",v);
+  std::printf("\n");
+}}
+'''
+        with tempfile.TemporaryDirectory(prefix='nabla-contact-pose-') as directory:
+            path = Path(directory)
+            (path/'pose.cc').write_text(harness + f'#define MAXD {source.max_depth(model)}\n'
+                + declarations + step.geometry_pose_constants(model) + helper + main)
+            compiled = subprocess.run(['c++', '-std=c++17', '-O2', '-ffp-contract=off', str(path/'pose.cc'),
+                                       '-o', str(path/'pose')], capture_output=True, text=True)
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
+            values = subprocess.check_output([str(path/'pose')], text=True)
+        actual = np.asarray([[float(v) for v in line.split()] for line in values.splitlines()], np.float32)
+        expected_quat = []
+        for g in geoms:
+            result = np.empty(4)
+            mujoco.mju_mulQuat(result, data.xquat[model.geom_bodyid[g]], model.geom_quat[g])
+            expected_quat.append(result)
+        expected = np.concatenate((data.geom_xpos[geoms], expected_quat), axis=1).astype(np.float32)
+        np.testing.assert_array_max_ulp(actual, expected, maxulp=1)
 
     def test_upstream_020_terrain_and_coupled_build_plans(self):
         from coupled_physics_check import native_contact_model

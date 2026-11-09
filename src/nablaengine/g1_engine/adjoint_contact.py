@@ -404,7 +404,8 @@ __device__ __noinline__ int adj_contact_geom(int t1, int t2, int slot, const flo
   // free ones solve their rows of G x = h, G = [ma mb; mb mc], h = (u, v), the others are fixed at +-1
   CapCap cc;
   capcap_setup(p1, q1, sz1[1], p2, q2, sz2[1], cc);
-  const float *a1 = cc.a1, *a2 = cc.a2, *dif = cc.dif;
+  float a1[3], a2[3], dif[3];
+  for (int k = 0; k < 3; k++) { a1[k] = (float)cc.a1[k]; a2[k] = (float)cc.a2[k]; dif[k] = (float)cc.dif[k]; }
   const float ma = cc.ma, mb = cc.mb, mc = cc.mc, det = cc.det;
   float x1, x2, raw;
   bool f1, f2;  // a clamp to [-1, 1] leaves x free for -1 <= raw < 1 (wp.clamp's gradient rule)

@@ -1074,8 +1074,7 @@ template <bool DBG>
 __device__ void adj_contacts_coupled(Adj& s, int lane, float* dbg) {
   int ncon = uniform_int(s.hdr & 65535, CON_COUNT_BITS), nlim = s.nlim;
   for (int g = lane; g < NGEOMC; g += 32) {
-    int b = c_gbody[g];
-    geom_pose(g, s.Q[b], s.X[b], s.gx[g], s.gq[g]);
+    geom_pose(g, s.q, s.gx[g], s.gq[g]);
   }
   __syncwarp();
   int ntri = 0;
@@ -1164,8 +1163,7 @@ __device__ __noinline__ void adj_contacts(Adj& s, int lane, float* dbg_in) {
   // the shuffles cost 5% of k_adjoint (RTX 3090, at 6 worlds per SM)
   const int ncon = uniform_int(s.hdr & 65535, CON_COUNT_BITS), nlim = s.nlim;
   for (int g = lane; g < NGEOMC; g += 32) {  // geom_poses (step.py)
-    const int b = c_gbody[g];
-    geom_pose(g, s.Q[b], s.X[b], s.gx[g], s.gq[g]);
+    geom_pose(g, s.q, s.gx[g], s.gq[g]);
   }
   if (lane < 3) {
     const float e[3] = {lane == 0 ? 1.f : 0.f, lane == 1 ? 1.f : 0.f, lane == 2 ? 1.f : 0.f};
