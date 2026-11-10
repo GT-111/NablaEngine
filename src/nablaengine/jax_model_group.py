@@ -28,11 +28,16 @@ using Forward = int (*)(cudaStream_t,int,const float*,const float*,const float*,
 using Adjoint = int (*)(cudaStream_t,int,int,const float*,const float*,const float*,const float*,const float*,
                        float*,float*,float*,int*,const float*,float,const float*,const float*,float*);
 using Work = long long (*)(int);
+using Kin = int (*)(cudaStream_t,int,const float*,const float*,const float*,float*,float*,float*,float*,float*);
+using KinVjp = int (*)(cudaStream_t,int,const float*,const float*,const float*,const float*,const float*,
+                      const float*,const float*,const float*,const float*,const float*,float*,float*);
 struct Model {
-  int nq,nv,nu,com,maxcon,rec,flags,refact,nonconv,singular,replay,iterations;
+  int nq,nv,nu,com,maxcon,rec,flags,refact,nonconv,singular,replay,iterations,nbody;
   Forward forward;
   Adjoint adjoint;
   Work work;
+  Kin kin;
+  KinVjp kin_vjp;
   cudaStream_t stream;
   cudaEvent_t done;
   unsigned long long* counters;
@@ -60,11 +65,12 @@ extern "C" int dk_group_create(int count, const long long* metadata, const uintp
   if (rc) return rc;
   if ((rc = (int)cudaEventCreateWithFlags(&group->ready, cudaEventDisableTiming))) return rc;
   for (int i = 0; i < count; ++i) {
-    const long long* p = metadata + 12*i;
+    const long long* p = metadata + 13*i;
     Model m{(int)p[0],(int)p[1],(int)p[2],(int)p[3],(int)p[4],(int)p[5],(int)p[6],
-            (int)p[7],(int)p[8],(int)p[9],(int)p[10],(int)p[11],
-            reinterpret_cast<Forward>(functions[3*i]), reinterpret_cast<Adjoint>(functions[3*i+1]),
-            reinterpret_cast<Work>(functions[3*i+2]), nullptr, nullptr, nullptr};
+            (int)p[7],(int)p[8],(int)p[9],(int)p[10],(int)p[11],(int)p[12],
+            reinterpret_cast<Forward>(functions[5*i]), reinterpret_cast<Adjoint>(functions[5*i+1]),
+            reinterpret_cast<Work>(functions[5*i+2]), reinterpret_cast<Kin>(functions[5*i+3]),
+            reinterpret_cast<KinVjp>(functions[5*i+4]), nullptr, nullptr, nullptr};
     if ((rc = (int)cudaStreamCreateWithFlags(&m.stream, cudaStreamNonBlocking))) return rc;
     if ((rc = (int)cudaEventCreateWithFlags(&m.done, cudaEventDisableTiming))) return rc;
     if ((rc = (int)cudaMalloc(&m.counters, NDIAG*sizeof(unsigned long long)))) return rc;
@@ -129,14 +135,15 @@ static bool shape(ffi::AnyBuffer b, ffi::DataType type, std::initializer_list<in
 }
 static ffi::Error dispatch(cudaStream_t main, ffi::ScratchAllocator scratch, ffi::RemainingArgs args,
                            ffi::RemainingRets rets, int64_t group_id, int32_t substeps, int32_t backward,
-                           int32_t taped, float clamp_soft) {
+                           int32_t taped, int32_t kinematics, float clamp_soft) {
   Group* group=lookup(group_id);
   if (!group || substeps<1) return bad("invalid model group/substeps");
   std::lock_guard<std::mutex> lock(group->mutex);
   int device=-1; cudaGetDevice(&device);
   if (device!=group->device) return bad("model group belongs to another CUDA device");
-  const size_t stride=backward?5:(taped?6:5), count=group->models.size();
-  if (args.size()!=count*8 || rets.size()!=count*stride) return bad("model group operand/result count");
+  const size_t kin_offset=taped?6:5, count=group->models.size();
+  const size_t stride=backward?5:(kin_offset+(kinematics?5:0)), input_stride=backward&&kinematics?15:8;
+  if (args.size()!=count*input_stride || rets.size()!=count*stride) return bad("model group operand/result count");
   std::vector<ffi::AnyBuffer> inputs, outputs;
   for (size_t i=0;i<args.size();++i) {
     auto b=args.get<ffi::AnyBuffer>(i); if (!b) return b.error(); inputs.push_back(*b);
@@ -149,13 +156,15 @@ static ffi::Error dispatch(cudaStream_t main, ffi::ScratchAllocator scratch, ffi
   // Decode/allocate all operands before forking the stream, so an argument or
   // allocation error cannot leave a worker using already-released scratch.
   for (size_t i=0;i<count;++i) {
-    const Model& m=group->models[i]; auto* a=inputs.data()+8*i; auto* o=outputs.data()+stride*i;
+    const Model& m=group->models[i]; auto* a=inputs.data()+input_stride*i; auto* o=outputs.data()+stride*i;
     if (a[0].dimensions().size()!=2 || a[0].dimensions()[0]>INT_MAX) return bad("model group batch rank/size");
     int B=worlds[i]=(int)a[0].dimensions()[0];
-    const std::vector<std::vector<int64_t>> expected = backward
+    std::vector<std::vector<int64_t>> expected = backward
       ? std::vector<std::vector<int64_t>>{{B,(int64_t)substeps*m.rec},{B},{B,m.com},{B,m.nv},{B},{B,m.nu},{B,m.nq},{B,m.nv}}
       : std::vector<std::vector<int64_t>>{{B,m.nq},{B,m.nv},{B,m.nv},{B,m.nu},{B},{B,m.com},{B,m.nv},{B}};
-    for (int j=0;j<8;++j) {
+    if(backward&&kinematics) expected.insert(expected.end(),{{B,m.nq},{B,m.nv},{B,m.nq},
+        {B,m.nbody,3},{B,m.nbody,4},{B,m.nbody,6},{B,m.nbody,3}});
+    for (size_t j=0;j<input_stride;++j) {
       if (a[j].element_type()!=ffi::DataType::F32 || a[j].dimensions().size()!=expected[j].size()) return bad("model group input dtype/rank");
       for (size_t k=0;k<expected[j].size();++k) if(a[j].dimensions()[k]!=expected[j][k]) return bad("model group input shape");
     }
@@ -164,9 +173,20 @@ static ffi::Error dispatch(cudaStream_t main, ffi::ScratchAllocator scratch, ffi
         || !(backward?shape(o[3],ffi::DataType::S32,{B}):shape(o[3],ffi::DataType::S32,{B,4}))
         || !shape(o[4],ffi::DataType::F32,{B,backward?m.nv:m.maxcon*8})
         || (!backward&&taped&&!shape(o[5],ffi::DataType::F32,{B,(int64_t)substeps*m.rec}))) return bad("model group result shape");
+    if(!backward&&kinematics) {
+      auto* k=o+kin_offset;
+      if(!shape(k[0],ffi::DataType::F32,{B,m.nq}) || !shape(k[1],ffi::DataType::F32,{B,m.nbody,3})
+          || !shape(k[2],ffi::DataType::F32,{B,m.nbody,4}) || !shape(k[3],ffi::DataType::F32,{B,m.nbody,6})
+          || !shape(k[4],ffi::DataType::F32,{B,m.nbody,3})) return bad("model group kinematics result shape");
+    }
     if (!backward&&B) if (long long bytes=m.work(B)) {
       auto p=scratch.Allocate((size_t)bytes,16);
       if(!p) return ffi::Error::Internal("model group forward scratch allocation failed");
+      work[i]=*p;
+    }
+    if(backward&&kinematics&&B) {
+      auto p=scratch.Allocate((size_t)B*(m.nq+m.nv)*sizeof(float),16);
+      if(!p) return ffi::Error::Internal("model group kinematics cotangent allocation failed");
       work[i]=*p;
     }
   }
@@ -175,7 +195,7 @@ static ffi::Error dispatch(cudaStream_t main, ffi::ScratchAllocator scratch, ffi
   int first_error=0;
   for (size_t i=0;i<count;++i) {
     Model& m=group->models[i]; int B=worlds[i]; if(!B) continue;
-    auto* a=inputs.data()+8*i; auto* o=outputs.data()+stride*i;
+    auto* a=inputs.data()+input_stride*i; auto* o=outputs.data()+stride*i;
     int code=(int)cudaStreamWaitEvent(m.stream,group->ready,0);
     if (!code&&!backward) {
       float* tape=taped?o[5].typed_data<float>():nullptr;
@@ -183,14 +203,27 @@ static ffi::Error dispatch(cudaStream_t main, ffi::ScratchAllocator scratch, ffi
           a[3].typed_data<float>(),a[4].typed_data<float>(),a[5].typed_data<float>(),m.iterations,substeps,
           o[0].typed_data<float>(),o[1].typed_data<float>(),o[2].typed_data<float>(),o[3].typed_data<int32_t>(),
           o[4].typed_data<float>(),tape,work[i],a[6].typed_data<float>(),a[7].typed_data<float>());
+      if(!code&&kinematics) {
+        auto* k=o+kin_offset;
+        code=m.kin(m.stream,B,o[0].typed_data<float>(),o[1].typed_data<float>(),a[5].typed_data<float>(),
+            k[0].typed_data<float>(),k[1].typed_data<float>(),k[2].typed_data<float>(),k[3].typed_data<float>(),k[4].typed_data<float>());
+      }
       if(!code) { forward_diagnostics<<<grid(B),256,0,m.stream>>>(m,B,substeps,o[3].typed_data<int32_t>(),tape); code=(int)cudaGetLastError(); }
     } else if (!code) {
-      code=m.adjoint(m.stream,B,substeps,a[0].typed_data<float>(),a[1].typed_data<float>(),a[2].typed_data<float>(),
-          a[6].typed_data<float>(),a[7].typed_data<float>(),o[0].typed_data<float>(),o[1].typed_data<float>(),
+      const float *cq=a[6].typed_data<float>(), *cv=a[7].typed_data<float>();
+      if(kinematics) {
+        float *sq=static_cast<float*>(work[i]), *sv=sq+(size_t)B*m.nq;
+        code=m.kin_vjp(m.stream,B,a[8].typed_data<float>(),a[9].typed_data<float>(),a[2].typed_data<float>(),
+            a[10].typed_data<float>(),a[11].typed_data<float>(),a[12].typed_data<float>(),a[13].typed_data<float>(),
+            a[14].typed_data<float>(),cq,cv,sq,sv);
+        cq=sq; cv=sv;
+      }
+      if(!code) code=m.adjoint(m.stream,B,substeps,a[0].typed_data<float>(),a[1].typed_data<float>(),a[2].typed_data<float>(),
+          cq,cv,o[0].typed_data<float>(),o[1].typed_data<float>(),
           o[2].typed_data<float>(),o[3].typed_data<int32_t>(),a[5].typed_data<float>(),clamp_soft,
           a[3].typed_data<float>(),a[4].typed_data<float>(),o[4].typed_data<float>());
       if(!code) { backward_diagnostics<<<grid(B),256,0,m.stream>>>(m,B,o[0].typed_data<float>(),o[1].typed_data<float>(),
-          o[2].typed_data<float>(),a[6].typed_data<float>(),a[7].typed_data<float>(),o[3].typed_data<int32_t>()); code=(int)cudaGetLastError(); }
+          o[2].typed_data<float>(),cq,cv,o[3].typed_data<int32_t>()); code=(int)cudaGetLastError(); }
     }
     if(code&&!first_error) first_error=code;
     code=(int)cudaEventRecord(m.done,m.stream); if(code&&!first_error) first_error=code;
@@ -217,7 +250,8 @@ static ffi::Error diagnostics(cudaStream_t main, ffi::RemainingArgs, int64_t id,
 }
 XLA_FFI_DEFINE_HANDLER_SYMBOL(DkModelGroup,dispatch,ffi::Ffi::Bind()
   .Ctx<ffi::PlatformStream<cudaStream_t>>().Ctx<ffi::ScratchAllocator>().RemainingArgs().RemainingRets()
-  .Attr<int64_t>("group_id").Attr<int32_t>("substeps").Attr<int32_t>("backward").Attr<int32_t>("taped").Attr<float>("clamp_soft"));
+  .Attr<int64_t>("group_id").Attr<int32_t>("substeps").Attr<int32_t>("backward").Attr<int32_t>("taped")
+  .Attr<int32_t>("kinematics").Attr<float>("clamp_soft"));
 XLA_FFI_DEFINE_HANDLER_SYMBOL(DkModelGroupDiag,diagnostics,ffi::Ffi::Bind()
   .Ctx<ffi::PlatformStream<cudaStream_t>>().RemainingArgs().Attr<int64_t>("group_id").Attr<int32_t>("reset")
   .Ret<ffi::Buffer<ffi::U32>>());
@@ -277,10 +311,11 @@ class ModelGroup:
             modules = engines.modules(state["m"])
             metadata.append((info["nq"], info["nv"], info["nu"], info["com_width"], info["maxcon"], info["rec_words"],
                 modules.tape.layout(state["m"])["flags"][0], modules.tape.FLAG_REFACT, modules.tape.FLAG_NONCONV,
-                modules.tape.FLAG_SINGULAR, modules.adjoint.ADJ_REPLAY_MISMATCH, count))
+                modules.tape.FLAG_SINGULAR, modules.adjoint.ADJ_REPLAY_MISMATCH, count, info["nbody"]))
             functions.extend(ctypes.cast(getattr(state["lib"], symbol), ctypes.c_void_p).value for symbol in (
                 info["forward_unit"] + "_forward", F._tag((int(clamp_kv), int(normal))) + "_adjoint",
-                info["forward_unit"] + "_work_bytes"))
+                info["forward_unit"] + "_work_bytes", info["forward_unit"] + "_kinematics",
+                info["forward_unit"] + "_kinematics_vjp"))
         metadata, functions = np.asarray(metadata, np.int64), np.asarray(functions, np.uintp)
         group_id = ctypes.c_int64()
         code = self._lib.dk_group_create(len(self.contexts), metadata.ctypes.data, functions.ctypes.data, ctypes.byref(group_id))
@@ -288,7 +323,7 @@ class ModelGroup:
             raise RuntimeError(f"CUDA model group setup failed ({code})")
         self.group_id = group_id.value
 
-    def _forward(self, inputs, substeps, tape):
+    def _forward(self, inputs, substeps, tape, kinematics):
         import jax
 
         if len(inputs) != len(self.contexts):
@@ -307,29 +342,36 @@ class ModelGroup:
                 ((B, 4), np.int32), ((B, info["maxcon"] * 8), np.float32)))
             if tape:
                 outputs.append(jax.ShapeDtypeStruct((B, substeps * info["rec_words"]), np.float32))
+            if kinematics:
+                outputs.extend(F._kin_structs(F._kin_lib(context), B))
         result = jax.ffi.ffi_call(self._targets["step"], outputs)(*(value for item in inputs for value in item),
             group_id=np.int64(self.group_id), substeps=np.int32(substeps), backward=np.int32(0),
-            taped=np.int32(tape), clamp_soft=np.float32(self.clamp_soft or 0.0))
-        stride = 6 if tape else 5
-        return tuple(tuple(result[i:i + 4]) + ((result[i + 5],) if tape else ()) for i in range(0, len(result), stride))
+            taped=np.int32(tape), kinematics=np.int32(kinematics), clamp_soft=np.float32(self.clamp_soft or 0.0))
+        offset = 6 if tape else 5
+        stride = offset + (5 if kinematics else 0)
+        return tuple(tuple(result[i:i + 4]) + tuple(result[i + offset:i + stride])
+                     + ((result[i + 5],) if tape else ()) for i in range(0, len(result), stride))
 
-    def _backward(self, residual, cotangent, substeps):
+    def _backward(self, residual, cotangent, substeps, kinematics):
         import jax
         import jax.numpy as jnp
 
         inputs, outputs = [], []
-        for context, (tape, friction, com, force, kp, ctrl), cot in zip(self.contexts, residual, cotangent, strict=True):
+        for context, (tape, friction, com, force, kp, ctrl, state), cot in zip(self.contexts, residual, cotangent, strict=True):
             info, B = context.info, tape.shape[0]
             if ctrl is None:
                 ctrl = jnp.zeros((B, info["nu"]), np.float32)
             inputs.extend((tape, friction, com, force, kp, ctrl, cot[0], cot[1]))
+            if kinematics:
+                inputs.extend((*state, *cot[4:]))
             outputs.extend(jax.ShapeDtypeStruct(shape, dtype) for shape, dtype in (
                 ((B, info["nq"]), np.float32), ((B, info["nv"]), np.float32), ((B, info["nu"]), np.float32),
                 ((B,), np.int32), ((B, info["nv"]), np.float32)))
         result = jax.ffi.ffi_call(self._targets["step"], outputs)(*inputs, group_id=np.int64(self.group_id),
-            substeps=np.int32(substeps), backward=np.int32(1), taped=np.int32(0), clamp_soft=np.float32(self.clamp_soft or 0.0))
+            substeps=np.int32(substeps), backward=np.int32(1), taped=np.int32(0), kinematics=np.int32(kinematics),
+            clamp_soft=np.float32(self.clamp_soft or 0.0))
         gradients = []
-        for index, ((_tape, friction, com, _force, kp, _ctrl), decay) in enumerate(zip(residual, self.grad_decay, strict=True)):
+        for index, ((_tape, friction, com, _force, kp, _ctrl, _state), decay) in enumerate(zip(residual, self.grad_decay, strict=True)):
             dq, dv, du, _info, df = result[index * 5:index * 5 + 5]
             if decay != 1.0:
                 dq, dv = dq * np.float32(decay), dv * np.float32(decay)
@@ -338,30 +380,30 @@ class ModelGroup:
         return tuple(gradients)
 
     @functools.lru_cache(maxsize=None)
-    def make_step(self, substeps=1):
+    def make_step(self, substeps=1, kinematics=False):
         import jax
         from jax.ad_checkpoint import checkpoint_name
 
         @jax.custom_vjp
         def step(inputs):
-            return self._forward(inputs, substeps, False)
+            return self._forward(inputs, substeps, False, kinematics)
 
         def forward(inputs):
-            result = self._forward(inputs, substeps, True)
-            outputs = tuple(tuple(checkpoint_name(value, F.OUT_NAME) for value in item[:4]) for item in result)
-            residual = tuple((checkpoint_name(item[4], F.TAPE_NAME), values[4], values[5], values[6], values[7],
-                              values[3] if self.clamp_soft is not None else None)
-                             for item, values in zip(result, inputs, strict=True))
+            result = self._forward(inputs, substeps, True, kinematics)
+            outputs = tuple(tuple(checkpoint_name(value, F.OUT_NAME) for value in item[:-1]) for item in result)
+            residual = tuple((checkpoint_name(item[-1], F.TAPE_NAME), values[4], values[5], values[6], values[7],
+                              values[3] if self.clamp_soft is not None else None, out[:2] if kinematics else ())
+                             for item, values, out in zip(result, inputs, outputs, strict=True))
             return outputs, residual
 
         def backward(residual, cotangent):
-            return (self._backward(residual, cotangent, substeps),)
+            return (self._backward(residual, cotangent, substeps, kinematics),)
 
         step.defvjp(forward, backward)
         return step
 
-    def step(self, inputs, *, substeps=1):
-        return self.make_step(int(substeps))(tuple(tuple(values) for values in inputs))
+    def step(self, inputs, *, substeps=1, kinematics=False):
+        return self.make_step(int(substeps), bool(kinematics))(tuple(tuple(values) for values in inputs))
 
     @functools.lru_cache(maxsize=None)
     def _diagnostics_reader(self, reset):

@@ -38,6 +38,14 @@ The forward kernels, analytic adjoint and per-model tapes are unchanged. An
 empty model batch remains empty. Controllers that recompute forces every
 physics substep must continue calling the group once per substep.
 
+`group.step(inputs, substeps=1, kinematics=True)` also returns the five native
+successor kinematics arrays after `info`, in the same order as the context's
+`step(..., kinematics=True)`. They remain differentiable: their cotangents are
+pulled back into successor Q/V before the existing adjoint. A controller can
+carry these exact arrays into its next feedback calculation and its final
+readout. Initial/reset states still need their own factual kinematics; the
+group does not cache geometry across states or optimizer updates.
+
 The dispatcher compiles one small additional CUDA unit, without rebuilding
 the model libraries. Group setup initializes the existing contexts before
 worker dispatch. `group.read_diagnostics(reset=False)` returns the existing

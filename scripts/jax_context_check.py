@@ -276,13 +276,18 @@ class ContextChecks(unittest.TestCase):
                 def call(*values, **attrs):
                     result, offset = [], 0
                     for index, owner in enumerate(owners):
-                        item = values[index * 8:index * 8 + 8]
                         backward = bool(attrs["backward"])
+                        use_kin = bool(attrs["kinematics"])
+                        input_stride = 15 if backward and use_kin else 8
+                        item = values[index * input_stride:(index + 1) * input_stride]
                         kind = "bwd" if backward else ("fwd" if attrs["taped"] else "step")
-                        stride = 5 if backward or not attrs["taped"] else 6
+                        stride = 5 if backward else (6 if attrs["taped"] else 5) + (5 if use_kin else 0)
+                        if use_kin:
+                            kind += "_kin"
                         if backward:
-                            tape, friction, com, force, kp, _ctrl, cq, cv = item
-                            item = (tape, friction, com, force, kp, cq, cv)
+                            tape, friction, com, force, kp, _ctrl, cq, cv, *kin_cot = item
+                            item = (tape, friction, com, force, kp)
+                            item += (*kin_cot[:2], cq, cv, *kin_cot[2:]) if use_kin else (cq, cv)
                         result.extend(serial_call(owner._state["targets"][kind], outputs[offset:offset + stride])(
                             *item, iterations=np.int32(100), substeps=attrs["substeps"]))
                         offset += stride
@@ -294,37 +299,38 @@ class ContextChecks(unittest.TestCase):
             # A real H sampler can leave a plant empty; no padded fake world.
             values = values[:1] + (tuple(x[:0] for x in values[1]),) + values[2:]
             with patch.object(jax.ffi, "ffi_call", ffi_call):
-                expected = tuple(owner.step(*item, iterations=100, substeps=1, return_info=True,
-                                            grad_decay=decay)
-                                 for owner, item, decay in zip(owners, values, group.grad_decay, strict=True))
-                self.assert_tree_equal(jax.jit(group.step)(values), expected)
+                for use_kin in (False, True):
+                    expected = tuple(owner.step(*item, iterations=100, substeps=1, return_info=True,
+                                                grad_decay=decay, kinematics=use_kin)
+                                     for owner, item, decay in zip(owners, values, group.grad_decay, strict=True))
+                    self.assert_tree_equal(jax.jit(lambda items: group.step(items, kinematics=use_kin))(values), expected)
 
-                def loss(items, grouped):
-                    result = group.step(items) if grouped else tuple(owner.step(*item, iterations=100,
-                        substeps=1, return_info=True, grad_decay=decay)
-                        for owner, item, decay in zip(owners, items, group.grad_decay, strict=True))
-                    return sum(jnp.sum(item[0]) + jnp.sum(item[1]) for item in result)
+                    def loss(items, grouped):
+                        result = group.step(items, kinematics=use_kin) if grouped else tuple(owner.step(*item,
+                            iterations=100, substeps=1, return_info=True, grad_decay=decay, kinematics=use_kin)
+                            for owner, item, decay in zip(owners, items, group.grad_decay, strict=True))
+                        return sum(value.sum() for item in result for index, value in enumerate(item) if index != 3)
 
-                oracle = jax.jit(jax.value_and_grad(lambda x: loss(x, False)))(values)
-                actual = jax.jit(jax.value_and_grad(lambda x: loss(x, True)))(values)
-                self.assert_tree_equal(actual, oracle)
-                programs = [jax.jit(jax.value_and_grad(lambda force, flag=flag: loss(
-                    tuple(item[:6] + (f,) + item[7:] for item, f in zip(values, force, strict=True)), flag)))
-                    for flag in (False, True)]
-                force = tuple(item[6] for item in values)
-                zeros = jax.tree.map(jnp.zeros_like, force)
-                states = [(force, zeros, zeros), (force, zeros, zeros)]
-                for visit in range(1, 4):
-                    results = []
-                    for (parameter, moment, variance), program in zip(states, programs, strict=True):
-                        value, gradient = program(parameter)
-                        moment = jax.tree.map(lambda a, b: .9*a+.1*b, moment, gradient)
-                        variance = jax.tree.map(lambda a, b: .95*a+.05*b*b, variance, gradient)
-                        parameter = jax.tree.map(lambda p, m, v: p-.001*(m/(1-.9**visit))
-                            /(jnp.sqrt(v/(1-.95**visit))+1.e-8), parameter, moment, variance)
-                        results.append((value, gradient, parameter, moment, variance))
-                    self.assert_tree_equal(results[0], results[1])
-                    states = [(item[2], item[3], item[4]) for item in results]
+                    oracle = jax.jit(jax.value_and_grad(lambda x: loss(x, False)))(values)
+                    actual = jax.jit(jax.value_and_grad(lambda x: loss(x, True)))(values)
+                    self.assert_tree_equal(actual, oracle)
+                    programs = [jax.jit(jax.value_and_grad(lambda force, flag=flag: loss(
+                        tuple(item[:6] + (f,) + item[7:] for item, f in zip(values, force, strict=True)), flag)))
+                        for flag in (False, True)]
+                    force = tuple(item[6] for item in values)
+                    zeros = jax.tree.map(jnp.zeros_like, force)
+                    states = [(force, zeros, zeros), (force, zeros, zeros)]
+                    for visit in range(1, 4):
+                        results = []
+                        for (parameter, moment, variance), program in zip(states, programs, strict=True):
+                            value, gradient = program(parameter)
+                            moment = jax.tree.map(lambda a, b: .9*a+.1*b, moment, gradient)
+                            variance = jax.tree.map(lambda a, b: .95*a+.05*b*b, variance, gradient)
+                            parameter = jax.tree.map(lambda p, m, v: p-.001*(m/(1-.9**visit))
+                                /(jnp.sqrt(v/(1-.95**visit))+1.e-8), parameter, moment, variance)
+                            results.append((value, gradient, parameter, moment, variance))
+                        self.assert_tree_equal(results[0], results[1])
+                        states = [(item[2], item[3], item[4]) for item in results]
 
     def test_h64_four_substeps_force_gradient_and_three_actual_adam_updates(self):
         with contexts() as (owners, _calls):
