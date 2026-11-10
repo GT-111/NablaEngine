@@ -29,6 +29,21 @@ builder. Neither setting enables fast math or lowers optimization levels.
 
 ## Shapes and units
 
+For independent models, `create_group(contexts, iterations, grad_decay=...)`
+reuses their existing compiled libraries. `group.step(inputs, substeps=1)` takes
+one tuple of eight native operands per model and returns one
+`(qpos, qvel, warm, info)` tuple per model. Each model executes on its own CUDA
+stream; events order its inputs and return completed outputs to XLA's stream.
+The forward kernels, analytic adjoint and per-model tapes are unchanged. An
+empty model batch remains empty. Controllers that recompute forces every
+physics substep must continue calling the group once per substep.
+
+The dispatcher compiles one small additional CUDA unit, without rebuilding
+the model libraries. Group setup initializes the existing contexts before
+worker dispatch. `group.read_diagnostics(reset=False)` returns the existing
+diagnostic counter schema for each group member; those counters belong to
+the group, separately from calls made directly through each context.
+
 For the mjlab Unitree G1 (`fixtures/mjlab/g1_train.mjb`): `nq = 36`, `nv = 35`, `nu = 29`. B, the number of worlds, is
 read from the arrays at run time: one library serves every batch size, and JAX traces once per shape.
 

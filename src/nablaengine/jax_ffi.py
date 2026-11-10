@@ -1264,6 +1264,20 @@ def init(model_dir=None, model=None, foot_pairs=None, terrain=None, com_body=Non
         return _DEFAULT_CONTEXT.info
 
 
+def create_group(contexts, iterations, *, clamp_kv=CLAMP_KV, normal=NORMAL,
+                 clamp_soft=None, grad_decay=GRAD_DECAY):
+    """Dispatch independent model steps concurrently, joining back to XLA.
+
+    The group reuses each context's compiled forward/adjoint programs and keeps
+    its own per-model diagnostic counters. Each step takes one tuple of eight
+    operands per model and returns one (qpos, qvel, warm, info) tuple per model.
+    """
+    from nablaengine.jax_model_group import ModelGroup
+
+    return ModelGroup(contexts, iterations, clamp_kv=clamp_kv, normal=normal,
+                      clamp_soft=clamp_soft, grad_decay=grad_decay)
+
+
 def _resolve_context(context):
     if context is None:
         init()
