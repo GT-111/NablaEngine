@@ -104,6 +104,8 @@ if "--version" in sys.argv:
     print("CPU fake nvcc 12.9")
     raise SystemExit(0)
 root=Path({str(self.root)!r})
+with (root/"working_dirs.jsonl").open("a") as log:
+    log.write(json.dumps(str(Path.cwd()))+"\\n")
 output=Path(sys.argv[sys.argv.index("-o")+1])
 if "-c" in sys.argv:
     tag=Path(sys.argv[-1]).read_text()
@@ -174,6 +176,9 @@ output.write_bytes(b"complete")
                 patch.object(jax_ffi, "ThreadPoolExecutor", wraps=ThreadPoolExecutor) as pool:
             self.build_units()
         self.assertEqual(pool.call_args.kwargs["max_workers"], 2)
+        directories = [Path(json.loads(line)) for line in (self.root / "working_dirs.jsonl").read_text().splitlines()]
+        self.assertEqual(len(directories), 4)  # three compile jobs and the final link
+        self.assertTrue(all(directory.parent == self.cache for directory in directories))
 
     def test_affinity_and_cgroup_bound_nested_compiler_parallelism(self):
         original = Path.read_text

@@ -162,6 +162,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -1123,20 +1124,20 @@ def _build(units, defines, arch, include, consts, unit_arch=None, prefix="libdk_
         t0 = time.time()
         work = Path(tempfile.mkdtemp(prefix=f"build_{key}_", dir=cache_dir()))
         print(f"nablaengine: compiling {len(units)} CUDA units with {jobs} jobs, "
-              f"split-compile={threads}", flush=True)
+              f"split-compile={threads}", file=sys.stderr, flush=True)
         try:
             def compile_unit(name):
                 (work / name).write_text(units[name])
                 r = subprocess.run([nvcc, *compile_flags, *unit_command(name, arch, defines, unit_arch, include), "-c", "-o",
                                     str(work / (name + ".o")), str(work / name)], stdout=subprocess.PIPE,
-                                   stderr=subprocess.STDOUT, universal_newlines=True)
+                                   stderr=subprocess.STDOUT, universal_newlines=True, cwd=work)
                 if r.returncode:
                     raise RuntimeError(f"nvcc failed on {name}:\n{r.stdout[-4000:]}")
             with ThreadPoolExecutor(max_workers=jobs) as ex:
                 list(ex.map(compile_unit, sorted(units)))
             r = subprocess.run([nvcc, "-shared", f"-arch={arch}", "-o", str(work / "lib.so"),
                                 *(str(work / (n + ".o")) for n in sorted(units))], stdout=subprocess.PIPE,
-                               stderr=subprocess.STDOUT, universal_newlines=True)
+                               stderr=subprocess.STDOUT, universal_newlines=True, cwd=work)
             if r.returncode:
                 raise RuntimeError(f"nvcc link failed:\n{r.stdout[-4000:]}")
             os.replace(work / "lib.so", out)

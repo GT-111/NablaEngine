@@ -16,6 +16,8 @@ CUDA library compilation uses `MAX_JOBS` for concurrent translation units and
 share. For a cold build assigned 24 CPUs, use `MAX_JOBS=12 DK_COMPILE_THREADS=2`.
 The final host link remains one command. Both Torch and JAX use this builder;
 there is no Ninja layer or separate `MAX_JOBS` owner.
+Compile and link subprocesses use their build directory as the working directory,
+independent of the caller's shared-home CWD; select a local `DK_CACHE_DIR`.
 
 Changing only `MAX_JOBS` reuses existing artifacts. Changing optimizer threads
 above 1 produces a distinct artifact because the generated code must be
