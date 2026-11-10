@@ -69,7 +69,7 @@ def _table(m, max_contacts=None, terrain=False):
     nc = max_contacts or step.maxcon(m)
     nv, ntri = m.nv, m.nv * (m.nv + 1) // 2
     npmax = 2048
-    assert nv <= 64 and len(step.contact_pairs(m)) < npmax and nc <= 65535 and step.nefc(m, nc) <= 65535, "field widths (clamp u64, pair bits, u8)"
+    assert nv <= 64 and len(step.contact_pairs(m)) <= npmax and nc <= 65535 and step.nefc(m, nc) <= 65535, "field widths (clamp u64, pair bits, u8)"
     fields = _FIELDS
     if terrain:
         i = [f[0] for f in _FIELDS].index("con") + 1

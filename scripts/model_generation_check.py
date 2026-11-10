@@ -48,10 +48,10 @@ def hand_model(nhinge=12, fingers=5, *, passive=False, damping=0.0, frictionloss
         + ('<equality>' + ''.join(equalities) + '</equality>' if equalities else '') + '</mujoco>')
 
 
-def dense_contact_model(nconmax=320, njmax=1400, *, frictionloss=0.0, equality=False):
-    geoms = '<geom type="sphere" size=".1"/>' * 17
+def dense_contact_model(nconmax=320, njmax=1400, *, frictionloss=0.0, equality=False, geom_counts=(17, 17)):
     bodies = []
-    for index, x in enumerate((0, .15)):
+    for index, (x, count) in enumerate(zip((0, .15), geom_counts, strict=True)):
+        geoms = '<geom type="sphere" size=".1"/>' * count
         bodies.append(f'<body pos="{x} 0 0"><freejoint/>' + geoms
                       + f'<body pos="0 0 .1"><joint name="j{index}" range="-1 1" frictionloss="{frictionloss}"/>'
                       '<inertial mass=".1" pos=".02 0 0" diaginertia=".001 .001 .001"/></body></body>')
@@ -261,6 +261,20 @@ inline double __fma_rn(double a,double b,double c){return std::fma(a,b,c);}
         model = dense_contact_model(64, 64)
         self.assertEqual(step.maxcon(model), 64)
         self.assertEqual(step.nefc(model), 258)
+
+    def test_last_supported_pair_id_round_trips_through_tape(self):
+        # The published 11-bit table admits 2048 pairs, numbered 0..2047.
+        model = dense_contact_model(geom_counts=(64, 32))
+        capability.require(model, [], source.free_roots(model))
+        self.assertEqual(len(step.contact_pairs(model)), 2048)
+        self.assertEqual(tape.pair_bits(model), 11)
+        record = np.zeros(tape.rec_words(model), np.float32)
+        layout, words = tape.layout(model), record.view(np.uint32)
+        words[layout["hdr"][0]] = 1
+        words[layout["con"][0]] = 2047
+        decoded = tape.decode(record, model)
+        self.assertEqual(decoded["pair"][0], 2047)
+        self.assertEqual(decoded["slot"][0], 0)
 
     def test_reference_com_invalidates_compiled_sameframe_shortcut(self):
         from coupled_physics_check import set_reference_com
