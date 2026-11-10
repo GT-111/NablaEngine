@@ -9,6 +9,22 @@ The library is generated from the engine's CUDA source for the model and built b
 GPU architecture), then loaded from a cache (`$DK_CACHE_DIR`, default `~/.cache/nablaengine`) keyed by a hash of the
 sources, the model constants, the flags, the nvcc version and XLA's FFI headers. Everything is float32.
 
+CUDA library compilation uses `MAX_JOBS` for concurrent translation units and
+`DK_COMPILE_THREADS` for each unit's `nvcc --split-compile` optimizer threads
+(default 1). Their product is bounded by process affinity and the container's
+`cpu.max` quota; the operator must still assign the process its authorized CPU
+share. For a cold build assigned 24 CPUs, use `MAX_JOBS=12 DK_COMPILE_THREADS=2`.
+The final host link remains one command. Both Torch and JAX use this builder;
+there is no Ninja layer or separate `MAX_JOBS` owner.
+
+Changing only `MAX_JOBS` reuses existing artifacts. Changing optimizer threads
+above 1 produces a distinct artifact because the generated code must be
+qualified separately. Keep `DK_COMPILE_THREADS=1` when reusing qualified libraries.
+CUDA 12.9's [split compilation](https://docs.nvidia.com/cuda/archive/12.9.1/cuda-compiler-driver-nvcc/index.html#split-compile-number-split-compile)
+parallelizes optimizer passes; `--threads` mainly parallelizes compilation for
+multiple target architectures, so it is not added to this single-architecture
+builder. Neither setting enables fast math or lowers optimization levels.
+
 ## Shapes and units
 
 For the mjlab Unitree G1 (`fixtures/mjlab/g1_train.mjb`): `nq = 36`, `nv = 35`, `nu = 29`. B, the number of worlds, is

@@ -13,6 +13,7 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
@@ -92,10 +93,13 @@ class BuildCacheCheck(unittest.TestCase):
         self.compiler = self.root / "nvcc"
         self.compiler.write_text(f'''#!{sys.executable}
 import os
+import json
 from pathlib import Path
 import sys
 import time
 
+with Path({str(self.root / 'commands.jsonl')!r}).open("a") as log:
+    log.write(json.dumps(sys.argv[1:])+"\\n")
 if "--version" in sys.argv:
     print("CPU fake nvcc 12.9")
     raise SystemExit(0)
@@ -157,6 +161,48 @@ output.write_bytes(b"complete")
         self.assertIn("intentional compiler failure", next(row["message"] for row in result if row["status"] == "error"))
         self.assertEqual(self.log.read_text().splitlines(), ["FAIL_ONCE", "FAIL_ONCE"])
         self.assertEqual(list(self.cache.glob("build_*")), [])
+
+    def build_units(self, count=3):
+        units = {f"unit{index}.cu": f"UNIT_{index}" for index in range(count)}
+        with patch.dict(os.environ, DK_CACHE_DIR=str(self.cache)), \
+                patch.object(jax_ffi.cuda, "nvcc", return_value=str(self.compiler)):
+            return jax_ffi._build(units, {name: [] for name in units}, "sm_90", None,
+                                  np.zeros(1, np.float32))
+
+    def test_max_jobs_reaches_the_actual_compilation_pool(self):
+        with patch.dict(os.environ, MAX_JOBS="2", DK_COMPILE_THREADS="1"), \
+                patch.object(jax_ffi, "ThreadPoolExecutor", wraps=ThreadPoolExecutor) as pool:
+            self.build_units()
+        self.assertEqual(pool.call_args.kwargs["max_workers"], 2)
+
+    def test_affinity_and_cgroup_bound_nested_compiler_parallelism(self):
+        original = Path.read_text
+
+        def quota(path, *args, **kwargs):
+            return "4800000 100000" if str(path) == "/sys/fs/cgroup/cpu.max" else original(path, *args, **kwargs)
+
+        with patch.dict(os.environ, MAX_JOBS="48", DK_COMPILE_THREADS="4"), \
+                patch.object(os, "sched_getaffinity", return_value=set(range(224))), \
+                patch.object(Path, "read_text", quota), \
+                patch.object(jax_ffi, "ThreadPoolExecutor", wraps=ThreadPoolExecutor) as pool:
+            self.build_units(13)
+        self.assertEqual(pool.call_args.kwargs["max_workers"], 12)
+        commands = [json.loads(line) for line in (self.root / "commands.jsonl").read_text().splitlines()]
+        self.assertTrue(all("--split-compile=4" in command for command in commands if "-c" in command))
+        self.assertTrue(all("--split-compile=4" not in command for command in commands if "-shared" in command))
+
+    def test_job_count_keeps_cache_but_split_compile_is_a_distinct_artifact(self):
+        with patch.dict(os.environ, MAX_JOBS="1", DK_COMPILE_THREADS="1"):
+            first = self.build_units(1)
+        with patch.dict(os.environ, MAX_JOBS="2", DK_COMPILE_THREADS="1"):
+            second = self.build_units(1)
+        with patch.dict(os.environ, MAX_JOBS="1", DK_COMPILE_THREADS="2"):
+            third = self.build_units(1)
+        self.assertTrue(first[1])
+        self.assertFalse(second[1])
+        self.assertEqual(first[2], second[2])
+        self.assertTrue(third[1])
+        self.assertNotEqual(first[2], third[2])
 
     def test_readers_never_see_partial_constants_metadata_or_current_pointer(self):
         publish_artifact(self.cache)

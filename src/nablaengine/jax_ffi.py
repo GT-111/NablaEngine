@@ -1060,6 +1060,25 @@ def cache_dir():
     return d
 
 
+def _compile_parallelism(unit_count):
+    """Bound unit jobs and their optimizer threads by this process's CPU budget."""
+    cpus = len(os.sched_getaffinity(0))
+    try:
+        quota, period = Path("/sys/fs/cgroup/cpu.max").read_text().split()
+    except FileNotFoundError:  # cgroup v1 hosts still supply the affinity bound
+        pass
+    else:
+        if quota != "max":
+            cpus = min(cpus, max(1, int(quota) // int(period)))
+    jobs = int(os.environ.get("MAX_JOBS", cpus))
+    threads = int(os.environ.get("DK_COMPILE_THREADS", "1"))
+    if jobs < 1 or threads < 1:
+        raise ValueError("MAX_JOBS and DK_COMPILE_THREADS must be positive integers")
+    threads = min(threads, cpus)
+    jobs = min(unit_count, jobs, max(1, cpus // threads))
+    return jobs, threads
+
+
 def _build(units, defines, arch, include, consts, unit_arch=None, prefix="libdk_g1"):
     """The library for these sources: from the cache, or built by nvcc (units in parallel, then linked). The key also
     covers the model constants (uploaded at run time, not compiled in: a library per model), the flags, the nvcc
@@ -1079,8 +1098,12 @@ def _build(units, defines, arch, include, consts, unit_arch=None, prefix="libdk_
                                       for f in ("api.h", "ffi.h", "c_api.h"))).hexdigest()
     common = common_flags(arch)
     unit_arch = dict(unit_arch or {})
+    jobs, threads = _compile_parallelism(len(units))
+    compile_flags = [f"--split-compile={threads}"] if threads > 1 else []
     kd = dict(units=units, defines=defines, common=common, nvcc=ver, ffi_headers=hdr,
               consts=hashlib.sha256(consts.tobytes()).hexdigest())
+    if compile_flags:  # default jobs-only changes retain every existing artifact key
+        kd["compile_flags"] = compile_flags
     if unit_arch:
         kd["unit_arch"] = unit_arch
     if arch in cuda.N7_VIRTUAL:
@@ -1099,15 +1122,17 @@ def _build(units, defines, arch, include, consts, unit_arch=None, prefix="libdk_
             return out, False, key
         t0 = time.time()
         work = Path(tempfile.mkdtemp(prefix=f"build_{key}_", dir=cache_dir()))
+        print(f"nablaengine: compiling {len(units)} CUDA units with {jobs} jobs, "
+              f"split-compile={threads}", flush=True)
         try:
             def compile_unit(name):
                 (work / name).write_text(units[name])
-                r = subprocess.run([nvcc, *unit_command(name, arch, defines, unit_arch, include), "-c", "-o",
+                r = subprocess.run([nvcc, *compile_flags, *unit_command(name, arch, defines, unit_arch, include), "-c", "-o",
                                     str(work / (name + ".o")), str(work / name)], stdout=subprocess.PIPE,
                                    stderr=subprocess.STDOUT, universal_newlines=True)
                 if r.returncode:
                     raise RuntimeError(f"nvcc failed on {name}:\n{r.stdout[-4000:]}")
-            with ThreadPoolExecutor(max_workers=max(1, min(len(units), os.cpu_count() or 1))) as ex:
+            with ThreadPoolExecutor(max_workers=jobs) as ex:
                 list(ex.map(compile_unit, sorted(units)))
             r = subprocess.run([nvcc, "-shared", f"-arch={arch}", "-o", str(work / "lib.so"),
                                 *(str(work / (n + ".o")) for n in sorted(units))], stdout=subprocess.PIPE,
