@@ -6,7 +6,8 @@ backward calls, gradient decay, a remat policy and diagnostic counters. The modu
 `src/nablaengine/jax_ffi.py` is the complete reference; this page is the overview.
 
 The library is generated from the engine's CUDA source for the model and built by nvcc on first use (about 15 s per
-GPU architecture), then loaded from a cache (`$DK_CACHE_DIR`, default `~/.cache/nablaengine`) keyed by a hash of the
+GPU architecture), then loaded from a cache (`$DK_CACHE_DIR`, else `$XDG_CACHE_HOME/nablaengine`, else
+`~/.cache/nablaengine`) keyed by a hash of the
 sources, the model constants, the flags, the nvcc version and XLA's FFI headers. Everything is float32.
 
 CUDA library compilation uses `MAX_JOBS` for concurrent translation units and
@@ -52,18 +53,21 @@ worker dispatch. `group.read_diagnostics(reset=False)` returns the existing
 diagnostic counter schema for each group member; those counters belong to
 the group, separately from calls made directly through each context.
 
-For the mjlab Unitree G1 (`fixtures/mjlab/g1_train.mjb`): `nq = 36`, `nv = 35`, `nu = 29`. B, the number of worlds, is
-read from the arrays at run time: one library serves every batch size, and JAX traces once per shape.
+Each context supplies its compiled `nq`, `nv`, `nu`, `nbody` and FREE-root count `nr`.
+Group members may have different dimensions and independent batch sizes, including zero.
+Create contexts and the group once for the selected models; a step does not rebuild them.
+B is read from each model's arrays: one library serves every batch size, while JAX traces once per shape.
+For the mjlab Unitree G1 fixture only, `nq = 36`, `nv = 35`, `nu = 29` and `nr = 1`.
 
 | argument | shape | meaning |
 |---|---|---|
-| `qpos` | (B, 36) | joint positions (free joint: position, unit quaternion w x y z; then 29 hinges) |
-| `qvel` | (B, 35) | joint velocities |
-| `warm` | (B, 35) | the Newton warm start (`qacc_warmstart`); the step returns the next one |
-| `ctrl` | (B, 29) | position targets of the 29 actuators, held over the control step |
-| `friction` | (B,) | per-world friction of the foot-floor contact pairs (domain randomisation); it replaces those pairs' own friction, so pass the model's value where it is not randomised |
+| `qpos` | (B, nq) | joint positions in the model's compiled order; each FREE joint has position and unit quaternion w x y z |
+| `qvel` | (B, nv) | joint velocities in the model's compiled order |
+| `warm` | (B, nv) | the Newton warm start (`qacc_warmstart`); the step returns the next one |
+| `ctrl` | (B, nu) | position targets in native actuator order, held over the call's substeps; passive hinges have no control slot |
+| `friction` | (B,) | per-world friction of the selected generated contact pairs; it replaces those pairs' own friction, so pass the model's value where it is not randomised |
 | `com` | (B, 3*nr) | offsets of the selected COM bodies for the model's one or two FREE trees; selected by `com_body_id` |
-| `qfrc_applied` | (B, nv) | applied generalized force, including installed wrist force/torque; default zeros |
+| `qfrc_applied` | (B, nv) | applied force in the model's generalized coordinates; default zeros |
 | `kp_scale` | (B,) | actual native actuator Kp scale; default ones, retained for replay and stopped in the VJP |
 
 A control step is `substeps` engine substeps of the model's timestep (4 x 5 ms by default).
@@ -86,7 +90,7 @@ size and whether the library was built now (`built`); log it with results.
 ## Model contexts
 
 Use `create_context(model=..., foot_pairs=..., com_body_id=...)` for multiple
-native hands in one process. The selected model owns its dimensions, packed
+models in one process. The selected model owns its dimensions, packed
 constants and registered FFI targets. The full selected COM-body tuple is used
 for construction and `context.check_model`, including bilateral FREE trees;
 it is not inferred from the G1 torso name.
@@ -163,20 +167,20 @@ qpos_n, xpos, xquat, cvel, subtree_com = jax_ffi.kinematics(qpos, qvel, com)
 *state, qpos_n, xpos, xquat, cvel, subtree_com = jax_ffi.step(..., kinematics=True)
 ```
 
-MJX's `mjx.kinematics` + `com_pos` + `com_vel` on the model with the world's torso centre-of-mass offset, with their
-VJP: `qpos_n` (B, 36) with the free joint's quaternion normalized, `xpos` (B, nbody, 3) and `xquat` (B, nbody, 4) body
+MJX's `mjx.kinematics` + `com_pos` + `com_vel` on the model with the selected bodies' centre-of-mass offsets, with their
+VJP: `qpos_n` (B, nq) with every FREE joint's quaternion normalized, `xpos` (B, nbody, 3) and `xquat` (B, nbody, 4) body
 frames (world body 0 included), `cvel` (B, nbody, 6) twists [angular; linear] at the reference point
-`subtree_com[1]`, `subtree_com` (B, nbody, 3). `step(..., kinematics=True)` computes them for the output state inside
+`subtree_com[body_rootid]`, `subtree_com` (B, nbody, 3). `step(..., kinematics=True)` computes them for the output state inside
 the step's call; `kinematics()` is for states the engine did not produce (initial or external states), and on a step's
 output it gives the same bits. `kinematics_forward` / `kinematics_backward` are the same without `custom_vjp`.
 
 ## Lower-level calls
 
 ```python
-qpos1, qvel1, warm1, info, tape = jax_ffi.forward(qpos, qvel, warm, ctrl, friction, com, *, iterations=10,
+qpos1, qvel1, warm1, info, tape = jax_ffi.forward(qpos, qvel, warm, ctrl, friction, com, qfrc_applied, kp_scale, iterations=10,
                                                   substeps=4, tape=True, kinematics=False)
-g_qpos, g_qvel, g_ctrl, binfo = jax_ffi.backward(tape, friction, com, g_qpos1, g_qvel1, *, substeps=4, clamp_kv=0,
-                                                 normal=3, ctrl=None, clamp_soft=None, kinematics=None)
+g_qpos, g_qvel, g_ctrl, binfo, g_qfrc = jax_ffi.backward(tape, friction, com, g_qpos1, g_qvel1, substeps=4, clamp_kv=0,
+                                                 normal=3, qfrc_applied=qfrc_applied, kp_scale=kp_scale)
 ```
 
 Traceable, without `custom_vjp`. `info` (B, 4) int32 per world: Newton iterations of the last substep, contacts,
@@ -184,7 +188,8 @@ constraint rows, unsupported bits (a world whose contacts exceed what the engine
 `FLAG_UNSUPPORTED`). `binfo` (B,) int32: the adjoint's flags (the union of the records' tape flags,
 `adjoint.ADJ_ROWS_SKIPPED`, `ADJ_REPLAY_MISMATCH`) or-ed with `NONFINITE_* << NONFINITE_SHIFT` (which of the world's
 gradients has a NaN / inf, and whether its incoming cotangent had one). `clamp_kv=2` needs the step's `ctrl`. The
-gradients of `backward` are never scaled by `grad_decay`.
+gradients of `backward` are never scaled by `grad_decay`. Supply the same physical operands as the forward.
+Omitting applied force keeps the original four-result backward interface; supplying it appends its gradient.
 
 ## Gradient decay: `scale_grad`
 
@@ -262,13 +267,17 @@ ignored.
 
 ## Unsupported models
 
-The engine's model class is a free root and one hinge per later body, with at most 31 bodies, five children per body
-and 12 hinge ancestors. Position actuators may drive any unique subset of hinges, with independent `nu`; passive
-hinges remain in `qpos` and `qvel`. Linear joint damping, dof frictionloss and up to six active soft linear hinge
-equalities are represented. Contact pairs may be absent. Sphere, capsule and world-plane contact pairs have an
-analytic adjoint; boxes remain forward-only. The published numerical qualification is for the mjlab G1; CPU
-generation checks for smaller models are described in `docs/verification.md`.
-Multiple free roots, implicit `contype` / `conaffinity` contacts and convex-mesh collisions remain unsupported.
+The engine accepts one or two top-level FREE roots and one hinge at the origin of every other body,
+with `6 <= nv <= 64`, at most eight children per body and 12 hinge ancestors. Forward and kinematics allow
+64 bodies; the adjoint allows 31 bodies for one FREE root and 64 for two. These are kernel limits, independent
+of robot names. Position actuators may drive any unique subset of hinges, with independent `nu`; passive
+hinges remain in `qpos` and `qvel`. Linear joint damping, dof frictionloss and up to `6 * nr` active soft linear hinge
+equalities are represented. Explicit and eligible `contype` / `conaffinity` contact pairs are generated; pairs may
+also be absent. The capability checker validates the supported plane, sphere, capsule and box combinations,
+including the plane-box and box-box adjoint hooks. Convex-mesh collisions, more than two FREE roots, welded,
+multi-joint, ball and slide bodies, tendons, flexes and plugin dynamics remain unsupported.
+The published numerical results belong to the models and builds named in their result files; CPU generation
+checks for the extended model class are described in `docs/verification.md`.
 Disabling contacts changes the simulated condition; a successful check of such a model does not qualify its original
 contact-enabled scene.
 
@@ -288,15 +297,12 @@ variant that does not exist or a non-finite `grad_decay`.
 
 ## Other robots
 
-The engine generates its code from the model. It supports one class of robot models (`nablaengine.model.capability`):
-- a floating base followed by one hinge per body, 7 <= nv <= 64, at most 31 bodies and 8 children per body;
-- one position servo per hinge, joint damping, armature and frictionloss, joint limits;
-- explicit contact pairs between planes, spheres, capsules and boxes. Box-box pairs follow MuJoCo Warp's general
-  convex collision (GJK, EPA and multi-contact polygon clipping, `src/nablaengine/ccd.py`), with an exact adjoint;
-- MuJoCo's Newton solver, a pyramidal friction cone, and implicitfast integration.
+The engine generates its code from each model under the model class and kernel limits above
+(`nablaengine.model.capability`), using MuJoCo's Newton solver, a pyramidal friction cone and implicitfast integration.
+Robot names, controller cadence, observation roles and training schedules are not inputs to code generation.
 
 A model outside the class is rejected with the failing checks. Pass a supported model as
-`init(model=m, foot_pairs=[...], com_body=...)`, set its `friction` input to the model's foot friction unless it is
+`create_context(model=m, foot_pairs=[...], com_body_id=...)`, set its `friction` input to the selected pairs' friction unless it is
 randomised, and set `substeps` to its control step.
 
 Validated robots (`docs/results/robots_check_v100.json`, V100). Forward: one control step of about 4000 states

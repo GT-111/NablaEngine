@@ -28,7 +28,7 @@ use `clamp_kv=1, normal=0, grad_decay=1` for finite differences and report train
 The two-root cases also cover all 56 velocities / 58 positions, 64-bit ancestor masks, 12 soft joint equalities,
 implicit cross-root sphere contacts, native material mixing, and a nonzero off-diagonal contact Hessian. They check
 that native implicit mesh contacts remain rejected. Most synthetic cases have no collision geometry; none represents
-the full enabled convex-mesh contact graph of the normal DexForge five-hand native scenes.
+an application's full enabled convex-mesh contact graph. Scene qualification must use that scene's actual supported geometry.
 
 The first coupled CUDA snapshot has a finite check with explicit source, cache and result locations:
 

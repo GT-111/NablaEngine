@@ -36,9 +36,9 @@ the engine's simulation gradients.
 ## Scope
 
 NablaEngine is specialized for one class of robot models, with the Unitree G1 (the mjlab model) as the first:
-- a floating base with one hinge per body;
+- one or two floating bases, with one hinge at the origin of every other body;
 - contacts between planes, spheres, capsules and boxes;
-- joint limits, PD position actuators;
+- joint limits, native position-actuator ordering with passive hinges, damping, frictionloss and soft linear joint equalities;
 - MuJoCo's Newton solver and implicitfast integration, in float32.
 
 Beyond the G1 it is validated on the Unitree Go1, Go2, A1 and H1, ANYbotics ANYmal C, Boston Dynamics Spot,
