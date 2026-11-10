@@ -536,6 +536,8 @@ int main() {
             model = hand_model(hinges, fingers, roots=2, passive=passive, equality=passive, damping=0.1)
             roots = source.free_roots(model)
             capability.require(model, [], roots)
+            actuator_facts = next(f.value for f in capability.check(model, [], roots).findings if f.code == "H11a")
+            self.assertEqual(actuator_facts["hinges"], int(np.count_nonzero(model.jnt_type == mujoco.mjtJoint.mjJNT_HINGE)))
             packed, layouts, sizes = adjoint.engine_constants(model, [], com_body_id=roots)
             offset, arrays = 0, {}
             for name, kind, unit, width in layouts:

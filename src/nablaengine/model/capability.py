@@ -273,7 +273,7 @@ def check(m, foot_pairs=None, com_body=COM_BODY, scope="engine"):
     add("H11a", nu == m.nactuator == m.nout and len(set(driven)) == len(driven) and not bad11, "error",
         "at most one position servo per hinge (passive hinges allowed, independent control order), joint "
         "transmission, affine bias, gear 1, gainprm[0] = -biasprm[1]",
-        dict(nu=nu, nactuator=int(m.nactuator), hinges=nv - 6, bad=bad11[:8]))
+        dict(nu=nu, nactuator=int(m.nactuator), hinges=len(hinge), bad=bad11[:8]))
     gt = [_name(m, mujoco.mjtObj.mjOBJ_ACTUATOR, a) for a in range(int(m.nactuator))
           if m.actuator_gaintype[a] != mujoco.mjtGain.mjGAIN_FIXED or m.actuator_dyntype[a] != mujoco.mjtDyn.mjDYN_NONE
           or m.actuator_biasprm[a, 0] != 0 or np.any(m.actuator_biasprm[a, 3:]) or np.any(m.actuator_gainprm[a, 1:])
