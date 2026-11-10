@@ -959,7 +959,7 @@ def sec_api(args):
     fwd_outs = lambda info_shape=(B, 4), tape_cols=4 * rw, con=(B, mc8): [  # noqa: E731
         S((B, nq), f32), S((B, nv), f32), S((B, nv), f32), S(info_shape, i32), S(con, f32), S((B, tape_cols), f32)]
     bwd_outs = lambda info_shape=(B,), gq=(B, nq): [S(gq, f32), S((B, nv), f32), S((B, nu), f32),  # noqa: E731
-                                                    S(info_shape, i32)]
+                                                    S(info_shape, i32), S((B, nv), f32)]
     attrs = dict(iterations=np.int32(10), substeps=np.int32(4))
     battrs = dict(substeps=np.int32(4), clamp_kv=np.int32(0), normal=np.int32(3))
     T = F._STATE["targets"]
@@ -972,23 +972,24 @@ def sec_api(args):
     before = valid()
     F.read_diagnostics(reset=True)
     neg = {}
+    force, kp = jnp.zeros((B, nv), f32), jnp.ones((B,), f32)
     neg["step_info_B3"] = _raises(lambda: jax.jit(lambda *x: jax.ffi.ffi_call(T["step"], fwd_outs((B, 3))[:5])(
-        *x, **attrs))(*a))
+        *x, force, kp, **attrs))(*a))
     neg["step_info_rank1"] = _raises(lambda: jax.jit(lambda *x: jax.ffi.ffi_call(T["step"], fwd_outs((B,))[:5])(
-        *x, **attrs))(*a))
+        *x, force, kp, **attrs))(*a))
     neg["fwd_tape_short"] = _raises(lambda: jax.jit(lambda *x: jax.ffi.ffi_call(T["fwd"], fwd_outs(tape_cols=4 * rw - 1))(
-        *x, **attrs))(*a))
+        *x, force, kp, **attrs))(*a))
     neg["fwd_contacts_short"] = _raises(lambda: jax.jit(lambda *x: jax.ffi.ffi_call(T["fwd"], fwd_outs(con=(B, 8)))(
-        *x, **attrs))(*a))
+        *x, force, kp, **attrs))(*a))
     neg["fwd_qpos_rank0"] = _raises(lambda: jax.jit(lambda *x: jax.ffi.ffi_call(T["fwd"], fwd_outs())(
-        jnp.zeros((), f32), *x[1:], **attrs))(*a))
+        jnp.zeros((), f32), *x[1:], force, kp, **attrs))(*a))
     tp0 = jnp.asarray(before[4])
     neg["bwd_info_B2"] = _raises(lambda: jax.jit(lambda tp: jax.ffi.ffi_call(T["bwd"], bwd_outs((B, 2)))(
-        tp, a[4], a[5], cq, cv, **battrs))(tp0))
+        tp, a[4], a[5], force, kp, cq, cv, **battrs))(tp0))
     neg["bwd_gqpos_wide"] = _raises(lambda: jax.jit(lambda tp: jax.ffi.ffi_call(T["bwd"], bwd_outs(gq=(B, nq + 1)))(
-        tp, a[4], a[5], cq, cv, **battrs))(tp0))
+        tp, a[4], a[5], force, kp, cq, cv, **battrs))(tp0))
     neg["bwd_tape_rank1"] = _raises(lambda: jax.jit(lambda tp: jax.ffi.ffi_call(T["bwd"], bwd_outs())(
-        tp.reshape(-1), a[4], a[5], cq, cv, **battrs))(tp0))
+        tp.reshape(-1), a[4], a[5], force, kp, cq, cv, **battrs))(tp0))
     d = F.read_diagnostics(reset=True)
     after = valid()
     res["negative_shapes"] = dict(

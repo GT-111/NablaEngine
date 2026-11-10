@@ -21,7 +21,9 @@ read from the arrays at run time: one library serves every batch size, and JAX t
 | `warm` | (B, 35) | the Newton warm start (`qacc_warmstart`); the step returns the next one |
 | `ctrl` | (B, 29) | position targets of the 29 actuators, held over the control step |
 | `friction` | (B,) | per-world friction of the foot-floor contact pairs (domain randomisation); it replaces those pairs' own friction, so pass the model's value where it is not randomised |
-| `com` | (B, 3) | per-world offset of the centre of mass of one body (domain randomisation): the torso, `torso_link`, unless `init(com_body=...)` names another |
+| `com` | (B, 3*nr) | offsets of the selected COM bodies for the model's one or two FREE trees; selected by `com_body_id` |
+| `qfrc_applied` | (B, nv) | applied generalized force, including installed wrist force/torque; default zeros |
+| `kp_scale` | (B,) | actual native actuator Kp scale; default ones, retained for replay and stopped in the VJP |
 
 A control step is `substeps` engine substeps of the model's timestep (4 x 5 ms by default).
 
@@ -40,11 +42,36 @@ and its foot-floor pair indices instead (for an installed package without the fi
 library path and cache key, the architecture and its flags (`arch`, `arch_flags`, `forward_defines`), the tape record
 size and whether the library was built now (`built`); log it with results.
 
+## Model contexts
+
+Use `create_context(model=..., foot_pairs=..., com_body_id=...)` for multiple
+native hands in one process. The selected model owns its dimensions, packed
+constants and registered FFI targets. The full selected COM-body tuple is used
+for construction and `context.check_model`, including bilateral FREE trees;
+it is not inferred from the G1 torso name.
+
+```python
+context = jax_ffi.create_context(model=model, foot_pairs=selected_pairs,
+                                 com_body_id=selected_com_bodies)
+q1, v1, warm1, info = context.step(qpos, qvel, warm, ctrl, friction, com,
+                                  qfrc_applied, kp_scale, iterations=100,
+                                  substeps=1, return_info=True)
+qn, xpos, xquat, cvel, subtree_com = context.kinematics(q1, v1, com)
+```
+
+State and tape arrays belong to the caller and can coexist across models and
+JIT scans. Different compiled models have different target names; custom VJP
+closures retain their actual context. Creating the same compiled model again
+returns its existing context and model-scoped diagnostics, rather than claiming
+independent counters for replicas. The default `init`/module functions retain
+their single selected model; explicit contexts do not replace it. Model context
+metadata is not a portable physical-state snapshot.
+
 ## `step` and `make_step`
 
 ```python
-qpos1, qvel1, warm1 = jax_ffi.step(qpos, qvel, warm, ctrl, friction, com, *, iterations=10, substeps=4,
-                                   clamp_kv=0, normal=3, clamp_soft=None, grad_decay=1.0, kinematics=False)
+qpos1, qvel1, warm1 = jax_ffi.step(qpos, qvel, warm, ctrl, friction, com, qfrc_applied=None, kp_scale=None, *, iterations=10, substeps=4,
+                                   clamp_kv=0, normal=3, clamp_soft=None, grad_decay=1.0, kinematics=False, return_info=False)
 step_fn = jax_ffi.make_step(iterations=10, substeps=4, clamp_kv=0, normal=3, clamp_soft=None, grad_decay=1.0,
                             kinematics=False)
 ```
@@ -55,7 +82,7 @@ runs the forward kernels without a tape. Under `jax.vjp` / `jax.grad` the forwar
 substep `rec_words()` float32 values; `tape_bytes(nworld)` gives the size) that the backward replays: the adjoint runs
 on the forward's own contacts, constraint rows and solver state, and is deterministic. The VJP returns the
 cotangents of `qpos` (in the 36-dimensional qpos form, as MuJoCo Warp), `qvel` and `ctrl` (summed over the substeps),
-and zeros for `warm`, `friction` and `com`; the cotangent of `warm'` is ignored.
+and applied generalized force, with zeros for `warm`, `friction`, `com` and `kp_scale`; the cotangent of `warm'` is ignored. The forward and adjoint use the same applied force and Kp values; these inputs are never silently dropped.
 
 | option | default | meaning |
 |---|---|---|
@@ -66,6 +93,7 @@ and zeros for `warm`, `friction` and `com`; the cotangent of `warm'` is ignored.
 | `clamp_soft` | None | the soft clamp's width for `clamp_kv=2` (None: 0.2); must stay None for `clamp_kv` 0 and 1 |
 | `grad_decay` | 1.0 | the physics-only gradient decay: the backward multiplies the cotangents it returns for qpos and qvel by this factor (1.0: no multiply) |
 | `kinematics` | False | also return the kinematics outputs of the output state (below), computed in the same call, their cotangents in the same VJP |
+| `return_info` | False | return the native int32 status after warm, before any kinematics outputs; info has no derivative |
 
 `clamp_kv=1, normal=0` is the exact derivative of the forward ("exact mode", the one compared with finite
 differences); `clamp_kv=0, normal=3` are the interface defaults. The defaults differ from the exact derivative only
@@ -256,3 +284,14 @@ Notes on the models:
 - The Go2's torque motors are replaced by position servos (kp 35, kd 0.5).
 
 Exporting and checking a robot, and the time per control step of each: `docs/robots.md`. Terrain: `docs/terrain.md`.
+
+## Context interface qualification
+
+`scripts/jax_context_check.py` checks context routing, typed shapes, force VJP,
+stopped physical parameters, successor kinematics/status, a 4×H64 scan and
+three actual CPU Adam updates using explicit analytic FFI doubles. It also
+checks bilateral COM constant packing with mocked library loading/admission.
+Those CPU checks do not qualify CUDA solver numerics or hand contacts. The
+native FFI handlers use the existing CUDA forward/adjoint kernels on XLA's
+provided stream; actual model/physics qualification must use the selected
+compiled source and runtime.
